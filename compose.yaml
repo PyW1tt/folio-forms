@@ -2,7 +2,7 @@ name: folio-forms
 
 services:
   postgres:
-    image: postgres:18.0@sha256:41fc5342eefba6cc2ccda736aaf034bbbb7c3df0fdb81516eba1ba33f360162c
+    image: postgres:18.0
     restart: unless-stopped
     environment:
       POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB}
@@ -17,7 +17,7 @@ services:
       - postgres-data-v18:/var/lib/postgresql
 
   rustfs:
-    image: rustfs/rustfs:1.0.0-rc.6@sha256:97171b3d72cd47dc81000f92ea84de25608bfc35a94c965501afaeb5d99f6035
+    image: rustfs/rustfs:1.0.0-rc.6
     restart: unless-stopped
     command: ["/data"]
     environment:
@@ -36,7 +36,7 @@ services:
       - rustfs-data:/data
 
   rustfs-init:
-    image: rustfs/rc:v0.1.35@sha256:adb45b56539006120f1d790bcc17ee5f9b4d93c1d7e71ed0a24f10267f9d6914
+    image: rustfs/rc:v0.1.35
     depends_on:
       rustfs:
         condition: service_healthy
@@ -51,7 +51,7 @@ services:
         rc alias set local http://rustfs:9000 "$$RUSTFS_ACCESS_KEY" "$$RUSTFS_SECRET_KEY" && rc bucket create "local/$$RUSTFS_BUCKET" --ignore-existing && rc anonymous set private "local/$$RUSTFS_BUCKET"
 
   onlyoffice:
-    image: onlyoffice/documentserver:9.4.0.1@sha256:3ab6ebc7c605e5a32b7ae3ff19daed4925090245acc8100ce2230bd766c88212
+    image: onlyoffice/documentserver:9.4.0.1
     restart: unless-stopped
     depends_on:
       postgres:
@@ -81,6 +81,8 @@ services:
       context: .
       dockerfile: apps/server/Dockerfile
     restart: unless-stopped
+    platform: linux/amd64
+    image: hadesgod/folio-server
     init: true
     depends_on:
       postgres:
@@ -141,6 +143,8 @@ services:
       dockerfile: apps/web/Dockerfile
       args:
         VITE_API_ORIGIN: ${PUBLIC_ORIGIN:?set PUBLIC_ORIGIN}
+    image: hadesgod/folio-web
+    platform: linux/amd64
     restart: unless-stopped
     expose:
       - "80"
@@ -151,7 +155,7 @@ services:
       retries: 12
 
   gateway:
-    image: vicanso/pingap:0.14.2@sha256:961e589cbeb64a3f4b11eba40e147dab9467bb8f5a29d2ecc62dba4ac839a440
+    image: vicanso/pingap:0.14.2
     restart: unless-stopped
     depends_on:
       server:
@@ -191,3 +195,4 @@ volumes:
   onlyoffice-logs:
   onlyoffice-cache:
   rustfs-data:
+
