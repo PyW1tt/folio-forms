@@ -3203,6 +3203,10 @@ const templateOfficeRelationshipNamespaces = new Set([
   "http://purl.oclc.org/ooxml/officeDocument/relationships",
   "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
 ]);
+const templateGlossaryDocumentRelationships = new Set([
+  "http://purl.oclc.org/ooxml/officeDocument/relationships/glossaryDocument",
+  "http://schemas.openxmlformats.org/officeDocument/2006/relationships/glossaryDocument",
+]);
 const templateVmlNamespace = "urn:schemas-microsoft-com:vml";
 const responsePictureJpegSofMarkers = new Set([
   0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf,
@@ -3897,8 +3901,9 @@ function templateGlossaryPlaceholders(
       if (
         element.local === "Relationship" &&
         element.uri === templatePackageRelationshipNamespace &&
-        templateAttribute(element, "Type") ===
-          "http://schemas.openxmlformats.org/officeDocument/2006/relationships/glossaryDocument" &&
+        templateGlossaryDocumentRelationships.has(
+          templateAttribute(element, "Type") ?? ""
+        ) &&
         templateAttribute(element, "TargetMode") === undefined
       ) {
         glossaryPath = resolveTemplateRelationshipTarget(
@@ -10365,24 +10370,25 @@ export function createApp(options: AppOptions = {}) {
               pictureFields
             )
           : null;
-      const correctionSummaries = await Promise.all(
-        response.corrections.toReversed().map(async (correction) => {
-          const documentAvailable = await objectExists(correction.objectKey);
-          const pictures =
-            documentAvailable && pictureFields.length > 0
-              ? responsePicturePresence(
-                  await readObject(correction.objectKey),
-                  pictureFields
-                )
-              : null;
-          return correctionRevisionSummary(
+      const correctionSummaries: CorrectionRevisionSummary[] = [];
+      for (const correction of response.corrections.toReversed()) {
+        const documentAvailable = await objectExists(correction.objectKey);
+        const pictures =
+          documentAvailable && pictureFields.length > 0
+            ? responsePicturePresence(
+                await readObject(correction.objectKey),
+                pictureFields
+              )
+            : null;
+        correctionSummaries.push(
+          correctionRevisionSummary(
             correction,
             actorById.get(correction.actorId),
             documentAvailable,
             pictures
-          );
-        })
-      );
+          )
+        );
+      }
       await createResponseAudit({
         action: "view_response",
         actorId: identity.id,

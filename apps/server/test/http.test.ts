@@ -2409,15 +2409,18 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   const orderedPlaceholderFixture = docxXmlFixture({
     additionalParts: {
       "word/_rels/document.xml.rels": strToU8(
-        `<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdGlossary" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/glossaryDocument" Target="glossary/document.xml"/></Relationships>`
+        `<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdGlossary" Type="http://purl.oclc.org/ooxml/officeDocument/relationships/glossaryDocument" Target="glossary/document.xml"/></Relationships>`
       ),
       "word/glossary/document.xml": strToU8(
-        `<?xml version="1.0"?><w:glossaryDocument xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:docParts><w:docPart><w:docPartPr><w:docPartName w:val="ReceiptPrompt"/></w:docPartPr><w:docPartBody><w:p><w:r><w:t>Configured glossary placeholder</w:t></w:r></w:p></w:docPartBody></w:docPart></w:docParts></w:glossaryDocument>`
+        `<?xml version="1.0"?><w:glossaryDocument xmlns:w="http://purl.oclc.org/ooxml/wordprocessingml/main"><w:docParts><w:docPart><w:docPartPr><w:docPartName w:val="ReceiptPrompt"/></w:docPartPr><w:docPartBody><w:p><w:r><w:t>Configured glossary placeholder</w:t></w:r></w:p></w:docPartBody></w:docPart></w:docParts></w:glossaryDocument>`
       ),
     },
     document: contentControlDocument(
       `<w:sdt><w:sdtPr><w:alias w:val="Parent label"/><w:tag w:val="parent"/><w:text/></w:sdtPr><w:sdtContent><w:sdt><w:sdtPr><w:alias w:val="Child label"/><w:tag w:val="child"/><w:text/></w:sdtPr><w:sdtContent><w:r><w:t>Child answer</w:t></w:r></w:sdtContent></w:sdt></w:sdtContent></w:sdt>` +
         `<w:sdt><w:sdtPr><w:alias w:val="Prompt label"/><w:tag w:val="prompt"/><w:placeholder><w:docPart w:val="ReceiptPrompt"/></w:placeholder><w:text/></w:sdtPr><w:sdtContent><w:r><w:t>Entered answer</w:t></w:r></w:sdtContent></w:sdt>`
+    ).replaceAll(
+      "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+      "http://purl.oclc.org/ooxml/wordprocessingml/main"
     ),
   });
   const orderedPlaceholderResult = await publishFixture(
