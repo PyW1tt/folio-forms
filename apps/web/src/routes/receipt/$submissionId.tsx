@@ -31,9 +31,16 @@ const receiptErrorMessage = (error: unknown): string => {
   }
   return "โหลดใบรับคำตอบไม่ได้ กรุณาลองใหม่";
 };
-const receiptFieldValue = (field: ReceiptField, value: unknown): string => {
+const receiptFieldValue = (
+  field: ReceiptField,
+  value: unknown,
+  picturePresent?: boolean
+): string => {
   if (field.type === "picture") {
-    return "เปิดเอกสาร DOCX เพื่อดูรูปภาพ";
+    if (picturePresent === undefined) {
+      return "รูปภาพตรวจสอบไม่ได้";
+    }
+    return picturePresent ? "มีรูปภาพแนบ" : "ไม่มีรูปภาพ";
   }
   if (value === null || value === undefined || value === "") {
     return "—";
@@ -135,11 +142,11 @@ const ReceiptRoute = () => {
 
   const latestRevision = revisions.at(-1)?.revision ?? 0;
   const selectedRevision = viewRevision === "latest" ? latestRevision : 0;
-  const displayedData =
-    revisions.find((revision) => revision.revision === selectedRevision)
-      ?.data ??
-    data ??
-    {};
+  const selectedRevisionRecord = revisions.find(
+    (revision) => revision.revision === selectedRevision
+  );
+  const displayedData = selectedRevisionRecord?.data ?? data ?? {};
+  const selectedPictures = selectedRevisionRecord?.pictures ?? null;
   const revisionQuery = viewRevision === "latest" ? "?revision=latest" : "";
   const revisionSuffix =
     viewRevision === "latest" && latestRevision > 0
@@ -268,7 +275,11 @@ const ReceiptRoute = () => {
                 >
                   <dt className="font-semibold">{field.label}</dt>
                   <dd className="mt-2 whitespace-pre-wrap break-words text-[var(--ink-soft)]">
-                    {receiptFieldValue(field, displayedData[field.tag])}
+                    {receiptFieldValue(
+                      field,
+                      displayedData[field.tag],
+                      selectedPictures?.[field.tag]
+                    )}
                   </dd>
                 </div>
               ))}

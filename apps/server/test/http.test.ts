@@ -2147,6 +2147,7 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   if (!publishedManifestRecord?.manifest) {
     throw new Error("The published manifest was not persisted");
   }
+  const publishedManifest = publishedManifestRecord.manifest;
   const publishedBytes = await readObject(publishedManifestRecord.objectKey);
   const expectedPublishedHash = createHash("sha256")
     .update(publishedBytes)
@@ -2157,6 +2158,7 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   });
   expect(publishedManifestRecord.manifest).toMatchObject({
     configurationHash: expectedPublishedHash,
+    displayMetadataVersion: 1,
   });
   expect(publishedManifestRecord.manifest.fields).toMatchObject([
     {
@@ -2404,6 +2406,52 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     pictureMaxWidth: 4096,
     type: "picture",
   });
+  const orderedPlaceholderFixture = docxXmlFixture({
+    additionalParts: {
+      "word/_rels/document.xml.rels": strToU8(
+        `<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdGlossary" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/glossaryDocument" Target="glossary/document.xml"/></Relationships>`
+      ),
+      "word/glossary/document.xml": strToU8(
+        `<?xml version="1.0"?><w:glossaryDocument xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:docParts><w:docPart><w:docPartPr><w:docPartName w:val="ReceiptPrompt"/></w:docPartPr><w:docPartBody><w:p><w:r><w:t>Configured glossary placeholder</w:t></w:r></w:p></w:docPartBody></w:docPart></w:docParts></w:glossaryDocument>`
+      ),
+    },
+    document: contentControlDocument(
+      `<w:sdt><w:sdtPr><w:alias w:val="Parent label"/><w:tag w:val="parent"/><w:text/></w:sdtPr><w:sdtContent><w:sdt><w:sdtPr><w:alias w:val="Child label"/><w:tag w:val="child"/><w:text/></w:sdtPr><w:sdtContent><w:r><w:t>Child answer</w:t></w:r></w:sdtContent></w:sdt></w:sdtContent></w:sdt>` +
+        `<w:sdt><w:sdtPr><w:alias w:val="Prompt label"/><w:tag w:val="prompt"/><w:placeholder><w:docPart w:val="ReceiptPrompt"/></w:placeholder><w:text/></w:sdtPr><w:sdtContent><w:r><w:t>Entered answer</w:t></w:r></w:sdtContent></w:sdt>`
+    ),
+  });
+  const orderedPlaceholderResult = await publishFixture(
+    "nested-and-glossary-placeholder",
+    orderedPlaceholderFixture
+  );
+  const orderedPlaceholderForm = await prisma.form.findUniqueOrThrow({
+    select: { id: true },
+    where: { publicId: orderedPlaceholderResult.publicId },
+  });
+  const orderedPlaceholderPublished =
+    await prisma.publishedTemplate.findUniqueOrThrow({
+      include: { manifest: { include: { fields: true } } },
+      where: { formId: orderedPlaceholderForm.id },
+    });
+  expect(
+    orderedPlaceholderPublished.manifest?.fields
+      .toSorted((left, right) => left.position - right.position)
+      .map(({ label, placeholder, position, tag }) => ({
+        label,
+        placeholder,
+        position,
+        tag,
+      }))
+  ).toEqual([
+    { label: "Parent label", placeholder: null, position: 0, tag: "parent" },
+    { label: "Child label", placeholder: null, position: 1, tag: "child" },
+    {
+      label: "Prompt label",
+      placeholder: "Configured glossary placeholder",
+      position: 2,
+      tag: "prompt",
+    },
+  ]);
   const requiredPictureCreateResponse = await app.handle(
     formCreationRequest({
       authorization: adminBearer,
@@ -2887,6 +2935,24 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   expect(await readObject(pictureCorrection.objectKey)).toEqual(
     nextPictureDocument
   );
+  await putObject(
+    pictureCorrection.objectKey,
+    pictureDocumentFixture(),
+    DOCX_CONTENT_TYPE
+  );
+  const pictureRevisionsResponse = await pictureApp.handle(
+    new Request(
+      `http://test.local/api/responses/${pictureResponseId}/corrections`,
+      { headers: { Authorization: `Bearer ${adminBearer}` } }
+    )
+  );
+  expect(pictureRevisionsResponse.status).toBe(200);
+  expect(await pictureRevisionsResponse.json()).toMatchObject({
+    revisions: [
+      { pictures: { photo: true }, revision: 0 },
+      { pictures: { photo: false }, revision: 1 },
+    ],
+  });
   const invalidFixtureCases = [
     {
       bytes: docxFixture("no-controls"),
@@ -5792,6 +5858,40 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   );
   expect(forbiddenDataResponse.status).toBe(403);
 
+  await prisma.$transaction(async (tx) => {
+    await tx.$executeRaw`ALTER TABLE "field_manifests" DISABLE TRIGGER "field_manifests_immutable"`;
+    await tx.$executeRaw`ALTER TABLE "manifest_fields" DISABLE TRIGGER "manifest_fields_immutable"`;
+    try {
+      await tx.$executeRaw`
+        UPDATE "manifest_fields"
+        SET "position" = "position" + 100000
+        WHERE "manifest_id" = ${publishedManifest.id}::uuid
+      `;
+      await tx.$executeRaw`
+        WITH ranked_fields AS (
+          SELECT
+            "id",
+            (ROW_NUMBER() OVER (ORDER BY "tag") - 1)::integer AS "position"
+          FROM "manifest_fields"
+          WHERE "manifest_id" = ${publishedManifest.id}::uuid
+        )
+        UPDATE "manifest_fields" AS field
+        SET
+          "label" = field."tag",
+          "placeholder" = NULL,
+          "position" = ranked_fields."position"
+        FROM ranked_fields
+        WHERE field."id" = ranked_fields."id"
+      `;
+      await tx.fieldManifest.update({
+        data: { displayMetadataVersion: 0 },
+        where: { id: publishedManifest.id },
+      });
+    } finally {
+      await tx.$executeRaw`ALTER TABLE "manifest_fields" ENABLE TRIGGER "manifest_fields_immutable"`;
+      await tx.$executeRaw`ALTER TABLE "field_manifests" ENABLE TRIGGER "field_manifests_immutable"`;
+    }
+  });
   const dataResponse = await app.handle(
     new Request(
       `http://test.local/api/submissions/${completedSubmissionId}/data`,
@@ -5830,7 +5930,7 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     }))
   ).toEqual(
     [...publishedManifestRecord.manifest.fields]
-      .sort((left, right) => left.position - right.position)
+      .toSorted((left, right) => left.position - right.position)
       .map(({ label, placeholder, position, tag, type }) => ({
         label,
         placeholder,
@@ -5847,6 +5947,36 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     { displayText: "Human Resources", value: "hr" },
     { displayText: "Finance", value: "finance" },
   ]);
+  await prisma.$transaction(async (tx) => {
+    await tx.$executeRaw`ALTER TABLE "field_manifests" DISABLE TRIGGER "field_manifests_immutable"`;
+    await tx.$executeRaw`ALTER TABLE "manifest_fields" DISABLE TRIGGER "manifest_fields_immutable"`;
+    try {
+      await tx.$executeRaw`
+        UPDATE "manifest_fields"
+        SET "position" = "position" + 100000
+        WHERE "manifest_id" = ${publishedManifest.id}::uuid
+      `;
+      for (const field of dataBody.fields) {
+        await tx.$executeRaw`
+          UPDATE "manifest_fields"
+          SET
+            "label" = ${field.label},
+            "placeholder" = ${field.placeholder},
+            "position" = ${field.position}
+          WHERE "manifest_id" = ${publishedManifest.id}::uuid AND "tag" = ${field.tag}
+        `;
+      }
+      await tx.fieldManifest.update({
+        data: {
+          displayMetadataVersion: publishedManifest.displayMetadataVersion,
+        },
+        where: { id: publishedManifest.id },
+      });
+    } finally {
+      await tx.$executeRaw`ALTER TABLE "manifest_fields" ENABLE TRIGGER "manifest_fields_immutable"`;
+      await tx.$executeRaw`ALTER TABLE "field_manifests" ENABLE TRIGGER "field_manifests_immutable"`;
+    }
+  });
   const ownerJsonResponse = await app.handle(
     new Request(
       `http://test.local/api/submissions/${completedSubmissionId}/json`,
@@ -6160,10 +6290,11 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     )
   );
   expect(latestDataResponse.status).toBe(200);
-  const latestDataBody = (await latestDataResponse.json()) as typeof dataBody & {
-    correction: { reason: string; revision: number } | null;
-    revision: number;
-  };
+  const latestDataBody =
+    (await latestDataResponse.json()) as typeof dataBody & {
+      correction: { reason: string; revision: number } | null;
+      revision: number;
+    };
   expect(latestDataBody).toMatchObject({
     correction: { reason: "แก้ไขตามเอกสารต้นฉบับ", revision: 1 },
     data: correctionData,

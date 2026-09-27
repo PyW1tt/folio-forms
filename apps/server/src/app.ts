@@ -3694,12 +3694,14 @@ interface ParsedTemplateField {
 
 interface TemplateControlFrame {
   alias: string | null;
+  documentOrder: number;
   duplicateMarker: boolean;
   duplicateTag: boolean;
   inContentDepth: number;
   inPropertiesDepth: number;
   markers: Set<FieldType>;
   options: { displayText: string; value: string }[];
+  placeholderName: string | null;
   placeholderText: string;
   propertyStack: string[];
   showingPlaceholder: boolean;
@@ -3796,7 +3798,10 @@ function templateControlAttribute(
   )?.value;
 }
 
-function parsedTemplateField(frame: TemplateControlFrame): ParsedTemplateField {
+function parsedTemplateField(
+  frame: TemplateControlFrame,
+  glossaryPlaceholders: ReadonlyMap<string, string>
+): ParsedTemplateField {
   if (!frame.tag?.trim()) {
     fail(422, "invalid_template", "Every content control must have a tag");
   }
@@ -3864,25 +3869,126 @@ function parsedTemplateField(frame: TemplateControlFrame): ParsedTemplateField {
   }
   const tag = frame.tag.trim();
   const label = frame.alias?.trim();
-  const placeholder = frame.placeholderText.trim();
+  const placeholder =
+    glossaryPlaceholders.get(frame.placeholderName ?? "")?.trim() ||
+    (frame.showingPlaceholder ? frame.placeholderText.trim() : "");
   return {
     label: label || tag,
     options: frame.options.length > 0 ? frame.options : null,
     pictureMaxBytes: type === FieldType.picture ? 10 * 1024 * 1024 : null,
     pictureMaxHeight: type === FieldType.picture ? 4096 : null,
     pictureMaxWidth: type === FieldType.picture ? 4096 : null,
-    placeholder:
-      frame.showingPlaceholder && placeholder.length > 0 ? placeholder : null,
+    placeholder: placeholder || null,
     tag,
     type,
   };
 }
 
+function templateGlossaryPlaceholders(
+  archive: Record<string, Uint8Array>
+): Map<string, string> {
+  const relationshipsPath = templateRelationshipPartPath("word/document.xml");
+  if (!archive[relationshipsPath]) {
+    return new Map();
+  }
+  let glossaryPath: string | null = null;
+  parseTemplateXml(templateArchiveText(archive, relationshipsPath), {
+    open: (element) => {
+      if (
+        element.local === "Relationship" &&
+        element.uri === templatePackageRelationshipNamespace &&
+        templateAttribute(element, "Type") ===
+          "http://schemas.openxmlformats.org/officeDocument/2006/relationships/glossaryDocument" &&
+        templateAttribute(element, "TargetMode") === undefined
+      ) {
+        glossaryPath = resolveTemplateRelationshipTarget(
+          "word/document.xml",
+          templateAttribute(element, "Target")
+        );
+      }
+    },
+  });
+  if (!glossaryPath || !archive[glossaryPath]) {
+    return new Map();
+  }
+  const placeholders = new Map<string, string>();
+  const docParts: {
+    bodyDepth: number;
+    name: string | null;
+    text: string;
+  }[] = [];
+  const elementStack: string[] = [];
+  parseTemplateXml(templateArchiveText(archive, glossaryPath), {
+    close: (element) => {
+      const docPart = docParts.at(-1);
+      if (
+        docPart &&
+        element.local === "docPartBody" &&
+        templateWordNamespaces.has(element.uri)
+      ) {
+        docPart.bodyDepth -= 1;
+      }
+      if (
+        element.local === "docPart" &&
+        templateWordNamespaces.has(element.uri)
+      ) {
+        const completed = docParts.pop();
+        if (
+          completed?.name &&
+          completed.text.trim() &&
+          !placeholders.has(completed.name)
+        ) {
+          placeholders.set(completed.name, completed.text.trim());
+        }
+      }
+      elementStack.pop();
+    },
+    open: (element) => {
+      if (
+        element.local === "docPart" &&
+        templateWordNamespaces.has(element.uri)
+      ) {
+        docParts.push({ bodyDepth: 0, name: null, text: "" });
+      }
+      const docPart = docParts.at(-1);
+      if (!docPart) {
+        elementStack.push(element.local);
+        return;
+      }
+      if (
+        elementStack.at(-1) === "docPartPr" &&
+        element.local === "docPartName" &&
+        templateWordNamespaces.has(element.uri)
+      ) {
+        docPart.name = templateControlAttribute(element, "val") ?? null;
+      }
+      if (
+        element.local === "docPartBody" &&
+        templateWordNamespaces.has(element.uri)
+      ) {
+        docPart.bodyDepth += 1;
+      }
+      elementStack.push(element.local);
+    },
+    text: (value) => {
+      const docPart = docParts.at(-1);
+      if (docPart && docPart.bodyDepth > 0) {
+        docPart.text += value;
+      }
+    },
+  });
+  return placeholders;
+}
+
 function parseTemplateFields(bytes: Uint8Array): ParsedTemplateField[] {
   const { archive, xmlPaths } = safeTemplateArchive(bytes);
-  const fields: ParsedTemplateField[] = [];
   const controlPaths = reachableTemplateControlParts(archive, xmlPaths);
+  const fields: { documentOrder: number; field: ParsedTemplateField }[] = [];
+  const glossaryPlaceholders = templateGlossaryPlaceholders(archive);
+  let documentOrderOffset = 0;
   for (const archivePath of controlPaths) {
+    const documentOrderBase = documentOrderOffset;
+    let documentOrder = 0;
     let alternateFallbackDepth = 0;
     const controls: TemplateControlFrame[] = [];
     parseTemplateXml(templateArchiveText(archive, archivePath), {
@@ -3925,7 +4031,10 @@ function parseTemplateFields(bytes: Uint8Array): ParsedTemplateField[] {
           templateWordNamespaces.has(element.uri)
         ) {
           controls.pop();
-          fields.push(parsedTemplateField(frame));
+          fields.push({
+            documentOrder: documentOrderBase + frame.documentOrder,
+            field: parsedTemplateField(frame, glossaryPlaceholders),
+          });
         }
       },
       open: (element) => {
@@ -3943,14 +4052,18 @@ function parseTemplateFields(bytes: Uint8Array): ParsedTemplateField[] {
           element.local === "sdt" &&
           templateWordNamespaces.has(element.uri)
         ) {
+          const controlOrder = documentOrderBase + documentOrder;
+          documentOrder += 1;
           controls.push({
             alias: null,
+            documentOrder: controlOrder,
             duplicateMarker: false,
             duplicateTag: false,
             inContentDepth: 0,
             inPropertiesDepth: 0,
             markers: new Set(),
             options: [],
+            placeholderName: null,
             placeholderText: "",
             propertyStack: [],
             showingPlaceholder: false,
@@ -4033,6 +4146,15 @@ function parseTemplateFields(bytes: Uint8Array): ParsedTemplateField[] {
           frame.alias = templateControlAttribute(element, "val") ?? null;
         }
         if (
+          frame.inPropertiesDepth === 2 &&
+          parentProperty === "placeholder" &&
+          templateWordNamespaces.has(element.uri) &&
+          element.local === "docPart"
+        ) {
+          frame.placeholderName =
+            templateControlAttribute(element, "val") ?? null;
+        }
+        if (
           isDirectProperty &&
           templateWordNamespaces.has(element.uri) &&
           element.local === "showingPlcHdr"
@@ -4103,6 +4225,7 @@ function parseTemplateFields(bytes: Uint8Array): ParsedTemplateField[] {
         }
       },
     });
+    documentOrderOffset += documentOrder;
   }
 
   if (fields.length === 0) {
@@ -4112,9 +4235,13 @@ function parseTemplateFields(bytes: Uint8Array): ParsedTemplateField[] {
       "The template must contain at least one tagged content control"
     );
   }
-  const duplicates = fields.filter(
+  const orderedFields = fields
+    .toSorted((left, right) => left.documentOrder - right.documentOrder)
+    .map(({ field }) => field);
+  const duplicates = orderedFields.filter(
     (field, index) =>
-      fields.findIndex((candidate) => candidate.tag === field.tag) !== index
+      orderedFields.findIndex((candidate) => candidate.tag === field.tag) !==
+      index
   );
   if (duplicates.length > 0) {
     fail(
@@ -4123,7 +4250,7 @@ function parseTemplateFields(bytes: Uint8Array): ParsedTemplateField[] {
       `Content control tags must be unique: ${[...new Set(duplicates.map((field) => field.tag))].join(", ")}`
     );
   }
-  return fields;
+  return orderedFields;
 }
 
 function validateTemplateControls(bytes: Uint8Array): string[] {
@@ -4338,12 +4465,13 @@ function validateResponsePictureControls(
   bytes: Uint8Array,
   manifestFields: readonly ResponsePictureManifestField[],
   enforceRequired: boolean
-): void {
+): Set<string> {
   const pictureFields = manifestFields.filter(
     (field) => field.type === FieldType.picture
   );
+  const presentTags = new Set<string>();
   if (pictureFields.length === 0) {
-    return;
+    return presentTags;
   }
   const { archive, xmlPaths } = safeTemplateArchive(bytes);
   const fieldsByTag = new Map(pictureFields.map((field) => [field.tag, field]));
@@ -4511,6 +4639,7 @@ function validateResponsePictureControls(
         invalidResponsePicture(control.tag, "target media is missing");
       }
       validateResponsePictureMediaBytes(control.tag, media, field);
+      presentTags.add(control.tag);
     }
   }
   for (const field of pictureFields) {
@@ -4518,6 +4647,20 @@ function validateResponsePictureControls(
       invalidResponsePicture(field.tag, "content control is missing");
     }
   }
+  return presentTags;
+}
+function responsePicturePresence(
+  bytes: Uint8Array,
+  pictureFields: readonly ResponsePictureManifestField[]
+): Record<string, boolean> {
+  const presentTags = validateResponsePictureControls(
+    bytes,
+    pictureFields,
+    false
+  );
+  return Object.fromEntries(
+    pictureFields.map(({ tag }) => [tag, presentTags.has(tag)])
+  );
 }
 function manifestFieldValueMatches(
   field: { options: unknown; type: FieldType },
@@ -7296,6 +7439,7 @@ interface CorrectionRevisionSummary {
   id: string | null;
   reason: string | null;
   revision: number;
+  pictures: Record<string, boolean> | null;
 }
 type RevisionSelector = "original" | "latest";
 
@@ -7333,7 +7477,8 @@ function selectedSubmissionRevision(
 function correctionRevisionSummary(
   correction: Correction,
   actor: Pick<Actor, "email" | "name"> | undefined,
-  documentAvailable: boolean
+  documentAvailable: boolean,
+  pictures: Record<string, boolean> | null
 ): CorrectionRevisionSummary {
   return {
     actorEmail: actor?.email ?? null,
@@ -7343,6 +7488,7 @@ function correctionRevisionSummary(
     documentAvailable,
     documentKey: correction.documentKey,
     id: correction.id,
+    pictures,
     reason: correction.reason,
     revision: correction.revision,
   };
@@ -7384,6 +7530,45 @@ function findSubmissionWithRevisions(
         : {}),
     },
     where: { id },
+  });
+}
+async function receiptManifestFields(submission: SubmissionWithManifest) {
+  const publishedTemplate = submission.response?.publishedTemplate;
+  const manifest = publishedTemplate?.manifest;
+  if (!manifest) {
+    return [];
+  }
+  if (manifest.displayMetadataVersion !== 0) {
+    return manifest.fields;
+  }
+  const documentFields = parseTemplateFields(
+    await readObject(publishedTemplate.objectKey)
+  );
+  if (documentFields.length !== manifest.fields.length) {
+    fail(
+      500,
+      "internal_error",
+      "The published Field Manifest does not match its document"
+    );
+  }
+  const fieldsByTag = new Map(
+    manifest.fields.map((field) => [field.tag, field])
+  );
+  return documentFields.map((documentField, position) => {
+    const field = fieldsByTag.get(documentField.tag);
+    if (!field) {
+      fail(
+        500,
+        "internal_error",
+        "The published Field Manifest does not match its document"
+      );
+    }
+    return {
+      ...field,
+      label: documentField.label,
+      placeholder: documentField.placeholder,
+      position,
+    };
   });
 }
 
@@ -10139,6 +10324,9 @@ export function createApp(options: AppOptions = {}) {
       const response = await prisma.response.findUnique({
         include: {
           corrections: { orderBy: { revision: "desc" } },
+          publishedTemplate: {
+            include: { manifest: { include: { fields: true } } },
+          },
           submission: true,
         },
         where: { id: params.id },
@@ -10166,16 +10354,34 @@ export function createApp(options: AppOptions = {}) {
       const originalAvailable = await objectExists(
         response.submission.objectKey
       );
-      const correctionSummaries = await Promise.all(
-        response.corrections
-          .toReversed()
-          .map(async (correction) =>
-            correctionRevisionSummary(
-              correction,
-              actorById.get(correction.actorId),
-              await objectExists(correction.objectKey)
+      const pictureFields =
+        response.publishedTemplate.manifest?.fields.filter(
+          (field) => field.type === FieldType.picture
+        ) ?? [];
+      const originalPictures =
+        originalAvailable && pictureFields.length > 0
+          ? responsePicturePresence(
+              await readObject(response.submission.objectKey),
+              pictureFields
             )
-          )
+          : null;
+      const correctionSummaries = await Promise.all(
+        response.corrections.toReversed().map(async (correction) => {
+          const documentAvailable = await objectExists(correction.objectKey);
+          const pictures =
+            documentAvailable && pictureFields.length > 0
+              ? responsePicturePresence(
+                  await readObject(correction.objectKey),
+                  pictureFields
+                )
+              : null;
+          return correctionRevisionSummary(
+            correction,
+            actorById.get(correction.actorId),
+            documentAvailable,
+            pictures
+          );
+        })
       );
       await createResponseAudit({
         action: "view_response",
@@ -10211,6 +10417,7 @@ export function createApp(options: AppOptions = {}) {
               state: "submission",
             },
             id: null,
+            pictures: originalPictures,
             reason: null,
             revision: 0,
           },
@@ -10224,6 +10431,7 @@ export function createApp(options: AppOptions = {}) {
               state: "correction",
             },
             id: correction.id,
+            pictures: correction.pictures,
             reason: correction.reason,
             revision: correction.revision,
           })),
@@ -10695,6 +10903,7 @@ export function createApp(options: AppOptions = {}) {
         targetId: selected.correction?.id ?? submission.responseId,
         targetType: selected.correction ? "correction" : "submission",
       });
+      const manifestFields = await receiptManifestFields(submission);
       return {
         correction: selected.correction
           ? {
@@ -10704,34 +10913,31 @@ export function createApp(options: AppOptions = {}) {
             }
           : null,
         data: selected.data,
-        fields:
-          submission.response?.publishedTemplate.manifest?.fields.map(
-            (field) => ({
-              label: field.label,
-              options: Array.isArray(field.options)
-                ? field.options.flatMap((option) => {
-                    if (
-                      !option ||
-                      typeof option !== "object" ||
-                      Array.isArray(option)
-                    ) {
-                      return [];
-                    }
-                    const optionRecord = option as Record<string, unknown>;
-                    const displayText = optionRecord.displayText;
-                    const value = optionRecord.value;
-                    return typeof displayText === "string" &&
-                      typeof value === "string"
-                      ? [{ displayText, value }]
-                      : [];
-                  })
-                : [],
-              placeholder: field.placeholder,
-              position: field.position,
-              tag: field.tag,
-              type: field.type,
-            })
-          ) ?? [],
+        fields: manifestFields.map((field) => ({
+          label: field.label,
+          options: Array.isArray(field.options)
+            ? field.options.flatMap((option) => {
+                if (
+                  !option ||
+                  typeof option !== "object" ||
+                  Array.isArray(option)
+                ) {
+                  return [];
+                }
+                const optionRecord = option as Record<string, unknown>;
+                const displayText = optionRecord.displayText;
+                const value = optionRecord.value;
+                return typeof displayText === "string" &&
+                  typeof value === "string"
+                  ? [{ displayText, value }]
+                  : [];
+              })
+            : [],
+          placeholder: field.placeholder,
+          position: field.position,
+          tag: field.tag,
+          type: field.type,
+        })),
         returnUrl: prefillReturnUrl,
         revision: selected.revision,
         submission: submissionSummary(submission, {

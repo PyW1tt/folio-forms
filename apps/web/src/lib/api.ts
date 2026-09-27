@@ -113,6 +113,7 @@ export interface ResponseRevision {
   actorName: string | null;
   createdAt: string;
   data: Record<string, unknown>;
+  pictures: Record<string, boolean> | null;
   document: {
     available: boolean;
     state: "submission" | "correction";
