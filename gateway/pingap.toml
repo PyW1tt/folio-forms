@@ -7,6 +7,9 @@ addrs = ["server:3000"]
 [upstreams.web]
 addrs = ["web:80"]
 
+[upstreams.web_assets]
+addrs = ["web-assets:80"]
+
 [upstreams.onlyoffice]
 addrs = ["onlyoffice:80"]
 
@@ -79,6 +82,15 @@ proxy_set_headers = [
 ]
 plugins = ["compression"]
 
+[locations.assets]
+path = "~^/assets(?:/|$)"
+upstream = "web_assets"
+proxy_set_headers = [
+  "Host:$http_host",
+  "X-Forwarded-For:$proxy_add_x_forwarded_for",
+]
+plugins = ["compression"]
+
 
 [locations.web]
 path = "/"
@@ -98,5 +110,6 @@ locations = [
   "onlyoffice",
   "prefill",
   "office",
+  "assets",
   "web",
 ]

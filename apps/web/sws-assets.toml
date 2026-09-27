@@ -1,7 +1,6 @@
 [general]
 port = 80
 root = "/home/sws/public"
-page-fallback = "/home/sws/public/index.html"
 cache-control-headers = false
 
 [advanced]

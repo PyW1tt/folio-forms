@@ -154,6 +154,23 @@ services:
       timeout: 5s
       retries: 12
 
+  web-assets:
+    image: hadesgod/folio-web
+    platform: linux/amd64
+    restart: unless-stopped
+    depends_on:
+      web:
+        condition: service_healthy
+    environment:
+      SERVER_CONFIG_FILE: /etc/sws-assets.toml
+    expose:
+      - "80"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "--quiet", "http://127.0.0.1/"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
   gateway:
     image: vicanso/pingap:0.14.2
     restart: unless-stopped
@@ -161,6 +178,8 @@ services:
       server:
         condition: service_healthy
       web:
+        condition: service_healthy
+      web-assets:
         condition: service_healthy
       onlyoffice:
         condition: service_healthy

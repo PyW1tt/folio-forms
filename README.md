@@ -53,7 +53,7 @@ This is a single-host, single-disk deployment with no application or off-host ba
 | Authentication | Better Auth opaque bearer sessions | Forms host only |
 | Object storage | RustFS 1.0.0-rc.6, private S3 bucket | Private Compose network only |
 
-The web image keeps the pinned Bun builder and serves its bundle with digest-pinned `joseluisq/static-web-server:2.44.0-alpine` on internal port `80`. `apps/web/sws.toml` configures the `/index.html` SPA fallback and `Content-Security-Policy: frame-ancestors 'self'` plus `X-Frame-Options: SAMEORIGIN`; gateway routes remain unchanged.
+The web image uses digest-pinned `joseluisq/static-web-server:2.44.0-alpine` on internal port `80`. Both SWS configs disable automatic extension cache headers and send `Cache-Control: no-cache`, so SPA entry pages revalidate. Production Pingap routes `/assets` to a second instance of the same image without SPA fallback, so missing bundles return 404 instead of HTML; all other web paths retain deep-route SPA fallback. Both configs retain `Content-Security-Policy: frame-ancestors 'self'` and `X-Frame-Options: SAMEORIGIN`.
 
 ## Quick start
 
@@ -387,7 +387,8 @@ apps/
     src/components/        App shell, editor wrapper, UI primitives
     src/lib/               API client and auth provider
     Dockerfile             Production static web image
-    sws.toml               Port 80, SPA fallback, same-origin frame policy
+    sws.toml               Port 80, SPA fallback, no-cache, same-origin frame policy
+    sws-assets.toml         Port 80, no SPA fallback, no-cache, same-origin frame policy
 packages/
   auth/                    Better Auth configuration and bearer plugin
   db/                      Prisma schema, generated client, and checked-in migration

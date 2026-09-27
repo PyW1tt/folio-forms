@@ -12,6 +12,7 @@ FROM joseluisq/static-web-server:2.44.0-alpine@sha256:c6704bc8f1fe05378d91c32884
 ENV SERVER_CONFIG_FILE=/etc/sws.toml
 
 COPY apps/web/sws.toml /etc/sws.toml
+COPY apps/web/sws-assets.toml /etc/sws-assets.toml
 COPY --from=builder /app/apps/web/dist /home/sws/public
 
 EXPOSE 80
