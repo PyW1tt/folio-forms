@@ -249,6 +249,7 @@ type Actor = Pick<
   Identity,
   "email" | "id" | "mustChangePassword" | "name" | "role"
 >;
+type EditorCapabilityIdentity = Actor & Pick<Identity, "expiresAt" | "isSso">;
 type AccountAuditAction =
   | "create_user"
   | "delete_user"
@@ -271,7 +272,7 @@ const adminUserSelect = {
 } as const;
 type AdminUser = Prisma.UserGetPayload<{ select: typeof adminUserSelect }>;
 interface EditorAuthorization {
-  actor: Actor;
+  actor: EditorCapabilityIdentity;
   capability: EditorCapabilityClaims | null;
 }
 type ActionEditorAuthorization = EditorAuthorization & {
@@ -2273,12 +2274,11 @@ async function editorAuthorization(
     },
     where: { id: capability.actorId },
   });
-  const ssoSession =
-    user?.mustChangePassword === true ? await identityFor(request) : null;
+  const ssoUser = capability.isSso === true && user?.role === "user";
   if (
     !user?.enabled ||
-    (user.mustChangePassword &&
-      !(ssoSession?.isSso && ssoSession.id === user.id)) ||
+    (capability.isSso === true && user.role !== "user") ||
+    (user.mustChangePassword && !ssoUser) ||
     user.role !== capability.role
   ) {
     fail(
@@ -2290,13 +2290,52 @@ async function editorAuthorization(
   return {
     actor: {
       email: user.email,
+      expiresAt: new Date(capability.expiresAt * 1000),
       id: user.id,
+      isSso: capability.isSso === true,
       mustChangePassword: false,
       name: user.name,
       role: user.role,
     },
     capability,
   };
+}
+function actionEditorCapability(
+  identity: EditorCapabilityIdentity,
+  scope: Omit<EditorCapabilityScope, "action" | "operationId">,
+  action: Exclude<EditorCapabilityAction, "poll-operation">,
+  lease: EditorLeaseGrant
+): string {
+  return createEditorCapability({
+    ...scope,
+    action,
+    actorId: identity.id,
+    expiresAt: identity.isSso
+      ? Math.floor(identity.expiresAt.getTime() / 1000)
+      : undefined,
+    isSso: identity.isSso === true,
+    leaseId: lease.id,
+    leaseProof: lease.proof,
+    role: identity.role,
+  });
+}
+
+function operationEditorCapability(
+  identity: EditorCapabilityIdentity,
+  scope: Omit<EditorCapabilityScope, "action" | "operationId">,
+  operationId: string
+): string {
+  return createEditorCapability({
+    ...scope,
+    action: "poll-operation",
+    actorId: identity.id,
+    expiresAt: identity.isSso
+      ? Math.floor(identity.expiresAt.getTime() / 1000)
+      : undefined,
+    isSso: identity.isSso === true,
+    operationId,
+    role: identity.role,
+  });
 }
 async function requireActionEditorAuthorization(
   request: Request
@@ -2337,35 +2376,6 @@ function requireEditorScope(
   }
 }
 
-function actionEditorCapability(
-  actor: Actor,
-  scope: Omit<EditorCapabilityScope, "action" | "operationId">,
-  action: Exclude<EditorCapabilityAction, "poll-operation">,
-  lease: EditorLeaseGrant
-): string {
-  return createEditorCapability({
-    ...scope,
-    action,
-    actorId: actor.id,
-    leaseId: lease.id,
-    leaseProof: lease.proof,
-    role: actor.role,
-  });
-}
-
-function operationEditorCapability(
-  actor: Actor,
-  scope: Omit<EditorCapabilityScope, "action" | "operationId">,
-  operationId: string
-): string {
-  return createEditorCapability({
-    ...scope,
-    action: "poll-operation",
-    actorId: actor.id,
-    operationId,
-    role: actor.role,
-  });
-}
 
 function editorLeaseTargetType(
   targetType: EditorCapabilityTarget

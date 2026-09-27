@@ -760,42 +760,184 @@ test("linked role=user completes browser-bound SSO and receives a normal session
       role: "user",
     },
   });
-  const ssoFormResponse = await handle(
-    new Request(`https://folio.example.test/api/forms/${"b".repeat(32)}`, {
-      headers: { Authorization: `Bearer ${bearer}` },
-    })
+  const ssoSession = await prisma.session.findFirst({
+    orderBy: { createdAt: "desc" },
+    where: { isSso: true, userId: user.id },
+  });
+  if (!ssoSession) {
+    throw new Error("The linked User SSO session was not created");
+  }
+  const boundedSessionExpiry = new Date(Date.now() + 60_000);
+  await prisma.session.update({
+    data: { expiresAt: boundedSessionExpiry },
+    where: { id: ssoSession.id },
+  });
+  const formId = crypto.randomUUID();
+  const formPublicId = crypto.randomUUID().replaceAll("-", "");
+  const templateDocumentKey = `ticket-12-template-${crypto.randomUUID()}`;
+  const templateObjectKey = objectKey(
+    "forms",
+    formId,
+    "published",
+    crypto.randomUUID(),
+    "ticket-12.docx"
   );
-  expect(ssoFormResponse.status).toBe(404);
-  const editorCapability = createEditorCapability({
+  const templateDocument = docxFixture(`ticket-12-${crypto.randomUUID()}`);
+  await putObject(templateObjectKey, templateDocument, DOCX_CONTENT_TYPE);
+  await prisma.form.create({
+    data: {
+      createdBy: user.id,
+      id: formId,
+      publicId: formPublicId,
+      publishedTemplate: {
+        create: {
+          contentHash: createHash("sha256")
+            .update(templateDocument)
+            .digest("hex"),
+          documentKey: templateDocumentKey,
+          id: crypto.randomUUID(),
+          manifest: {
+            create: {
+              configurationHash: createHash("sha256")
+                .update("ticket-12-manifest")
+                .digest("hex"),
+              id: crypto.randomUUID(),
+            },
+          },
+          objectKey: templateObjectKey,
+          version: 1,
+        },
+      },
+      status: "published",
+      title: "Ticket 12 SSO capability form",
+      version: 1,
+    },
+  });
+  const startResponse = await handle(
+    new Request(
+      `https://folio.example.test/api/forms/${formPublicId}/start`,
+      {
+        headers: { Authorization: `Bearer ${bearer}` },
+        method: "POST",
+      }
+    )
+  );
+  expect(startResponse.status).toBe(200);
+  const startBody = (await startResponse.json()) as {
+    response?: { id?: string };
+  };
+  const responseId = startBody.response?.id;
+  if (!responseId) {
+    throw new Error("The linked User response was not started");
+  }
+  const editorResponse = await handle(
+    new Request(
+      `https://folio.example.test/api/forms/${formPublicId}/editor-config?responseId=${responseId}&action=fill`,
+      { headers: { Authorization: `Bearer ${bearer}` } }
+    )
+  );
+  expect(editorResponse.status).toBe(200);
+  const editorConfig = (await editorResponse.json()) as EditorConfigBody;
+  const ssoCapability =
+    editorConfig.bridge.capabilities["save-draft"];
+  if (!ssoCapability) {
+    throw new Error("The linked User editor capability was not returned");
+  }
+  const ssoCapabilityClaims = verifyEditorCapability(ssoCapability);
+  if (
+    !ssoCapabilityClaims ||
+    !ssoCapabilityClaims.leaseId ||
+    !ssoCapabilityClaims.leaseProof
+  ) {
+    throw new Error("The linked User editor capability did not verify");
+  }
+  expect(ssoCapabilityClaims).toMatchObject({
     action: "save-draft",
     actorId: user.id,
-    documentKey: "ticket-12-document",
-    formId: crypto.randomUUID(),
-    leaseId: crypto.randomUUID(),
-    leaseProof: "ticket-12-lease-proof",
+    isSso: true,
     role: "user",
-    targetId: crypto.randomUUID(),
-    targetType: "response",
   });
+  expect(ssoCapabilityClaims.expiresAt).toBeLessThanOrEqual(
+    Math.floor(boundedSessionExpiry.getTime() / 1000)
+  );
   const capabilityRequest = (token: string) =>
     handle(
       new Request(
-        `https://folio.example.test/api/forms/${"b".repeat(32)}/draft`,
+        `https://folio.example.test/api/forms/${formPublicId}/draft`,
         {
           body: JSON.stringify({
-            documentKey: "ticket-12-document",
-            responseId: crypto.randomUUID(),
+            data: {},
+            documentKey: ssoCapabilityClaims.documentKey,
+            responseId,
           }),
           headers: {
             ...jsonHeaders,
-            Authorization: `Bearer ${token}`,
-            "X-Editor-Capability": editorCapability,
+            "X-Editor-Capability": token,
           },
           method: "POST",
         }
       )
     );
-  expect((await capabilityRequest(bearer)).status).toBe(404);
+  const ssoDraftResponse = await capabilityRequest(ssoCapability);
+  expect(ssoDraftResponse.status).toBe(202);
+  const ssoDraftBody = (await ssoDraftResponse.json()) as {
+    operationCapability?: string;
+  };
+  if (!ssoDraftBody.operationCapability) {
+    throw new Error("The SSO save did not return an operation capability");
+  }
+  const operationClaims = verifyEditorCapability(
+    ssoDraftBody.operationCapability
+  );
+  expect(operationClaims).toMatchObject({
+    action: "poll-operation",
+    actorId: user.id,
+    isSso: true,
+    role: "user",
+  });
+  if (!operationClaims) {
+    throw new Error("The SSO operation capability did not verify");
+  }
+  expect(operationClaims.expiresAt).toBeLessThanOrEqual(
+    ssoCapabilityClaims.expiresAt
+  );
+  expect(operationClaims.expiresAt).toBeLessThanOrEqual(
+    Math.floor(boundedSessionExpiry.getTime() / 1000)
+  );
+  const malformedSsoCapability = createEditorCapability({
+    action: ssoCapabilityClaims.action,
+    actorId: user.id,
+    documentKey: ssoCapabilityClaims.documentKey,
+    expiresAt: ssoCapabilityClaims.expiresAt,
+    formId: ssoCapabilityClaims.formId,
+    isSso: "true" as unknown as boolean,
+    leaseId: ssoCapabilityClaims.leaseId,
+    leaseProof: ssoCapabilityClaims.leaseProof,
+    role: "user",
+    targetId: ssoCapabilityClaims.targetId,
+    targetType: ssoCapabilityClaims.targetType,
+  });
+  expect(verifyEditorCapability(malformedSsoCapability)).toBeNull();
+  const admin = await createCredentialFixture({
+    email: `ticket-12-admin-${crypto.randomUUID()}@example.com`,
+    name: "Ticket 12 Admin",
+    password: "Ticket12-admin-password",
+    role: "admin",
+  });
+  const adminSsoCapability = createEditorCapability({
+    action: ssoCapabilityClaims.action,
+    actorId: admin.id,
+    documentKey: ssoCapabilityClaims.documentKey,
+    expiresAt: ssoCapabilityClaims.expiresAt,
+    formId: ssoCapabilityClaims.formId,
+    isSso: true,
+    leaseId: ssoCapabilityClaims.leaseId,
+    leaseProof: ssoCapabilityClaims.leaseProof,
+    role: "admin",
+    targetId: ssoCapabilityClaims.targetId,
+    targetType: ssoCapabilityClaims.targetType,
+  });
+  expect((await capabilityRequest(adminSsoCapability)).status).toBe(401);
 
   const localBearer = await bearerFor(
     email,
@@ -803,7 +945,7 @@ test("linked role=user completes browser-bound SSO and receives a normal session
     `ticket-12-local-${crypto.randomUUID()}`
   );
   const localFormResponse = await handle(
-    new Request(`https://folio.example.test/api/forms/${"b".repeat(32)}`, {
+    new Request(`https://folio.example.test/api/forms/${formPublicId}`, {
       headers: { Authorization: `Bearer ${localBearer}` },
     })
   );
@@ -811,7 +953,23 @@ test("linked role=user completes browser-bound SSO and receives a normal session
   expect(await localFormResponse.json()).toMatchObject({
     error: "password_change_required",
   });
-  expect((await capabilityRequest(localBearer)).status).toBe(401);
+  const localPasswordCapability = createEditorCapability({
+    action: ssoCapabilityClaims.action,
+    actorId: user.id,
+    documentKey: ssoCapabilityClaims.documentKey,
+    expiresAt: ssoCapabilityClaims.expiresAt,
+    formId: ssoCapabilityClaims.formId,
+    leaseId: ssoCapabilityClaims.leaseId,
+    leaseProof: ssoCapabilityClaims.leaseProof,
+    role: "user",
+    targetId: ssoCapabilityClaims.targetId,
+    targetType: ssoCapabilityClaims.targetType,
+  });
+  expect(verifyEditorCapability(localPasswordCapability)).toMatchObject({
+    actorId: user.id,
+    isSso: false,
+  });
+  expect((await capabilityRequest(localPasswordCapability)).status).toBe(401);
 
   const callbackReplay = await handle(
     new Request(callbackUrl.href, {

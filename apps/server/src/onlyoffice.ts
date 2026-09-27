@@ -73,6 +73,7 @@ export interface EditorCapabilityClaims {
   expiresAt: number;
   formId: string;
   issuedAt: number;
+  isSso?: boolean;
   kind: "editor-capability";
   leaseId?: string;
   leaseProof?: string;
@@ -88,6 +89,7 @@ export interface EditorCapabilityInput {
   documentKey: string;
   expiresAt?: number;
   formId: string;
+  isSso?: boolean;
   leaseId?: string;
   leaseProof?: string;
   operationId?: string;
@@ -290,11 +292,15 @@ function validOperationScope(claims: JsonRecord): boolean {
 
 export function createEditorCapability(input: EditorCapabilityInput): string {
   const now = Math.floor(Date.now() / 1000);
+  const maximumExpiry = now + capabilityLifetimeSeconds(input.action);
   return signToken(
     {
       ...input,
       expiresAt:
-        input.expiresAt ?? now + capabilityLifetimeSeconds(input.action),
+        input.isSso === true
+          ? Math.min(input.expiresAt ?? maximumExpiry, maximumExpiry)
+          : (input.expiresAt ?? maximumExpiry),
+      isSso: input.isSso === undefined ? false : input.isSso,
       issuedAt: now,
       kind: "editor-capability",
     },
@@ -312,6 +318,7 @@ export function verifyEditorCapability(
     !editorCapabilityActions.has(claims.action) ||
     !userRoles.has(claims.role) ||
     !editorCapabilityTargets.has(claims.targetType) ||
+    (claims.isSso !== undefined && typeof claims.isSso !== "boolean") ||
     !capabilityStringFields.every(
       (field) => typeof claims[field] === "string"
     ) ||
