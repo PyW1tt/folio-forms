@@ -68,28 +68,50 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
 
   useEffect(() => {
     let active = true;
+    const loadSessionForToken = async (sessionToken: string) => {
+      const session = await getSession();
+      if (active && getToken() === sessionToken) {
+        setUser(session.user);
+        setExpiresAt(session.session.expiresAt);
+      }
+    };
     const loadSession = async () => {
-      let sessionToken = getToken();
+      const originalToken = getToken();
+      let sessionToken = originalToken;
       try {
         if (!sessionToken) {
-          sessionToken = await claimLegacySsoSession();
-          if (sessionToken) {
-            setToken(sessionToken);
+          const claimedToken = await claimLegacySsoSession();
+          if (!active || !claimedToken || getToken()) {
+            return;
           }
+          sessionToken = claimedToken;
+          setToken(sessionToken);
         }
-        if (!sessionToken) {
-          return;
-        }
-        const session = await getSession();
-        if (active && getToken() === sessionToken) {
-          setUser(session.user);
-          setExpiresAt(session.session.expiresAt);
+        if (sessionToken) {
+          await loadSessionForToken(sessionToken);
         }
       } catch {
-        if (active && sessionToken && getToken() === sessionToken) {
-          clearToken();
-          setUser(null);
-          setExpiresAt(null);
+        if (!active || !sessionToken || getToken() !== sessionToken) {
+          return;
+        }
+        clearToken();
+        setUser(null);
+        setExpiresAt(null);
+        if (!originalToken) {
+          return;
+        }
+        try {
+          const claimedToken = await claimLegacySsoSession();
+          if (!active || !claimedToken || getToken()) {
+            return;
+          }
+          sessionToken = claimedToken;
+          setToken(sessionToken);
+          await loadSessionForToken(sessionToken);
+        } catch {
+          if (active && getToken() === sessionToken) {
+            clearToken();
+          }
         }
       } finally {
         if (active) {

@@ -2290,7 +2290,9 @@ async function editorAuthorization(
   return {
     actor: {
       email: user.email,
-      expiresAt: new Date(capability.expiresAt * 1000),
+      expiresAt: new Date(
+        (capability.sessionExpiresAt ?? capability.expiresAt) * 1000
+      ),
       id: user.id,
       isSso: capability.isSso === true,
       mustChangePassword: false,
@@ -2317,6 +2319,9 @@ function actionEditorCapability(
     leaseId: lease.id,
     leaseProof: lease.proof,
     role: identity.role,
+    sessionExpiresAt: identity.isSso
+      ? Math.floor(identity.expiresAt.getTime() / 1000)
+      : undefined,
   });
 }
 
@@ -2335,6 +2340,9 @@ function operationEditorCapability(
     isSso: identity.isSso === true,
     operationId,
     role: identity.role,
+    sessionExpiresAt: identity.isSso
+      ? Math.floor(identity.expiresAt.getTime() / 1000)
+      : undefined,
   });
 }
 async function requireActionEditorAuthorization(

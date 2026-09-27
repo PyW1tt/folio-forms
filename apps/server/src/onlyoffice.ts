@@ -74,6 +74,7 @@ export interface EditorCapabilityClaims {
   formId: string;
   issuedAt: number;
   isSso?: boolean;
+  sessionExpiresAt?: number;
   kind: "editor-capability";
   leaseId?: string;
   leaseProof?: string;
@@ -90,6 +91,7 @@ export interface EditorCapabilityInput {
   expiresAt?: number;
   formId: string;
   isSso?: boolean;
+  sessionExpiresAt?: number;
   leaseId?: string;
   leaseProof?: string;
   operationId?: string;
@@ -298,7 +300,11 @@ export function createEditorCapability(input: EditorCapabilityInput): string {
       ...input,
       expiresAt:
         input.isSso === true
-          ? Math.min(input.expiresAt ?? maximumExpiry, maximumExpiry)
+          ? Math.min(
+              input.expiresAt ?? maximumExpiry,
+              maximumExpiry,
+              input.sessionExpiresAt ?? maximumExpiry
+            )
           : (input.expiresAt ?? maximumExpiry),
       isSso: input.isSso === undefined ? false : input.isSso,
       issuedAt: now,
@@ -312,6 +318,15 @@ export function verifyEditorCapability(
   token: string
 ): EditorCapabilityClaims | null {
   const claims = verifiedTokenPayload(token, env.EDITOR_CAPABILITY_SECRET);
+  const validSsoMetadata =
+    claims?.isSso === true
+      ? typeof claims.issuedAt === "number" &&
+        typeof claims.expiresAt === "number" &&
+        typeof claims.sessionExpiresAt === "number" &&
+        Number.isInteger(claims.sessionExpiresAt) &&
+        claims.sessionExpiresAt > claims.issuedAt &&
+        claims.expiresAt <= claims.sessionExpiresAt
+      : claims?.sessionExpiresAt === undefined;
   if (
     !claims ||
     claims.kind !== "editor-capability" ||
@@ -323,6 +338,7 @@ export function verifyEditorCapability(
       (field) => typeof claims[field] === "string"
     ) ||
     !validCapabilityTimes(claims) ||
+    !validSsoMetadata ||
     !validOperationScope(claims)
   ) {
     return null;

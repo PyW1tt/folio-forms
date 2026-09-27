@@ -767,7 +767,7 @@ test("linked role=user completes browser-bound SSO and receives a normal session
   if (!ssoSession) {
     throw new Error("The linked User SSO session was not created");
   }
-  const boundedSessionExpiry = new Date(Date.now() + 60_000);
+  const boundedSessionExpiry = new Date(Date.now() + 600_000);
   await prisma.session.update({
     data: { expiresAt: boundedSessionExpiry },
     where: { id: ssoSession.id },
@@ -857,6 +857,9 @@ test("linked role=user completes browser-bound SSO and receives a normal session
     isSso: true,
     role: "user",
   });
+  expect(ssoCapabilityClaims.sessionExpiresAt).toBe(
+    Math.floor(boundedSessionExpiry.getTime() / 1000)
+  );
   expect(ssoCapabilityClaims.expiresAt).toBeLessThanOrEqual(
     Math.floor(boundedSessionExpiry.getTime() / 1000)
   );
@@ -889,21 +892,36 @@ test("linked role=user completes browser-bound SSO and receives a normal session
   const operationClaims = verifyEditorCapability(
     ssoDraftBody.operationCapability
   );
+  if (!operationClaims?.operationId) {
+    throw new Error("The SSO operation capability did not verify");
+  }
   expect(operationClaims).toMatchObject({
     action: "poll-operation",
     actorId: user.id,
     isSso: true,
     role: "user",
+    sessionExpiresAt: Math.floor(boundedSessionExpiry.getTime() / 1000),
   });
-  if (!operationClaims) {
-    throw new Error("The SSO operation capability did not verify");
-  }
-  expect(operationClaims.expiresAt).toBeLessThanOrEqual(
+  expect(operationClaims.expiresAt).toBeGreaterThan(
     ssoCapabilityClaims.expiresAt
+  );
+  expect(operationClaims.expiresAt).toBeLessThanOrEqual(
+    operationClaims.issuedAt + 6 * 60
   );
   expect(operationClaims.expiresAt).toBeLessThanOrEqual(
     Math.floor(boundedSessionExpiry.getTime() / 1000)
   );
+  const ssoPollResponse = await handle(
+    new Request(
+      `https://folio.example.test/api/operations/${operationClaims.operationId}`,
+      {
+        headers: {
+          "X-Editor-Capability": ssoDraftBody.operationCapability,
+        },
+      }
+    )
+  );
+  expect(ssoPollResponse.status).toBe(200);
   const malformedSsoCapability = createEditorCapability({
     action: ssoCapabilityClaims.action,
     actorId: user.id,
@@ -918,6 +936,23 @@ test("linked role=user completes browser-bound SSO and receives a normal session
     targetType: ssoCapabilityClaims.targetType,
   });
   expect(verifyEditorCapability(malformedSsoCapability)).toBeNull();
+  const missingSsoExpiryCapability = createEditorCapability({
+    action: ssoCapabilityClaims.action,
+    actorId: user.id,
+    documentKey: ssoCapabilityClaims.documentKey,
+    expiresAt: ssoCapabilityClaims.expiresAt,
+    formId: ssoCapabilityClaims.formId,
+    isSso: true,
+    leaseId: ssoCapabilityClaims.leaseId,
+    leaseProof: ssoCapabilityClaims.leaseProof,
+    role: "user",
+    targetId: ssoCapabilityClaims.targetId,
+    targetType: ssoCapabilityClaims.targetType,
+  });
+  expect(verifyEditorCapability(missingSsoExpiryCapability)).toBeNull();
+  expect(
+    (await capabilityRequest(missingSsoExpiryCapability)).status
+  ).toBe(401);
   const admin = await createCredentialFixture({
     email: `ticket-12-admin-${crypto.randomUUID()}@example.com`,
     name: "Ticket 12 Admin",
@@ -931,6 +966,7 @@ test("linked role=user completes browser-bound SSO and receives a normal session
     expiresAt: ssoCapabilityClaims.expiresAt,
     formId: ssoCapabilityClaims.formId,
     isSso: true,
+    sessionExpiresAt: ssoCapabilityClaims.sessionExpiresAt,
     leaseId: ssoCapabilityClaims.leaseId,
     leaseProof: ssoCapabilityClaims.leaseProof,
     role: "admin",
