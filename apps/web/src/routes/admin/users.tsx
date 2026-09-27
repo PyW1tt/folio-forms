@@ -6,6 +6,7 @@ import {
 import {
   ChevronLeft,
   ChevronRight,
+  Copy,
   KeyRound,
   Mail,
   Pencil,
@@ -228,6 +229,11 @@ const AdminUsersRoute = () => {
   const [temporaryPassword, setTemporaryPassword] = useState<string | null>(
     null
   );
+  const [temporaryPasswordCopyFeedback, setTemporaryPasswordCopyFeedback] =
+    useState<{
+      tone: "danger" | "success";
+      message: string;
+    } | null>(null);
   const [pendingAction, setPendingAction] = useState<string | null>(null);
   const [confirmingAction, setConfirmingAction] = useState<Confirmation | null>(
     null
@@ -259,7 +265,26 @@ const AdminUsersRoute = () => {
   const clearTransientState = () => {
     setFeedback(null);
     setTemporaryPassword(null);
+    setTemporaryPasswordCopyFeedback(null);
     setEmailEditError(null);
+  };
+  const copyTemporaryPassword = async () => {
+    if (!temporaryPassword) {
+      return;
+    }
+
+    try {
+      await navigator.clipboard.writeText(temporaryPassword);
+      setTemporaryPasswordCopyFeedback({
+        message: "คัดลอกรหัสผ่านชั่วคราวแล้ว",
+        tone: "success",
+      });
+    } catch {
+      setTemporaryPasswordCopyFeedback({
+        message: "คัดลอกรหัสผ่านชั่วคราวไม่สำเร็จ กรุณาลองใหม่",
+        tone: "danger",
+      });
+    }
   };
   const leaveAfterOwnMutation = async (targetId: string): Promise<boolean> => {
     if (authenticatedUser?.id !== targetId) {
@@ -632,23 +657,51 @@ const AdminUsersRoute = () => {
       ) : null}
 
       {temporaryPassword ? (
-        <div
-          ref={temporaryPasswordRef}
-          tabIndex={-1}
-          role="status"
-          aria-live="polite"
-          aria-atomic="true"
-          className="mt-4 rounded-[10px] border border-[var(--success)]/25 bg-[var(--success-soft)] px-4 py-3 text-sm text-[var(--success)] focus:outline-none"
-        >
-          <strong className="block">รหัสผ่านชั่วคราว (แสดงครั้งเดียว)</strong>
-          <code className="mt-2 block break-all rounded-md bg-[var(--paper)] px-3 py-2 text-base font-semibold text-[var(--ink)]">
-            {temporaryPassword}
-          </code>
-          <span className="mt-2 block text-xs">
-            จดหรือส่งรหัสนี้ให้เจ้าของบัญชีอย่างปลอดภัย
-            ระบบจะไม่แสดงรหัสนี้อีกหลังจากการดำเนินการครั้งถัดไป
-          </span>
-        </div>
+        <>
+          <div
+            ref={temporaryPasswordRef}
+            tabIndex={-1}
+            role="status"
+            aria-live="polite"
+            aria-atomic="true"
+            className="mt-4 rounded-[10px] border border-[var(--success)]/25 bg-[var(--success-soft)] px-4 py-3 text-sm text-[var(--success)] focus:outline-none"
+          >
+            <strong className="block">รหัสผ่านชั่วคราว (แสดงครั้งเดียว)</strong>
+            <code className="mt-2 block break-all rounded-md bg-[var(--paper)] px-3 py-2 text-base font-semibold text-[var(--ink)]">
+              {temporaryPassword}
+            </code>
+            <span className="mt-2 block text-xs">
+              จดหรือส่งรหัสนี้ให้เจ้าของบัญชีอย่างปลอดภัย
+              ระบบจะไม่แสดงรหัสนี้อีกหลังจากการดำเนินการครั้งถัดไป
+            </span>
+            <Button
+              className="mt-3"
+              onClick={copyTemporaryPassword}
+              size="sm"
+              type="button"
+              variant="secondary"
+            >
+              <Copy aria-hidden="true" size={15} />
+              คัดลอกรหัสผ่านชั่วคราว
+            </Button>
+          </div>
+          <p
+            aria-atomic="true"
+            aria-live="polite"
+            className={
+              temporaryPasswordCopyFeedback
+                ? `mt-2 text-sm font-medium ${
+                    temporaryPasswordCopyFeedback.tone === "danger"
+                      ? "text-[var(--danger)]"
+                      : "text-[var(--success)]"
+                  }`
+                : "sr-only"
+            }
+            role="status"
+          >
+            {temporaryPasswordCopyFeedback?.message ?? ""}
+          </p>
+        </>
       ) : null}
 
       <div className="mt-6 grid gap-6 lg:grid-cols-[minmax(0,0.8fr)_minmax(0,1.2fr)]">
