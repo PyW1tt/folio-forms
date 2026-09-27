@@ -46,12 +46,14 @@ This is a single-host, single-disk deployment with no application or off-host ba
 
 | Component | Technology | Production exposure |
 | --- | --- | --- |
-| Forms web/API | React, Vite, Bun, Elysia | `https://FORMS_HOST` |
+| Forms web/API | React, Vite, Bun, Elysia, `joseluisq/static-web-server:2.44.0-alpine` | `https://FORMS_HOST` (web listens on internal port `80`) |
 | Document editor | ONLYOFFICE Docs Community Edition 9.4.0.1 | `https://FORMS_HOST/office` |
 | Database | PostgreSQL 18 | Private Compose network only |
 | ORM and migrations | Prisma | Applied by the server before readiness |
 | Authentication | Better Auth opaque bearer sessions | Forms host only |
 | Object storage | RustFS 1.0.0-rc.6, private S3 bucket | Private Compose network only |
+
+The web image keeps the pinned Bun builder and serves its bundle with digest-pinned `joseluisq/static-web-server:2.44.0-alpine` on internal port `80`. `apps/web/sws.toml` configures the `/index.html` SPA fallback and `Content-Security-Policy: frame-ancestors 'self'` plus `X-Frame-Options: SAMEORIGIN`; gateway routes remain unchanged.
 
 ## Quick start
 
@@ -385,7 +387,7 @@ apps/
     src/components/        App shell, editor wrapper, UI primitives
     src/lib/               API client and auth provider
     Dockerfile             Production static web image
-    nginx.conf             SPA fallback configuration
+    sws.toml               Port 80, SPA fallback, same-origin frame policy
 packages/
   auth/                    Better Auth configuration and bearer plugin
   db/                      Prisma schema, generated client, and checked-in migration

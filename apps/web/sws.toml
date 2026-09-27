@@ -1,0 +1,12 @@
+[general]
+port = 80
+root = "/home/sws/public"
+page-fallback = "/home/sws/public/index.html"
+
+[advanced]
+
+[[advanced.headers]]
+source = "**"
+[advanced.headers.headers]
+Content-Security-Policy = "frame-ancestors 'self'"
+X-Frame-Options = "SAMEORIGIN"
