@@ -505,7 +505,7 @@ const startLegacySsoBrowser = async (
   if (returnTo !== undefined) {
     startUrl.searchParams.set("returnTo", returnTo);
   }
-  const startResponse = await handle(new Request(startUrl));
+  const startResponse = await handle(new Request(startUrl.href));
   const authorizationUrl = startResponse.headers.get("location");
   if (!authorizationUrl) {
     throw new Error("The legacy SSO start did not redirect to the old backend");
@@ -684,7 +684,7 @@ test("linked role=user completes browser-bound SSO and receives a normal session
   expect([...callbackUrl.searchParams.keys()].sort()).toEqual(["code", "state"]);
   expect(callbackUrl.searchParams.get("code")).toBe(authorizationCode);
   const callbackResponse = await handle(
-    new Request(callbackUrl, {
+    new Request(callbackUrl.href, {
       headers: {
         Cookie: browserStart.preLoginCookie,
         Host: "attacker.example.test",
@@ -814,7 +814,7 @@ test("linked role=user completes browser-bound SSO and receives a normal session
   expect((await capabilityRequest(localBearer)).status).toBe(401);
 
   const callbackReplay = await handle(
-    new Request(callbackUrl, {
+    new Request(callbackUrl.href, {
       headers: { Cookie: browserStart.preLoginCookie },
     })
   );
@@ -884,7 +884,7 @@ test("rejects unsafe returns and mismatched callback state or cookie", async () 
       "https://folio.example.test"
     );
     unsafeStartUrl.searchParams.set("returnTo", unsafeReturn);
-    const unsafeStart = await handle(new Request(unsafeStartUrl));
+    const unsafeStart = await handle(new Request(unsafeStartUrl.href));
     expect(unsafeStart.status).toBe(400);
     expect(unsafeStart.headers.has("set-cookie")).toBe(false);
   }
@@ -903,7 +903,7 @@ test("rejects unsafe returns and mismatched callback state or cookie", async () 
   const wrongStateUrl = new URL(callbackUrl);
   wrongStateUrl.searchParams.set("state", "x".repeat(43));
   const wrongStateResponse = await handle(
-    new Request(wrongStateUrl, {
+    new Request(wrongStateUrl.href, {
       headers: { Cookie: browserStart.preLoginCookie },
     })
   );
@@ -911,7 +911,7 @@ test("rejects unsafe returns and mismatched callback state or cookie", async () 
     legacySsoFailedLocation
   );
   const wrongCookieResponse = await handle(
-    new Request(callbackUrl, {
+    new Request(callbackUrl.href, {
       headers: { Cookie: `__Host-folio-sso=${"y".repeat(43)}` },
     })
   );
@@ -921,7 +921,7 @@ test("rejects unsafe returns and mismatched callback state or cookie", async () 
   const wrongHostUrl = new URL(callbackUrl);
   wrongHostUrl.hostname = "attacker.example.test";
   const wrongHostResponse = await handle(
-    new Request(wrongHostUrl, {
+    new Request(wrongHostUrl.href, {
       headers: { Cookie: browserStart.preLoginCookie },
     })
   );
@@ -929,7 +929,7 @@ test("rejects unsafe returns and mismatched callback state or cookie", async () 
     legacySsoFailedLocation
   );
   const wrongProtocolResponse = await handle(
-    new Request(callbackUrl, {
+    new Request(callbackUrl.href, {
       headers: {
         Cookie: browserStart.preLoginCookie,
         "X-Forwarded-Proto": "http",
@@ -941,7 +941,7 @@ test("rejects unsafe returns and mismatched callback state or cookie", async () 
   );
 
   const validCallback = await handle(
-    new Request(callbackUrl, {
+    new Request(callbackUrl.href, {
       headers: { Cookie: browserStart.preLoginCookie },
     })
   );
@@ -957,16 +957,6 @@ test("rejects unsafe returns and mismatched callback state or cookie", async () 
     ).json()
   ).toEqual({ enabled: true });
 
-  const separatedHandoff = await handle(
-    new Request("https://folio.example.test/api/legacy-sso/session", {
-      headers: {
-        Cookie: prefillCookie,
-        Origin: "https://folio.example.test",
-      },
-      method: "POST",
-    })
-  );
-  expect(separatedHandoff.status).toBe(401);
   expect(
     (await handle(new Request("https://folio.example.test/prefill/handoff")))
       .status
@@ -1171,7 +1161,7 @@ test("old-backend codes bind client, callback, verifier, expiry, and single use"
     email_verified: true,
     sub: `legacy-${crypto.randomUUID()}`,
   };
-  legacySsoMock = startLegacySsoMock({
+  const legacySsoServer = startLegacySsoMock({
     callbackUrl,
     clientId,
     clientSecret,
@@ -1179,12 +1169,13 @@ test("old-backend codes bind client, callback, verifier, expiry, and single use"
     clock: () => new Date(now),
     identity,
   });
+  legacySsoMock = legacySsoServer;
   const verifier = "v".repeat(43);
   const challenge = createHash("sha256")
     .update(verifier)
     .digest("base64url");
   const state = "s".repeat(43);
-  const authorize = new URL(legacySsoMock.authorizeUrl);
+  const authorize = new URL(legacySsoServer.authorizeUrl);
   authorize.searchParams.set("client_id", clientId);
   authorize.searchParams.set("redirect_uri", callbackUrl);
   authorize.searchParams.set("state", state);
@@ -1224,7 +1215,7 @@ test("old-backend codes bind client, callback, verifier, expiry, and single use"
     codeVerifier?: string;
     redirectUri?: string;
   } = {}) =>
-    fetch(legacySsoMock.exchangeUrl, {
+    fetch(legacySsoServer.exchangeUrl, {
       body: new URLSearchParams({
         client_id: exchangeClientId,
         code,
@@ -1262,7 +1253,7 @@ test("old-backend codes bind client, callback, verifier, expiry, and single use"
     throw new Error("The test old backend callback omitted its expiring code");
   }
   now = new Date(now.getTime() + 1001);
-  const expiredResponse = await fetch(legacySsoMock.exchangeUrl, {
+  const expiredResponse = await fetch(legacySsoServer.exchangeUrl, {
     body: new URLSearchParams({
       client_id: clientId,
       code: expiredCode,
@@ -4124,6 +4115,24 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   expect(launchCookieHeader).toContain("HttpOnly");
   expect(launchCookieHeader).toContain("Secure");
   expect(launchCookieHeader).toContain("SameSite=Lax");
+  const prefillBoundarySsoApp = createLegacySsoTestApp({
+    authorizeUrl: "https://legacy.example.test/authorize",
+    callbackUrl: legacySsoCallbackUrl,
+    clientId: "ticket-12-prefill-boundary",
+    clientSecret: "ticket-12-prefill-boundary-secret",
+    exchangeUrl: "https://legacy.example.test/token",
+    providerId: "ticket-12-prefill-boundary",
+  });
+  const separatedHandoff = await prefillBoundarySsoApp.handle(
+    new Request("https://folio.example.test/api/legacy-sso/session", {
+      headers: {
+        Cookie: pendingCookie,
+        Origin: "https://folio.example.test",
+      },
+      method: "POST",
+    })
+  );
+  expect(separatedHandoff.status).toBe(401);
   const redeemedStartResponse = await app.handle(
     new Request(`http://test.local/api/forms/${formRecord.publicId}/start`, {
       headers: {
