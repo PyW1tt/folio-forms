@@ -1424,8 +1424,13 @@ function cookieValueFor(
   return match;
 }
 
-function hostOnlySsoCookie(name: string, value: string, maxAge: number): string {
-  return `${name}=${value}; Path=/; Max-Age=${maxAge}; HttpOnly; Secure; SameSite=Lax`;
+function hostOnlySsoCookie(
+  name: string,
+  value: string,
+  maxAge: number,
+  sameSite: "Lax" | "None" = "Lax"
+): string {
+  return `${name}=${value}; Path=/; Max-Age=${maxAge}; HttpOnly; Secure; SameSite=${sameSite}`;
 }
 
 function legacySsoFailureResponse(): globalThis.Response {
@@ -1437,7 +1442,7 @@ function legacySsoFailureResponse(): globalThis.Response {
   headers.append("Set-Cookie", hostOnlySsoCookie(legacySsoCookieName, "", 0));
   headers.append(
     "Set-Cookie",
-    hostOnlySsoCookie(legacySsoSessionCookieName, "", 0)
+    hostOnlySsoCookie(legacySsoSessionCookieName, "", 0, "None")
   );
   return new Response(null, { headers, status: 303 });
 }
@@ -1787,7 +1792,8 @@ async function completeLegacySso(
     hostOnlySsoCookie(
       legacySsoSessionCookieName,
       transferId,
-      legacySsoSessionTransferLifetimeSeconds
+      legacySsoSessionTransferLifetimeSeconds,
+      "None"
     )
   );
   return new Response(null, { headers, status: 303 });
@@ -1797,7 +1803,7 @@ function legacySsoSessionUnavailableResponse(): globalThis.Response {
   const headers = new Headers({ "Cache-Control": "no-store" });
   headers.append(
     "Set-Cookie",
-    hostOnlySsoCookie(legacySsoSessionCookieName, "", 0)
+    hostOnlySsoCookie(legacySsoSessionCookieName, "", 0, "None")
   );
   return Response.json(
     {
@@ -1864,7 +1870,7 @@ async function claimLegacySsoSession(
   const headers = new Headers({ "Cache-Control": "no-store" });
   headers.append(
     "Set-Cookie",
-    hostOnlySsoCookie(legacySsoSessionCookieName, "", 0)
+    hostOnlySsoCookie(legacySsoSessionCookieName, "", 0, "None")
   );
   return Response.json({ token: transfer.value }, { headers });
 }

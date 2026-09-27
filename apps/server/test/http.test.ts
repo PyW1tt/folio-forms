@@ -483,15 +483,22 @@ const createLegacySsoTestApp = (
     requestIp: (request) => request.headers.get("x-test-ip"),
   });
 
-const cookiePairFrom = (response: Response, name: string): string => {
+const cookieHeaderFrom = (response: Response, name: string): string => {
   const setCookie = response.headers.get("set-cookie") ?? "";
   for (const cookie of setCookie.split(/,\s*(?=[^;,]+=)/u)) {
-    const pair = cookie.split(";", 1)[0]?.trim();
-    if (pair?.startsWith(`${name}=`)) {
-      return pair;
+    if (cookie.startsWith(`${name}=`)) {
+      return cookie;
     }
   }
   throw new Error(`The ${name} cookie was not set`);
+};
+
+const cookiePairFrom = (response: Response, name: string): string => {
+  const pair = cookieHeaderFrom(response, name).split(";", 1)[0]?.trim();
+  if (!pair) {
+    throw new Error(`The ${name} cookie was not set`);
+  }
+  return pair;
 };
 
 const startLegacySsoBrowser = async (
@@ -652,8 +659,10 @@ test("linked role=user completes browser-bound SSO and receives a normal session
   const returnTo = `/forms/${"a".repeat(32)}/fill?responseId=${crypto.randomUUID()}`;
   const browserStart = await startLegacySsoBrowser(handle, returnTo);
   expect(browserStart.startResponse.status).toBe(303);
-  const startCookieHeader =
-    browserStart.startResponse.headers.get("set-cookie") ?? "";
+  const startCookieHeader = cookieHeaderFrom(
+    browserStart.startResponse,
+    "__Host-folio-sso"
+  );
   expect(startCookieHeader).toContain("HttpOnly");
   expect(startCookieHeader).toContain("Secure");
   expect(startCookieHeader).toContain("SameSite=Lax");
@@ -699,11 +708,19 @@ test("linked role=user completes browser-bound SSO and receives a normal session
   );
   expect(callbackResponse.headers.get("referrer-policy")).toBe("no-referrer");
   expect(callbackLocation).not.toContain(clientSecret);
-  const callbackCookieHeader =
-    callbackResponse.headers.get("set-cookie") ?? "";
+  const callbackPreLoginCookieHeader = cookieHeaderFrom(
+    callbackResponse,
+    "__Host-folio-sso"
+  );
+  expect(callbackPreLoginCookieHeader).toContain("Secure");
+  expect(callbackPreLoginCookieHeader).toContain("SameSite=Lax");
+  const callbackCookieHeader = cookieHeaderFrom(
+    callbackResponse,
+    "__Host-folio-sso-session"
+  );
   expect(callbackCookieHeader).toContain("HttpOnly");
   expect(callbackCookieHeader).toContain("Secure");
-  expect(callbackCookieHeader).toContain("SameSite=Lax");
+  expect(callbackCookieHeader).toContain("SameSite=None");
 
   const sessionCookie = cookiePairFrom(
     callbackResponse,
@@ -733,6 +750,12 @@ test("linked role=user completes browser-bound SSO and receives a normal session
     )
   );
   expect(claimResponse.status).toBe(200);
+  const claimCookieHeader = cookieHeaderFrom(
+    claimResponse,
+    "__Host-folio-sso-session"
+  );
+  expect(claimCookieHeader).toContain("Secure");
+  expect(claimCookieHeader).toContain("SameSite=None");
   const claimBody = await claimResponse.json();
   if (
     !claimBody ||
@@ -1020,6 +1043,18 @@ test("linked role=user completes browser-bound SSO and receives a normal session
   expect(callbackReplay.headers.get("location")).toBe(
     legacySsoFailedLocation
   );
+  const callbackReplaySessionCookieHeader = cookieHeaderFrom(
+    callbackReplay,
+    "__Host-folio-sso-session"
+  );
+  expect(callbackReplaySessionCookieHeader).toContain("Secure");
+  expect(callbackReplaySessionCookieHeader).toContain("SameSite=None");
+  const callbackReplayPreLoginCookieHeader = cookieHeaderFrom(
+    callbackReplay,
+    "__Host-folio-sso"
+  );
+  expect(callbackReplayPreLoginCookieHeader).toContain("Secure");
+  expect(callbackReplayPreLoginCookieHeader).toContain("SameSite=Lax");
   const sessionReplay = await handle(
     new Request("https://folio.example.test/api/legacy-sso/session", {
       headers: {
@@ -1030,6 +1065,12 @@ test("linked role=user completes browser-bound SSO and receives a normal session
     })
   );
   expect(sessionReplay.status).toBe(401);
+  const sessionReplayCookieHeader = cookieHeaderFrom(
+    sessionReplay,
+    "__Host-folio-sso-session"
+  );
+  expect(sessionReplayCookieHeader).toContain("Secure");
+  expect(sessionReplayCookieHeader).toContain("SameSite=None");
 });
 
 test("rejects unsafe returns and mismatched callback state or cookie", async () => {
