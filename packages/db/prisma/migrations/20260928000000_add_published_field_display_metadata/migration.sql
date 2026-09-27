@@ -1,8 +1,11 @@
+BEGIN;
 ALTER TABLE "manifest_fields"
   ADD COLUMN "label" TEXT,
   ADD COLUMN "placeholder" TEXT,
   ADD COLUMN "position" INTEGER;
 
+ALTER TABLE "manifest_fields"
+  DISABLE TRIGGER "manifest_fields_immutable";
 WITH ranked_fields AS (
   SELECT
     "id",
@@ -15,6 +18,8 @@ SET
   "position" = ranked_fields."position"
 FROM ranked_fields
 WHERE field."id" = ranked_fields."id";
+ALTER TABLE "manifest_fields"
+  ENABLE TRIGGER "manifest_fields_immutable";
 
 ALTER TABLE "manifest_fields"
   ALTER COLUMN "label" SET NOT NULL,
@@ -22,3 +27,4 @@ ALTER TABLE "manifest_fields"
 
 CREATE UNIQUE INDEX "manifest_fields_manifest_id_position_key"
   ON "manifest_fields"("manifest_id", "position");
+COMMIT;
