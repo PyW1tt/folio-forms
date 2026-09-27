@@ -241,6 +241,6 @@ export const Route = createFileRoute("/login")({
   component: LoginRoute,
   validateSearch: (search) => ({
     returnTo: safeReturnPath(search.returnTo) ?? undefined,
-    legacySso: search.legacySso === "failed" ? "failed" : undefined,
+    ...(search.legacySso === "failed" ? { legacySso: "failed" as const } : {}),
   }),
 });
