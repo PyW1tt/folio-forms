@@ -258,11 +258,13 @@ const AdminUsersRoute = () => {
     confirmingAction
   );
   const temporaryPasswordRef = useRef<HTMLDivElement | null>(null);
+  const temporaryPasswordCopyVersion = useRef(0);
   const usersHeadingRef = useRef<HTMLHeadingElement | null>(null);
   const focusListAfterLoadRef = useRef(false);
   const restoreFocusKeyRef = useRef<string | null>(null);
 
   const clearTransientState = () => {
+    temporaryPasswordCopyVersion.current += 1;
     setFeedback(null);
     setTemporaryPassword(null);
     setTemporaryPasswordCopyFeedback(null);
@@ -273,13 +275,20 @@ const AdminUsersRoute = () => {
       return;
     }
 
+    const copyVersion = temporaryPasswordCopyVersion.current;
     try {
       await navigator.clipboard.writeText(temporaryPassword);
+      if (copyVersion !== temporaryPasswordCopyVersion.current) {
+        return;
+      }
       setTemporaryPasswordCopyFeedback({
         message: "คัดลอกรหัสผ่านชั่วคราวแล้ว",
         tone: "success",
       });
     } catch {
+      if (copyVersion !== temporaryPasswordCopyVersion.current) {
+        return;
+      }
       setTemporaryPasswordCopyFeedback({
         message: "คัดลอกรหัสผ่านชั่วคราวไม่สำเร็จ กรุณาลองใหม่",
         tone: "danger",
@@ -486,6 +495,7 @@ const AdminUsersRoute = () => {
         message: `สร้างบัญชี ${payload.user.email} แล้ว กรุณาส่งรหัสผ่านชั่วคราวให้เจ้าของบัญชีอย่างปลอดภัย`,
         tone: "success",
       });
+      temporaryPasswordCopyVersion.current += 1;
       setTemporaryPassword(payload.temporaryPassword);
     } catch (caughtError) {
       setCreateError(
@@ -548,6 +558,7 @@ const AdminUsersRoute = () => {
           message: `ตั้งรหัสผ่านใหม่สำหรับ ${payload.user.email} แล้ว กรุณาส่งรหัสผ่านชั่วคราวให้เจ้าของบัญชีอย่างปลอดภัย`,
           tone: "success",
         });
+        temporaryPasswordCopyVersion.current += 1;
         setTemporaryPassword(payload.temporaryPassword);
         setReloadVersion((value) => value + 1);
         succeeded = true;
