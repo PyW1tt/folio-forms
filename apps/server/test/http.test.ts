@@ -974,6 +974,10 @@ test("linked role=user completes browser-bound SSO and receives a normal session
     targetType: ssoCapabilityClaims.targetType,
   });
   expect((await capabilityRequest(adminSsoCapability)).status).toBe(401);
+  await prisma.user.update({
+    data: { role: "user" },
+    where: { id: admin.id },
+  });
 
   const localBearer = await bearerFor(
     email,
@@ -1244,6 +1248,10 @@ test("rejects unlinked, unverified, disabled, email-mismatched, and Admin identi
     where: { id: user.id },
   });
   await rejectCurrentIdentity();
+  await prisma.user.update({
+    data: { role: "user" },
+    where: { id: user.id },
+  });
   expect(await prisma.user.count()).toBe(userCountBefore);
   expect(await prisma.session.count({ where: { userId: user.id } })).toBe(0);
 });
