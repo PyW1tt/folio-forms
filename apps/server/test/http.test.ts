@@ -109,8 +109,24 @@ const docxFixture = (label: string, paddingBytes = 0): Uint8Array =>
 const contentControlDocument = (controls: string): string =>
   `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml" xmlns:word="http://purl.oclc.org/ooxml/wordprocessingml/main"><w:body>${controls}<w:sectPr/></w:body></w:document>`;
 
-const contentControl = ({ tag, type }: { tag: string; type: string }): string =>
-  `<w:sdt><w:sdtPr><w:tag w:val="${tag}"/>${type}</w:sdtPr><w:sdtContent><w:r><w:t>fixture</w:t></w:r></w:sdtContent></w:sdt>`;
+const contentControl = ({
+  alias,
+  placeholderText,
+  tag,
+  type,
+}: {
+  alias?: string;
+  placeholderText?: string;
+  tag: string;
+  type: string;
+}): string => {
+  const aliasProperty =
+    alias === undefined ? "" : `<w:alias w:val="${alias}"/>`;
+  const placeholderProperty =
+    placeholderText === undefined ? "" : "<w:showingPlcHdr/>";
+  const content = placeholderText ?? "fixture";
+  return `<w:sdt><w:sdtPr>${aliasProperty}<w:tag w:val="${tag}"/>${type}${placeholderProperty}</w:sdtPr><w:sdtContent><w:r><w:t>${content}</w:t></w:r></w:sdtContent></w:sdt>`;
+};
 const pictureDrawing = (relationshipId: string): string =>
   `<w:drawing xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><a:blip r:embed="${relationshipId}"/></w:drawing>`;
 const onePixelPng = Uint8Array.from(
@@ -2142,7 +2158,7 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   expect(publishedManifestRecord.manifest).toMatchObject({
     configurationHash: expectedPublishedHash,
   });
-  expect(publishedManifestRecord.manifest.fields).toEqual([
+  expect(publishedManifestRecord.manifest.fields).toMatchObject([
     {
       id: expect.any(String),
       manifestId: expect.any(String),
@@ -2293,12 +2309,23 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   };
   const validExtendedFixture = docxXmlFixture({
     document: contentControlDocument(
-      contentControl({ tag: "/person/name", type: "<w:text/>" }) +
+      contentControl({
+        alias: "Applicant photo",
+        tag: "photo",
+        type: "<w:picture/>",
+      }) +
         contentControl({
+          alias: "Applicant name",
+          placeholderText: "Enter applicant name",
+          tag: "/person/name",
+          type: "<w:text/>",
+        }) +
+        contentControl({
+          alias: "   ",
+          placeholderText: "Choose a department",
           tag: "department_choice",
           type: `<w:comboBox><w:listItem w:displayText="Engineering" w:value="engineering"/><w:listItem w:displayText="Finance" w:value="finance"/></w:comboBox>`,
-        }) +
-        contentControl({ tag: "photo", type: "<w:picture/>" })
+        })
     ),
   });
   const validExtendedResult = await publishFixture(
@@ -2312,7 +2339,9 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   });
   const validExtendedPublished =
     await prisma.publishedTemplate.findUniqueOrThrow({
-      include: { manifest: { include: { fields: true } } },
+      include: {
+        manifest: { include: { fields: { orderBy: { position: "asc" } } } },
+      },
       where: { formId: validExtendedForm.id },
     });
   if (!validExtendedPublished.manifest) {
@@ -2320,6 +2349,33 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   }
   const validExtendedFields = validExtendedPublished.manifest.fields;
   expect(validExtendedFields).toHaveLength(3);
+  expect(
+    validExtendedFields.map(({ label, placeholder, position, tag }) => ({
+      label,
+      placeholder,
+      position,
+      tag,
+    }))
+  ).toEqual([
+    {
+      label: "Applicant photo",
+      placeholder: null,
+      position: 0,
+      tag: "photo",
+    },
+    {
+      label: "Applicant name",
+      placeholder: "Enter applicant name",
+      position: 1,
+      tag: "/person/name",
+    },
+    {
+      label: "department_choice",
+      placeholder: "Choose a department",
+      position: 2,
+      tag: "department_choice",
+    },
+  ]);
   expect(
     validExtendedFields.find((field) => field.tag === "/person/name")
   ).toMatchObject({
@@ -5728,6 +5784,13 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     )
   );
   expect(forbiddenPdfResponse.status).toBe(403);
+  const forbiddenDataResponse = await app.handle(
+    new Request(
+      `http://test.local/api/submissions/${completedSubmissionId}/data`,
+      { headers: { Authorization: `Bearer ${otherUserBearer}` } }
+    )
+  );
+  expect(forbiddenDataResponse.status).toBe(403);
 
   const dataResponse = await app.handle(
     new Request(
@@ -5740,6 +5803,14 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   expect(dataResponse.status).toBe(200);
   const dataBody = (await dataResponse.json()) as {
     data: Record<string, unknown>;
+    fields: {
+      label: string;
+      options: { displayText: string; value: string }[];
+      placeholder: string | null;
+      position: number;
+      tag: string;
+      type: string;
+    }[];
     returnUrl: string;
     submission: Record<string, unknown>;
   };
@@ -5749,6 +5820,33 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     submission: { id: completedSubmissionId, responseId },
   });
   expect(dataBody.submission).not.toHaveProperty("userEmail");
+  expect(
+    dataBody.fields.map(({ label, placeholder, position, tag, type }) => ({
+      label,
+      placeholder,
+      position,
+      tag,
+      type,
+    }))
+  ).toEqual(
+    [...publishedManifestRecord.manifest.fields]
+      .sort((left, right) => left.position - right.position)
+      .map(({ label, placeholder, position, tag, type }) => ({
+        label,
+        placeholder,
+        position,
+        tag,
+        type,
+      }))
+  );
+  expect(
+    dataBody.fields.find((field) => field.tag === "department")?.options
+  ).toEqual([
+    { displayText: "Choose an item", value: "" },
+    { displayText: "Engineering", value: "engineering" },
+    { displayText: "Human Resources", value: "hr" },
+    { displayText: "Finance", value: "finance" },
+  ]);
   const ownerJsonResponse = await app.handle(
     new Request(
       `http://test.local/api/submissions/${completedSubmissionId}/json`,
@@ -6062,9 +6160,14 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     )
   );
   expect(latestDataResponse.status).toBe(200);
-  expect(await latestDataResponse.json()).toMatchObject({
+  const latestDataBody = (await latestDataResponse.json()) as typeof dataBody & {
+    correction: { reason: string; revision: number } | null;
+    revision: number;
+  };
+  expect(latestDataBody).toMatchObject({
     correction: { reason: "แก้ไขตามเอกสารต้นฉบับ", revision: 1 },
     data: correctionData,
+    fields: dataBody.fields,
     revision: 1,
   });
   const latestJsonResponse = await app.handle(

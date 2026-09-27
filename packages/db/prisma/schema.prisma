@@ -245,6 +245,9 @@ model ManifestField {
   id               String        @id @default(uuid()) @db.Uuid
   manifestId       String        @map("manifest_id") @db.Uuid
   tag              String
+  label            String
+  placeholder      String?
+  position         Int
   type             FieldType
   required         Boolean       @default(false)
   prefillPolicy    PrefillPolicy @default(editable) @map("prefill_policy")
@@ -256,6 +259,7 @@ model ManifestField {
   manifest FieldManifest @relation(fields: [manifestId], references: [id], onDelete: Restrict)
 
   @@unique([manifestId, tag])
+  @@unique([manifestId, position])
   @@index([manifestId])
   @@map("manifest_fields")
 }

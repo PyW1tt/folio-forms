@@ -65,6 +65,27 @@ type PublishedTemplate =
 type Response = Prisma.ResponseGetPayload<Prisma.ResponseDefaultArgs>;
 type Correction = Prisma.CorrectionGetPayload<Prisma.CorrectionDefaultArgs>;
 type Submission = Prisma.SubmissionGetPayload<Prisma.SubmissionDefaultArgs>;
+type SubmissionWithManifest = Prisma.SubmissionGetPayload<{
+  include: {
+    corrections: true;
+    form: true;
+    owner: true;
+    response: {
+      include: {
+        publishedTemplate: {
+          include: {
+            manifest: {
+              include: { fields: true };
+            };
+          };
+        };
+      };
+    };
+  };
+}>;
+type SubmissionWithRevisions = Prisma.SubmissionGetPayload<{
+  include: { corrections: true; form: true; owner: true };
+}>;
 type TemplateDraft =
   Prisma.TemplateDraftGetPayload<Prisma.TemplateDraftDefaultArgs>;
 type DraftFieldRule =
@@ -3217,6 +3238,7 @@ interface TemplateXmlElement {
 interface TemplateXmlVisitor {
   close?: (element: TemplateXmlElement) => void;
   open?: (element: TemplateXmlElement) => void;
+  text?: (value: string) => void;
 }
 
 function templateXmlElement(tag: {
@@ -3245,6 +3267,9 @@ function parseTemplateXml(xml: string, visitor: TemplateXmlVisitor = {}): void {
   });
   parser.on("closetag", (tag) => {
     visitor.close?.(templateXmlElement(tag));
+  });
+  parser.on("text", (value) => {
+    visitor.text?.(value);
   });
   try {
     parser.write(xml).close();
@@ -3657,21 +3682,27 @@ function validateTemplatePackage(bytes: Uint8Array): void {
 }
 
 interface ParsedTemplateField {
+  label: string;
   options: { displayText: string; value: string }[] | null;
   pictureMaxBytes: number | null;
   pictureMaxHeight: number | null;
   pictureMaxWidth: number | null;
+  placeholder: string | null;
   tag: string;
   type: FieldType;
 }
 
 interface TemplateControlFrame {
+  alias: string | null;
+  duplicateMarker: boolean;
+  duplicateTag: boolean;
+  inContentDepth: number;
   inPropertiesDepth: number;
   markers: Set<FieldType>;
   options: { displayText: string; value: string }[];
+  placeholderText: string;
   propertyStack: string[];
-  duplicateMarker: boolean;
-  duplicateTag: boolean;
+  showingPlaceholder: boolean;
   tag: string | null;
   unsupported: string | null;
 }
@@ -3832,11 +3863,16 @@ function parsedTemplateField(frame: TemplateControlFrame): ParsedTemplateField {
     fail(422, "invalid_template", "Dropdown and combo options must be unique");
   }
   const tag = frame.tag.trim();
+  const label = frame.alias?.trim();
+  const placeholder = frame.placeholderText.trim();
   return {
+    label: label || tag,
     options: frame.options.length > 0 ? frame.options : null,
     pictureMaxBytes: type === FieldType.picture ? 10 * 1024 * 1024 : null,
     pictureMaxHeight: type === FieldType.picture ? 4096 : null,
     pictureMaxWidth: type === FieldType.picture ? 4096 : null,
+    placeholder:
+      frame.showingPlaceholder && placeholder.length > 0 ? placeholder : null,
     tag,
     type,
   };
@@ -3863,6 +3899,13 @@ function parseTemplateFields(bytes: Uint8Array): ParsedTemplateField[] {
         }
         const frame = controls.at(-1);
         if (!frame) {
+          return;
+        }
+        if (
+          element.local === "sdtContent" &&
+          templateWordNamespaces.has(element.uri)
+        ) {
+          frame.inContentDepth -= 1;
           return;
         }
         if (
@@ -3901,12 +3944,16 @@ function parseTemplateFields(bytes: Uint8Array): ParsedTemplateField[] {
           templateWordNamespaces.has(element.uri)
         ) {
           controls.push({
+            alias: null,
             duplicateMarker: false,
             duplicateTag: false,
+            inContentDepth: 0,
             inPropertiesDepth: 0,
             markers: new Set(),
             options: [],
+            placeholderText: "",
             propertyStack: [],
+            showingPlaceholder: false,
             tag: null,
             unsupported: null,
           });
@@ -3921,6 +3968,13 @@ function parseTemplateFields(bytes: Uint8Array): ParsedTemplateField[] {
           templateWordNamespaces.has(element.uri)
         ) {
           frame.inPropertiesDepth = 1;
+          return;
+        }
+        if (
+          element.local === "sdtContent" &&
+          templateWordNamespaces.has(element.uri)
+        ) {
+          frame.inContentDepth += 1;
           return;
         }
         if (frame.inPropertiesDepth === 0) {
@@ -3970,6 +4024,24 @@ function parseTemplateFields(bytes: Uint8Array): ParsedTemplateField[] {
             frame.duplicateTag = true;
           }
           frame.tag = templateControlAttribute(element, "val") ?? null;
+        }
+        if (
+          isDirectProperty &&
+          templateWordNamespaces.has(element.uri) &&
+          element.local === "alias"
+        ) {
+          frame.alias = templateControlAttribute(element, "val") ?? null;
+        }
+        if (
+          isDirectProperty &&
+          templateWordNamespaces.has(element.uri) &&
+          element.local === "showingPlcHdr"
+        ) {
+          const value = templateControlAttribute(element, "val")
+            ?.trim()
+            .toLowerCase();
+          frame.showingPlaceholder =
+            value === undefined || !["0", "false", "off"].includes(value);
         }
         if (marker !== undefined) {
           if (frame.markers.has(marker)) {
@@ -4023,6 +4095,12 @@ function parseTemplateFields(bytes: Uint8Array): ParsedTemplateField[] {
         }
         frame.propertyStack.push(element.local);
         frame.inPropertiesDepth += 1;
+      },
+      text: (value) => {
+        const frame = controls.at(-1);
+        if (frame?.showingPlaceholder && frame.inContentDepth > 0) {
+          frame.placeholderText += value;
+        }
       },
     });
   }
@@ -5212,10 +5290,13 @@ function publishedContractFields(
   draftRules: DraftFieldRule[]
 ): {
   manifestFields: {
+    label: string;
     options?: Prisma.InputJsonValue;
     pictureMaxBytes: number | null;
     pictureMaxHeight: number | null;
     pictureMaxWidth: number | null;
+    placeholder: string | null;
+    position: number;
     prefillPolicy: PrefillPolicy;
     required: boolean;
     tag: string;
@@ -5259,13 +5340,16 @@ function publishedContractFields(
     rulesByTag.set(rule.tag, rule);
   }
   return {
-    manifestFields: controls.map((field) => {
+    manifestFields: controls.map((field, position) => {
       const rule = rulesByTag.get(field.tag);
       return {
         ...(field.options ? { options: jsonValue(field.options) } : {}),
+        label: field.label,
         pictureMaxBytes: field.pictureMaxBytes,
         pictureMaxHeight: field.pictureMaxHeight,
         pictureMaxWidth: field.pictureMaxWidth,
+        placeholder: field.placeholder,
+        position,
         prefillPolicy: rule?.prefillPolicy ?? PrefillPolicy.editable,
         required: rule?.required ?? false,
         tag: field.tag,
@@ -7264,12 +7348,40 @@ function correctionRevisionSummary(
   };
 }
 
-function findSubmissionWithRevisions(id: string) {
+function findSubmissionWithRevisions(
+  id: string,
+  includeFieldManifest: true
+): Promise<SubmissionWithManifest | null>;
+function findSubmissionWithRevisions(
+  id: string,
+  includeFieldManifest?: false
+): Promise<SubmissionWithRevisions | null>;
+function findSubmissionWithRevisions(
+  id: string,
+  includeFieldManifest = false
+): Promise<SubmissionWithManifest | SubmissionWithRevisions | null> {
   return prisma.submission.findUnique({
     include: {
       corrections: { orderBy: { revision: "desc" } },
       form: true,
       owner: true,
+      ...(includeFieldManifest
+        ? {
+            response: {
+              include: {
+                publishedTemplate: {
+                  include: {
+                    manifest: {
+                      include: {
+                        fields: { orderBy: { position: "asc" } },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          }
+        : {}),
     },
     where: { id },
   });
@@ -10563,7 +10675,7 @@ export function createApp(options: AppOptions = {}) {
     .get("/api/submissions/:id/data", async ({ request, params, query }) => {
       const identity = await requireIdentity(request);
       validateId(params.id, "Submission");
-      const submission = await findSubmissionWithRevisions(params.id);
+      const submission = await findSubmissionWithRevisions(params.id, true);
       if (!submission) {
         fail(404, "not_found", "Submission was not found");
       }
@@ -10592,6 +10704,34 @@ export function createApp(options: AppOptions = {}) {
             }
           : null,
         data: selected.data,
+        fields:
+          submission.response?.publishedTemplate.manifest?.fields.map(
+            (field) => ({
+              label: field.label,
+              options: Array.isArray(field.options)
+                ? field.options.flatMap((option) => {
+                    if (
+                      !option ||
+                      typeof option !== "object" ||
+                      Array.isArray(option)
+                    ) {
+                      return [];
+                    }
+                    const optionRecord = option as Record<string, unknown>;
+                    const displayText = optionRecord.displayText;
+                    const value = optionRecord.value;
+                    return typeof displayText === "string" &&
+                      typeof value === "string"
+                      ? [{ displayText, value }]
+                      : [];
+                  })
+                : [],
+              placeholder: field.placeholder,
+              position: field.position,
+              tag: field.tag,
+              type: field.type,
+            })
+          ) ?? [],
         returnUrl: prefillReturnUrl,
         revision: selected.revision,
         submission: submissionSummary(submission, {

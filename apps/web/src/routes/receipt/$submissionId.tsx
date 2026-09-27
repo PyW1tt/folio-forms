@@ -1,12 +1,6 @@
 // oxlint-disable unicorn(filename-case) -- TanStack Router requires this dynamic route filename.
 import { createFileRoute, Link, useParams } from "@tanstack/react-router";
-import {
-  ArrowLeft,
-  CheckCircle2,
-  Download,
-  FileJson,
-  FileText,
-} from "lucide-react";
+import { ArrowLeft, CheckCircle2, Download, FileText } from "lucide-react";
 import { useEffect, useState } from "react";
 
 import { Badge, Card, Notice, Spinner } from "@/components/ui";
@@ -17,7 +11,11 @@ import {
   formatDate,
   formatDateTime,
 } from "@/lib/api";
-import type { ResponseRevisionsResponse, Submission } from "@/lib/api";
+import type {
+  ReceiptField,
+  ResponseRevisionsResponse,
+  Submission,
+} from "@/lib/api";
 
 const receiptErrorMessage = (error: unknown): string => {
   if (error instanceof ApiError) {
@@ -33,15 +31,37 @@ const receiptErrorMessage = (error: unknown): string => {
   }
   return "โหลดใบรับคำตอบไม่ได้ กรุณาลองใหม่";
 };
+const receiptFieldValue = (field: ReceiptField, value: unknown): string => {
+  if (field.type === "picture") {
+    return "เปิดเอกสาร DOCX เพื่อดูรูปภาพ";
+  }
+  if (value === null || value === undefined || value === "") {
+    return "—";
+  }
+  if (field.type === "checkbox" && typeof value === "boolean") {
+    return value ? "ใช่" : "ไม่ใช่";
+  }
+  if (typeof value === "string") {
+    return (
+      field.options.find((option) => option.value === value)?.displayText ??
+      value
+    );
+  }
+  if (typeof value === "number") {
+    return String(value);
+  }
+  return "มีข้อมูลที่บันทึกแล้ว";
+};
 const ReceiptRoute = () => {
   const { submissionId } = useParams({ from: "/receipt/$submissionId" });
   const [submission, setSubmission] = useState<Submission | null>(null);
+  const [fields, setFields] = useState<ReceiptField[]>([]);
   const [data, setData] = useState<Record<string, unknown> | null>(null);
   const [revisions, setRevisions] = useState<
     ResponseRevisionsResponse["revisions"]
   >([]);
   const [viewRevision, setViewRevision] = useState<"original" | "latest">(
-    "original"
+    "latest"
   );
   const [returnUrl, setReturnUrl] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -52,6 +72,7 @@ const ReceiptRoute = () => {
       try {
         const payload = await apiGet<{
           data: Record<string, unknown>;
+          fields: ReceiptField[];
           returnUrl: string;
           submission: Submission;
         }>(`/api/submissions/${submissionId}/data`);
@@ -62,7 +83,9 @@ const ReceiptRoute = () => {
           `/api/responses/${payload.submission.responseId}/corrections`
         );
         if (!cancelled) {
+          setViewRevision("latest");
           setData(payload.data);
+          setFields(payload.fields);
           setRevisions(history.revisions);
           setReturnUrl(payload.returnUrl);
           setSubmission(payload.submission);
@@ -122,7 +145,7 @@ const ReceiptRoute = () => {
     viewRevision === "latest" && latestRevision > 0
       ? `-revision-${latestRevision}`
       : "";
-  const download = async (format: "json" | "docx" | "pdf") => {
+  const download = async (format: "docx" | "pdf") => {
     await downloadArtifact(
       `/api/submissions/${submissionId}/${format}${revisionQuery}`,
       `${submissionId}${revisionSuffix}.${format}`
@@ -175,14 +198,6 @@ const ReceiptRoute = () => {
               className="inline-flex min-h-10 items-center rounded-[10px] border border-[var(--line-strong)] bg-[var(--paper)] px-3 text-sm font-semibold hover:border-[var(--ink)]"
             >
               ล่าสุด{latestRevision > 0 ? ` (Correction ${latestRevision})` : ""}
-            </button>
-            <button
-              type="button"
-              onClick={() => download("json")}
-              className="inline-flex min-h-10 items-center gap-2 rounded-[10px] border border-[var(--line-strong)] bg-[var(--paper)] px-3 text-sm font-semibold hover:border-[var(--ink)]"
-            >
-              <FileJson size={15} />
-              JSON
             </button>
             <button
               type="button"
@@ -244,14 +259,20 @@ const ReceiptRoute = () => {
             </ol>
           </div>
           <div className="p-5 sm:p-7">
-            <div className="mb-4 flex items-center gap-2">
-              <FileJson size={17} />
-              <h2 className="font-semibold">ข้อมูลคำตอบ</h2>
-              <Badge>อ่านอย่างเดียว</Badge>
-            </div>
-            <pre className="max-h-[500px] overflow-auto rounded-[10px] bg-[#eef1ed] p-4 text-sm leading-6 text-[var(--ink-soft)]">
-              {JSON.stringify(displayedData, null, 2)}
-            </pre>
+            <h2 className="mb-4 font-semibold">ข้อมูลคำตอบ</h2>
+            <dl className="space-y-3">
+              {fields.map((field) => (
+                <div
+                  className="rounded-[10px] border border-[var(--line)] p-4"
+                  key={field.tag}
+                >
+                  <dt className="font-semibold">{field.label}</dt>
+                  <dd className="mt-2 whitespace-pre-wrap break-words text-[var(--ink-soft)]">
+                    {receiptFieldValue(field, displayedData[field.tag])}
+                  </dd>
+                </div>
+              ))}
+            </dl>
           </div>
         </Card>
       </div>

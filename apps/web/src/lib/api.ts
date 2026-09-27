@@ -93,6 +93,21 @@ export interface Submission {
   submittedAt?: string;
   updatedAt?: string;
 }
+export type ReceiptFieldType =
+  | "text"
+  | "checkbox"
+  | "date"
+  | "dropdown"
+  | "combo"
+  | "picture";
+export interface ReceiptField {
+  label: string;
+  options: { displayText: string; value: string }[];
+  placeholder: string | null;
+  position: number;
+  tag: string;
+  type: ReceiptFieldType;
+}
 export interface ResponseRevision {
   actorEmail: string | null;
   actorName: string | null;
