@@ -148,6 +148,14 @@ const callbackClaimLifetimeSeconds = 5 * 60;
 const objectCleanupIntentGraceMs = 15 * 60_000;
 const handoffCodeLifetimeMs = 120_000;
 const pendingClaimLifetimeSeconds = 10 * 60;
+const legacySsoTransactionLifetimeSeconds = 5 * 60;
+const legacySsoSessionTransferLifetimeSeconds = 60;
+const legacySsoExchangeBodyMaximumBytes = 8 * 1024;
+const legacySsoCookieName = "__Host-folio-sso";
+const legacySsoSessionCookieName = "__Host-folio-sso-session";
+const legacySsoTransactionIdentifier = "legacy-sso-transaction";
+const legacySsoSessionIdentifier = "legacy-sso-session";
+
 const handoffExpirySweepBatchSize = 100;
 const handoffCodeMaximumLength = 256;
 const handoffExternalReferenceMaximumLength = 512;
@@ -208,10 +216,30 @@ const pluginOrigins = new Set(
 );
 
 type UserRole = "admin" | "user";
+export interface LegacySsoConfig {
+  authorizeUrl: string;
+  callbackUrl: string;
+  clientId: string;
+  clientSecret: string;
+  exchangeUrl: string;
+  providerId: string;
+}
+interface LegacySsoTransaction {
+  callbackUrl: string;
+  clientId: string;
+  codeVerifier: string;
+  returnTo: string;
+  state: string;
+}
+interface LegacyIdentity {
+  email: string;
+  subject: string;
+}
 interface Identity {
   email: string;
   expiresAt: Date;
   id: string;
+  isSso: boolean;
   mustChangePassword: boolean;
   name: string;
   role: UserRole;
@@ -576,6 +604,7 @@ interface CallbackPayload {
 export interface AppOptions {
   clock?: () => Date;
   deleteObject?: (key: string) => Promise<void>;
+  legacySso?: LegacySsoConfig | null;
   onlyOffice?: OnlyOfficeClient;
   onlyOfficeCallbackOrigins?: readonly string[];
   onlyOfficeCallbackMaxBytes?: number;
@@ -1111,6 +1140,7 @@ async function identityFor(request: Request): Promise<Identity | null> {
   const liveSession = result.session as unknown as {
     expiresAt?: unknown;
     id?: unknown;
+    isSso?: unknown;
   };
   const expiresAt =
     liveSession.expiresAt instanceof Date
@@ -1120,6 +1150,7 @@ async function identityFor(request: Request): Promise<Identity | null> {
     typeof sessionUser.id !== "string" ||
     typeof sessionUser.email !== "string" ||
     sessionUser.enabled !== true ||
+    (liveSession.isSso === true && sessionUser.role !== "user") ||
     typeof liveSession.id !== "string" ||
     Number.isNaN(expiresAt.getTime()) ||
     expiresAt.getTime() <= Date.now()
@@ -1130,6 +1161,7 @@ async function identityFor(request: Request): Promise<Identity | null> {
     email: sessionUser.email,
     expiresAt,
     id: sessionUser.id,
+    isSso: liveSession.isSso === true,
     mustChangePassword: sessionUser.mustChangePassword === true,
     name:
       typeof sessionUser.name === "string" && sessionUser.name.length > 0
@@ -1196,6 +1228,645 @@ function pendingClaimFor(request: Request): string | undefined {
       : undefined;
   }
   return undefined;
+}
+
+function legacySsoConfigurationFromEnv(): LegacySsoConfig | null {
+  const {
+    LEGACY_SSO_AUTHORIZE_URL: authorizeUrl,
+    LEGACY_SSO_CALLBACK_URL: callbackUrl,
+    LEGACY_SSO_CLIENT_ID: clientId,
+    LEGACY_SSO_CLIENT_SECRET: clientSecret,
+    LEGACY_SSO_EXCHANGE_URL: exchangeUrl,
+    LEGACY_SSO_PROVIDER_ID: providerId,
+  } = env;
+  const values = [
+    authorizeUrl,
+    callbackUrl,
+    clientId,
+    clientSecret,
+    exchangeUrl,
+    providerId,
+  ];
+  if (values.every((value) => value === undefined)) {
+    return null;
+  }
+  if (
+    typeof authorizeUrl !== "string" ||
+    typeof callbackUrl !== "string" ||
+    typeof clientId !== "string" ||
+    typeof clientSecret !== "string" ||
+    typeof exchangeUrl !== "string" ||
+    typeof providerId !== "string"
+  ) {
+    throw new Error("All six LEGACY_SSO settings must be configured together");
+  }
+  return validatedLegacySsoConfiguration({
+    authorizeUrl,
+    callbackUrl,
+    clientId,
+    clientSecret,
+    exchangeUrl,
+    providerId,
+  });
+}
+
+function validatedLegacySsoConfiguration(
+  config: LegacySsoConfig
+): LegacySsoConfig {
+  const parseEndpoint = (value: string, label: string): URL => {
+    let url: URL;
+    try {
+      url = new URL(value);
+    } catch {
+      throw new Error(`${label} must be an absolute URL`);
+    }
+    if (
+      (url.protocol !== "https:" &&
+        !(url.protocol === "http:" &&
+          (url.hostname === "localhost" ||
+            url.hostname === "127.0.0.1" ||
+            url.hostname === "[::1]"))) ||
+      url.username ||
+      url.password ||
+      url.hash
+    ) {
+      throw new Error(`${label} must use HTTPS without URL credentials`);
+    }
+    return url;
+  };
+  const authorize = parseEndpoint(
+    config.authorizeUrl,
+    "LEGACY_SSO_AUTHORIZE_URL"
+  );
+  const callback = parseEndpoint(
+    config.callbackUrl,
+    "LEGACY_SSO_CALLBACK_URL"
+  );
+  const exchange = parseEndpoint(
+    config.exchangeUrl,
+    "LEGACY_SSO_EXCHANGE_URL"
+  );
+  if (
+    authorize.search ||
+    exchange.search ||
+    callback.search ||
+    callback.pathname !== "/api/legacy-sso/callback" ||
+    config.clientId.length === 0 ||
+    config.clientId.length > 128 ||
+    config.clientId.trim() !== config.clientId ||
+    config.clientId.includes(":") ||
+    config.clientSecret.length < 32 ||
+    config.providerId.length === 0 ||
+    config.providerId.length > 128 ||
+    config.providerId.trim() !== config.providerId
+  ) {
+    throw new Error("Legacy SSO settings are invalid");
+  }
+  return {
+    ...config,
+    authorizeUrl: authorize.href,
+    callbackUrl: callback.href,
+    exchangeUrl: exchange.href,
+  };
+}
+
+function safeLegacyFormReturnPath(
+  value: unknown,
+  callbackUrl: string
+): string | null {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length > 2048 ||
+    !value.startsWith("/") ||
+    value.startsWith("//") ||
+    value.includes("\\") ||
+    /[\u0000-\u001f\u007f]/u.test(value)
+  ) {
+    return null;
+  }
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(value);
+  } catch {
+    return null;
+  }
+  if (
+    decoded.startsWith("//") ||
+    decoded.includes("\\") ||
+    /[\u0000-\u001f\u007f]/u.test(decoded)
+  ) {
+    return null;
+  }
+  const callback = new URL(callbackUrl);
+  let returnUrl: URL;
+  try {
+    returnUrl = new URL(value, callback.origin);
+  } catch {
+    return null;
+  }
+  const isFormPath = /^\/forms\/[0-9a-f]{32}\/fill$/u.test(
+    returnUrl.pathname
+  );
+  const isDashboardPath =
+    returnUrl.pathname === "/dashboard" && !returnUrl.search;
+  if (
+    returnUrl.origin !== callback.origin ||
+    returnUrl.hash ||
+    (!isFormPath && !isDashboardPath)
+  ) {
+    return null;
+  }
+  const queryKeys = [...returnUrl.searchParams.keys()];
+  if (
+    queryKeys.some((key) => key !== "responseId") ||
+    queryKeys.length > 1
+  ) {
+    return null;
+  }
+  const responseIds = returnUrl.searchParams.getAll("responseId");
+  if (
+    responseIds.length > 1 ||
+    (responseIds.length === 1 && !idPattern.test(responseIds[0] ?? ""))
+  ) {
+    return null;
+  }
+  return `${returnUrl.pathname}${returnUrl.search}`;
+}
+
+function cookieValueFor(
+  request: Request,
+  name: string,
+  maximumLength: number
+): string | null {
+  const cookieHeader = request.headers.get("cookie");
+  if (!cookieHeader) {
+    return null;
+  }
+  let match: string | null = null;
+  for (const part of cookieHeader.split(";")) {
+    const separator = part.indexOf("=");
+    if (separator === -1 || part.slice(0, separator).trim() !== name) {
+      continue;
+    }
+    const value = part.slice(separator + 1).trim();
+    if (
+      match !== null ||
+      value.length === 0 ||
+      value.length > maximumLength ||
+      !/^[A-Za-z0-9_-]+$/u.test(value)
+    ) {
+      return null;
+    }
+    match = value;
+  }
+  return match;
+}
+
+function hostOnlySsoCookie(name: string, value: string, maxAge: number): string {
+  return `${name}=${value}; Path=/; Max-Age=${maxAge}; HttpOnly; Secure; SameSite=Lax`;
+}
+
+function legacySsoFailureResponse(): globalThis.Response {
+  const headers = new Headers({
+    "Cache-Control": "no-store",
+    Location: "/login?legacySso=failed",
+    "Referrer-Policy": "no-referrer",
+  });
+  headers.append("Set-Cookie", hostOnlySsoCookie(legacySsoCookieName, "", 0));
+  headers.append(
+    "Set-Cookie",
+    hostOnlySsoCookie(legacySsoSessionCookieName, "", 0)
+  );
+  return new Response(null, { headers, status: 303 });
+}
+
+function legacySsoTransaction(value: string): LegacySsoTransaction | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return null;
+  }
+  const transaction = parsed as Record<string, unknown>;
+  if (
+    typeof transaction.callbackUrl !== "string" ||
+    typeof transaction.clientId !== "string" ||
+    typeof transaction.codeVerifier !== "string" ||
+    typeof transaction.returnTo !== "string" ||
+    typeof transaction.state !== "string" ||
+    !/^[A-Za-z0-9._~-]{43,128}$/u.test(transaction.codeVerifier) ||
+    !/^[A-Za-z0-9_-]{43}$/u.test(transaction.state)
+  ) {
+    return null;
+  }
+  return {
+    callbackUrl: transaction.callbackUrl,
+    clientId: transaction.clientId,
+    codeVerifier: transaction.codeVerifier,
+    returnTo: transaction.returnTo,
+    state: transaction.state,
+  };
+}
+
+async function readLegacyIdentityResponse(
+  response: globalThis.Response
+): Promise<LegacyIdentity | null> {
+  if (
+    !/^application\/json(?:\s*;|$)/iu.test(
+      response.headers.get("content-type") ?? ""
+    )
+  ) {
+    return null;
+  }
+  const contentLength = Number(response.headers.get("content-length") ?? "");
+  if (
+    Number.isFinite(contentLength) &&
+    contentLength > legacySsoExchangeBodyMaximumBytes
+  ) {
+    return null;
+  }
+  const reader = response.body?.getReader();
+  if (!reader) {
+    return null;
+  }
+  const chunks: Uint8Array[] = [];
+  let byteLength = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+    byteLength += value.byteLength;
+    if (byteLength > legacySsoExchangeBodyMaximumBytes) {
+      await reader.cancel();
+      return null;
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(byteLength);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  let payload: unknown;
+  try {
+    payload = JSON.parse(new TextDecoder().decode(bytes));
+  } catch {
+    return null;
+  }
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return null;
+  }
+  const claims = payload as Record<string, unknown>;
+  if (
+    typeof claims.sub !== "string" ||
+    claims.sub.length === 0 ||
+    claims.sub.length > 255 ||
+    claims.sub.trim() !== claims.sub ||
+    /[\u0000-\u001f\u007f]/u.test(claims.sub) ||
+    typeof claims.email !== "string" ||
+    claims.email.length > accountEmailMaximumLength ||
+    !accountEmailPattern.test(claims.email) ||
+    claims.email_verified !== true
+  ) {
+    return null;
+  }
+  return { email: normalizeEmail(claims.email), subject: claims.sub };
+}
+
+async function exchangeLegacyCode(
+  config: LegacySsoConfig,
+  code: string,
+  codeVerifier: string
+): Promise<LegacyIdentity | null> {
+  try {
+    const response = await fetch(config.exchangeUrl, {
+      body: new URLSearchParams({
+        client_id: config.clientId,
+        code,
+        code_verifier: codeVerifier,
+        grant_type: "authorization_code",
+        redirect_uri: config.callbackUrl,
+      }),
+      headers: {
+        Accept: "application/json",
+        Authorization: `Basic ${Buffer.from(
+          `${config.clientId}:${config.clientSecret}`
+        ).toString("base64")}`,
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      method: "POST",
+      redirect: "error",
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!response.ok) {
+      return null;
+    }
+    return await readLegacyIdentityResponse(response);
+  } catch {
+    return null;
+  }
+}
+
+async function createSsoSessionTransfer(
+  userId: string,
+  now: Date
+): Promise<string> {
+  const authContext = await auth.$context;
+  const session = await authContext.internalAdapter.createSession(
+    userId,
+    false,
+    { isSso: true },
+    true
+  );
+  const transferId = randomBytes(32).toString("base64url");
+  try {
+    await prisma.verification.create({
+      data: {
+        expiresAt: new Date(
+          now.getTime() + legacySsoSessionTransferLifetimeSeconds * 1000
+        ),
+        id: transferId,
+        identifier: legacySsoSessionIdentifier,
+        value: session.token,
+      },
+    });
+  } catch (error) {
+    await authContext.internalAdapter.deleteSession(session.token);
+    throw error;
+  }
+  return transferId;
+}
+
+async function startLegacySso(
+  request: Request,
+  config: LegacySsoConfig,
+  clock: () => Date
+): Promise<globalThis.Response> {
+  const requestUrl = new URL(request.url);
+  const queryKeys = [...requestUrl.searchParams.keys()];
+  if (queryKeys.some((key) => key !== "returnTo")) {
+    fail(400, "invalid_return_path", "Only a Form return path is accepted");
+  }
+  const returnValues = requestUrl.searchParams.getAll("returnTo");
+  const returnTo =
+    returnValues.length === 0
+      ? "/dashboard"
+      : returnValues.length === 1
+        ? safeLegacyFormReturnPath(returnValues[0], config.callbackUrl)
+        : null;
+  if (!returnTo) {
+    fail(400, "invalid_return_path", "The Form return path is unsafe");
+  }
+  const state = randomBytes(32).toString("base64url");
+  const codeVerifier = randomBytes(32).toString("base64url");
+  const codeChallenge = createHash("sha256")
+    .update(codeVerifier)
+    .digest("base64url");
+  const transactionId = randomBytes(32).toString("base64url");
+  const now = clock();
+  const expiresAt = new Date(
+    now.getTime() + legacySsoTransactionLifetimeSeconds * 1000
+  );
+  await prisma.verification.deleteMany({
+    where: {
+      expiresAt: { lte: now },
+      identifier: {
+        in: [legacySsoTransactionIdentifier, legacySsoSessionIdentifier],
+      },
+    },
+  });
+  await prisma.verification.create({
+    data: {
+      expiresAt,
+      id: transactionId,
+      identifier: legacySsoTransactionIdentifier,
+      value: JSON.stringify({
+        callbackUrl: config.callbackUrl,
+        clientId: config.clientId,
+        codeVerifier,
+        returnTo,
+        state,
+      } satisfies LegacySsoTransaction),
+    },
+  });
+  const authorizeUrl = new URL(config.authorizeUrl);
+  authorizeUrl.searchParams.set("client_id", config.clientId);
+  authorizeUrl.searchParams.set("redirect_uri", config.callbackUrl);
+  authorizeUrl.searchParams.set("state", state);
+  authorizeUrl.searchParams.set("code_challenge", codeChallenge);
+  authorizeUrl.searchParams.set("code_challenge_method", "S256");
+  const headers = new Headers({
+    "Cache-Control": "no-store",
+    Location: authorizeUrl.href,
+    "Referrer-Policy": "no-referrer",
+  });
+  headers.append(
+    "Set-Cookie",
+    hostOnlySsoCookie(
+      legacySsoCookieName,
+      transactionId,
+      legacySsoTransactionLifetimeSeconds
+    )
+  );
+  return new Response(null, { headers, status: 303 });
+}
+
+async function completeLegacySso(
+  request: Request,
+  config: LegacySsoConfig,
+  clock: () => Date
+): Promise<globalThis.Response> {
+  const requestUrl = new URL(request.url);
+  const forwardedProtocol = request.headers.get("x-forwarded-proto")?.trim();
+  const publicOrigin = forwardedProtocol
+    ? `${forwardedProtocol}://${requestUrl.host}`
+    : requestUrl.origin;
+  const callbackUrl = new URL(config.callbackUrl);
+  const queryKeys = [...requestUrl.searchParams.keys()];
+  const codeValues = requestUrl.searchParams.getAll("code");
+  const stateValues = requestUrl.searchParams.getAll("state");
+  if (
+    `${publicOrigin}${requestUrl.pathname}` !== callbackUrl.href ||
+    queryKeys.length !== 2 ||
+    !queryKeys.includes("code") ||
+    !queryKeys.includes("state") ||
+    codeValues.length !== 1 ||
+    stateValues.length !== 1
+  ) {
+    return legacySsoFailureResponse();
+  }
+  const code = codeValues[0];
+  const state = stateValues[0];
+  const transactionId = cookieValueFor(
+    request,
+    legacySsoCookieName,
+    43
+  );
+  if (
+    !code ||
+    code.length > handoffCodeMaximumLength ||
+    !/^[A-Za-z0-9._~-]+$/u.test(code) ||
+    !state ||
+    !/^[A-Za-z0-9_-]{43}$/u.test(state) ||
+    !transactionId
+  ) {
+    return legacySsoFailureResponse();
+  }
+  const now = clock();
+  const storedTransaction = await prisma.verification.findUnique({
+    where: { id: transactionId },
+  });
+  const transaction = storedTransaction
+    ? legacySsoTransaction(storedTransaction.value)
+    : null;
+  if (
+    !storedTransaction ||
+    storedTransaction.identifier !== legacySsoTransactionIdentifier ||
+    storedTransaction.expiresAt.getTime() <= now.getTime() ||
+    !transaction ||
+    transaction.state !== state ||
+    transaction.clientId !== config.clientId ||
+    transaction.callbackUrl !== config.callbackUrl ||
+    !safeLegacyFormReturnPath(transaction.returnTo, config.callbackUrl)
+  ) {
+    return legacySsoFailureResponse();
+  }
+  const consumed = await prisma.verification.deleteMany({
+    where: {
+      expiresAt: { gt: now },
+      id: transactionId,
+      identifier: legacySsoTransactionIdentifier,
+    },
+  });
+  if (consumed.count !== 1) {
+    return legacySsoFailureResponse();
+  }
+  const identity = await exchangeLegacyCode(
+    config,
+    code,
+    transaction.codeVerifier
+  );
+  if (!identity) {
+    return legacySsoFailureResponse();
+  }
+  const linkedAccount = await prisma.account.findUnique({
+    include: {
+      user: {
+        select: { email: true, enabled: true, id: true, role: true },
+      },
+    },
+    where: {
+      providerId_accountId: {
+        accountId: identity.subject,
+        providerId: config.providerId,
+      },
+    },
+  });
+  if (
+    !linkedAccount?.user.enabled ||
+    linkedAccount.user.role !== "user" ||
+    normalizeEmail(linkedAccount.user.email) !== identity.email
+  ) {
+    return legacySsoFailureResponse();
+  }
+  const transferId = await createSsoSessionTransfer(linkedAccount.user.id, now);
+  const headers = new Headers({
+    "Cache-Control": "no-store",
+    Location: transaction.returnTo,
+    "Referrer-Policy": "no-referrer",
+  });
+  headers.append("Set-Cookie", hostOnlySsoCookie(legacySsoCookieName, "", 0));
+  headers.append(
+    "Set-Cookie",
+    hostOnlySsoCookie(
+      legacySsoSessionCookieName,
+      transferId,
+      legacySsoSessionTransferLifetimeSeconds
+    )
+  );
+  return new Response(null, { headers, status: 303 });
+}
+
+function legacySsoSessionUnavailableResponse(): globalThis.Response {
+  const headers = new Headers({ "Cache-Control": "no-store" });
+  headers.append(
+    "Set-Cookie",
+    hostOnlySsoCookie(legacySsoSessionCookieName, "", 0)
+  );
+  return Response.json(
+    {
+      error: "unauthorized",
+      message: "The legacy SSO session handoff is unavailable",
+    },
+    { headers, status: 401 }
+  );
+}
+
+async function claimLegacySsoSession(
+  request: Request,
+  clock: () => Date,
+  config: LegacySsoConfig | null
+): Promise<globalThis.Response> {
+  const requestOrigin = request.headers.get("origin");
+  const allowedOrigins = [
+    corsOrigin,
+    originOf(env.BETTER_AUTH_URL),
+    config ? originOf(config.callbackUrl) : null,
+  ];
+  if (
+    !config ||
+    !requestOrigin ||
+    !allowedOrigins.includes(requestOrigin)
+  ) {
+    return Response.json(
+      {
+        error: "forbidden",
+        message: "The legacy SSO session handoff origin is invalid",
+      },
+      { headers: { "Cache-Control": "no-store" }, status: 403 }
+    );
+  }
+  const transferId = cookieValueFor(
+    request,
+    legacySsoSessionCookieName,
+    43
+  );
+  if (!transferId) {
+    return legacySsoSessionUnavailableResponse();
+  }
+  const now = clock();
+  const transfer = await prisma.verification.findUnique({
+    where: { id: transferId },
+  });
+  if (
+    !transfer ||
+    transfer.identifier !== legacySsoSessionIdentifier ||
+    transfer.expiresAt.getTime() <= now.getTime()
+  ) {
+    return legacySsoSessionUnavailableResponse();
+  }
+  const consumed = await prisma.verification.deleteMany({
+    where: {
+      expiresAt: { gt: now },
+      id: transferId,
+      identifier: legacySsoSessionIdentifier,
+    },
+  });
+  if (consumed.count !== 1) {
+    return legacySsoSessionUnavailableResponse();
+  }
+  const headers = new Headers({ "Cache-Control": "no-store" });
+  headers.append(
+    "Set-Cookie",
+    hostOnlySsoCookie(legacySsoSessionCookieName, "", 0)
+  );
+  return Response.json({ token: transfer.value }, { headers });
 }
 
 function handoffUnavailable(): never {
@@ -1572,7 +2243,7 @@ async function requireIdentity(request: Request): Promise<Identity> {
   if (!identity) {
     fail(401, "unauthorized", "Authentication is required");
   }
-  if (identity.mustChangePassword) {
+  if (identity.mustChangePassword && !identity.isSso) {
     fail(403, "password_change_required", "Password replacement is required");
   }
   return identity;
@@ -1603,9 +2274,12 @@ async function editorAuthorization(
     },
     where: { id: capability.actorId },
   });
+  const ssoSession =
+    user?.mustChangePassword === true ? await identityFor(request) : null;
   if (
     !user?.enabled ||
-    user.mustChangePassword ||
+    (user.mustChangePassword &&
+      !(ssoSession?.isSso && ssoSession.id === user.id)) ||
     user.role !== capability.role
   ) {
     fail(
@@ -7681,6 +8355,12 @@ export function createApp(options: AppOptions = {}) {
     options.prefillReturnUrl ?? env.PREFILL_RETURN_URL
   );
   const handoffClock = options.clock ?? (() => new Date());
+  const legacySso =
+    options.legacySso === undefined
+      ? legacySsoConfigurationFromEnv()
+      : options.legacySso
+        ? validatedLegacySsoConfiguration(options.legacySso)
+        : null;
   return new Elysia()
     .onError(({ error, set }) => {
       if (error instanceof HttpError) {
@@ -7822,6 +8502,36 @@ export function createApp(options: AppOptions = {}) {
       },
       { parse: "none" }
     )
+    .get("/api/legacy-sso/status", () =>
+      Response.json(
+        { enabled: Boolean(legacySso) },
+        { headers: { "Cache-Control": "no-store" } }
+      )
+    )
+    .get(
+      "/api/legacy-sso/start",
+      ({ request }) => {
+        if (!legacySso) {
+          fail(404, "legacy_sso_unavailable", "Legacy SSO is unavailable");
+        }
+        return startLegacySso(request, legacySso, handoffClock);
+      },
+      { parse: "none" }
+    )
+    .get(
+      "/api/legacy-sso/callback",
+      ({ request }) =>
+        legacySso
+          ? completeLegacySso(request, legacySso, handoffClock)
+          : legacySsoFailureResponse(),
+      { parse: "none" }
+    )
+    .post(
+      "/api/legacy-sso/session",
+      ({ request }) =>
+        claimLegacySsoSession(request, handoffClock, legacySso),
+      { parse: "none" }
+    )
     .get("/prefill/handoff", () => {
       fail(
         405,
@@ -7846,7 +8556,8 @@ export function createApp(options: AppOptions = {}) {
         user: {
           email: identity.email,
           id: identity.id,
-          mustChangePassword: identity.mustChangePassword,
+          mustChangePassword:
+            identity.mustChangePassword && !identity.isSso,
           name: identity.name,
           role: identity.role,
         },

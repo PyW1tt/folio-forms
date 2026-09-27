@@ -8,11 +8,14 @@ import { strToU8, zipSync } from "fflate";
 import {
   createInProcessFolioConnector,
   deterministicExternalRecord,
+  startLegacySsoMock,
   startPrefillMock,
 } from "prefill-mock/mock";
+import type { LegacySsoMockServer, PrefillMockServer } from "prefill-mock/mock";
 
 import {
   createApp,
+  type LegacySsoConfig,
   reconcileRecoverableState,
   resolveCallbackDocumentUrl,
 } from "../src/app";
@@ -45,6 +48,7 @@ if (!databaseUrl) {
 }
 
 const app = createApp({
+  legacySso: null,
   onlyOffice: {
     convertDocxToPdf: () =>
       Promise.resolve(new TextEncoder().encode("%PDF-test")),
@@ -54,11 +58,14 @@ const app = createApp({
   requestIp: (request) => request.headers.get("x-test-ip"),
 });
 
-let externalMock: ReturnType<typeof startPrefillMock> | undefined;
+let externalMock: PrefillMockServer | undefined;
+let legacySsoMock: LegacySsoMockServer | undefined;
 
 afterEach(() => {
   externalMock?.close();
   externalMock = undefined;
+  legacySsoMock?.close();
+  legacySsoMock = undefined;
 });
 const jsonHeaders = { "Content-Type": "application/json" };
 const trimTrailingSlashes = (value: string): string =>
@@ -450,6 +457,65 @@ const bearerFor = async (
   }
   return token;
 };
+type LegacySsoHttpHandler = (
+  request: Request
+) => Response | Promise<Response>;
+
+interface LegacySsoBrowserTransaction {
+  authorizationUrl: string;
+  preLoginCookie: string;
+  startResponse: Response;
+}
+
+const createLegacySsoTestApp = (
+  config: LegacySsoConfig,
+  clock: () => Date = () => new Date()
+) =>
+  createApp({
+    clock,
+    legacySso: config,
+    onlyOffice: {
+      convertDocxToPdf: () =>
+        Promise.resolve(new TextEncoder().encode("%PDF-test")),
+      forceSave: () => Promise.resolve(false),
+    },
+    prefillReturnUrl: "https://source.example.test/forms/return",
+    requestIp: (request) => request.headers.get("x-test-ip"),
+  });
+
+const cookiePairFrom = (response: Response, name: string): string => {
+  const setCookie = response.headers.get("set-cookie") ?? "";
+  for (const cookie of setCookie.split(/,\s*(?=[^;,]+=)/u)) {
+    const pair = cookie.split(";", 1)[0]?.trim();
+    if (pair?.startsWith(`${name}=`)) {
+      return pair;
+    }
+  }
+  throw new Error(`The ${name} cookie was not set`);
+};
+
+const startLegacySsoBrowser = async (
+  handle: LegacySsoHttpHandler,
+  returnTo?: string
+): Promise<LegacySsoBrowserTransaction> => {
+  const startUrl = new URL(
+    "/api/legacy-sso/start",
+    "https://folio.example.test"
+  );
+  if (returnTo !== undefined) {
+    startUrl.searchParams.set("returnTo", returnTo);
+  }
+  const startResponse = await handle(new Request(startUrl));
+  const authorizationUrl = startResponse.headers.get("location");
+  if (!authorizationUrl) {
+    throw new Error("The legacy SSO start did not redirect to the old backend");
+  }
+  return {
+    authorizationUrl,
+    preLoginCookie: cookiePairFrom(startResponse, "__Host-folio-sso"),
+    startResponse,
+  };
+};
 
 const waitForOperation = async (
   operationId: string,
@@ -530,6 +596,669 @@ test("rewrites public ONLYOFFICE callback paths to the internal base", () => {
   ).toBe("http://localhost:8081/cache/files/data/example/output.docx?md5=x");
 });
 
+
+const legacySsoCallbackUrl =
+  "https://folio.example.test/api/legacy-sso/callback";
+
+test("linked role=user completes browser-bound SSO and receives a normal session", async () => {
+  const email = `ticket-12-linked-${crypto.randomUUID()}@example.com`;
+  const password = "Ticket12-local-password";
+  const user = await createCredentialFixture({
+    email,
+    mustChangePassword: true,
+    name: "Ticket 12 linked User",
+    password,
+  });
+  const identity = {
+    email,
+    email_verified: true,
+    sub: `legacy-${crypto.randomUUID()}`,
+  };
+  const clientId = `folio-${crypto.randomUUID()}`;
+  const clientSecret = `ticket-12-test-secret-${crypto.randomUUID()}`;
+  const providerId = `legacy-${crypto.randomUUID()}`;
+  await prisma.account.create({
+    data: {
+      accountId: identity.sub,
+      id: crypto.randomUUID(),
+      providerId,
+      userId: user.id,
+    },
+  });
+  legacySsoMock = startLegacySsoMock({
+    callbackUrl: legacySsoCallbackUrl,
+    clientId,
+    clientSecret,
+    identity,
+  });
+  const ssoApp = createLegacySsoTestApp({
+    authorizeUrl: legacySsoMock.authorizeUrl,
+    callbackUrl: legacySsoCallbackUrl,
+    clientId,
+    clientSecret,
+    exchangeUrl: legacySsoMock.exchangeUrl,
+    providerId,
+  });
+  const handle: LegacySsoHttpHandler = (request) => ssoApp.handle(request);
+  const returnTo = `/forms/${"a".repeat(32)}/fill?responseId=${crypto.randomUUID()}`;
+  const browserStart = await startLegacySsoBrowser(handle, returnTo);
+  expect(browserStart.startResponse.status).toBe(303);
+  const startCookieHeader =
+    browserStart.startResponse.headers.get("set-cookie") ?? "";
+  expect(startCookieHeader).toContain("HttpOnly");
+  expect(startCookieHeader).toContain("Secure");
+  expect(startCookieHeader).toContain("SameSite=Lax");
+  expect(startCookieHeader).toContain("Path=/");
+
+  const authorizeUrl = new URL(browserStart.authorizationUrl);
+  expect(authorizeUrl.searchParams.get("client_id")).toBe(clientId);
+  expect(authorizeUrl.searchParams.get("redirect_uri")).toBe(
+    legacySsoCallbackUrl
+  );
+  expect(authorizeUrl.searchParams.get("code_challenge_method")).toBe("S256");
+  expect(authorizeUrl.searchParams.get("state")).toMatch(/^[A-Za-z0-9_-]{43}$/u);
+  expect(authorizeUrl.searchParams.get("code_challenge")).toMatch(
+    /^[A-Za-z0-9_-]{43}$/u
+  );
+  expect(authorizeUrl.searchParams.has("returnTo")).toBe(false);
+  expect(browserStart.authorizationUrl).not.toContain(clientSecret);
+
+  const oldBackendResponse = await fetch(browserStart.authorizationUrl, {
+    redirect: "manual",
+  });
+  expect(oldBackendResponse.status).toBe(303);
+  const callbackLocation = oldBackendResponse.headers.get("location");
+  if (!callbackLocation) {
+    throw new Error("The test old backend did not return a callback");
+  }
+  const callbackUrl = new URL(callbackLocation);
+  expect([...callbackUrl.searchParams.keys()].sort()).toEqual(["code", "state"]);
+  const callbackResponse = await handle(
+    new Request(callbackUrl, {
+      headers: { Cookie: browserStart.preLoginCookie },
+    })
+  );
+  expect(callbackResponse.status).toBe(303);
+  expect(callbackResponse.headers.get("location")).toBe(returnTo);
+  expect(callbackResponse.headers.get("referrer-policy")).toBe("no-referrer");
+  expect(callbackLocation).not.toContain(clientSecret);
+  const callbackCookieHeader =
+    callbackResponse.headers.get("set-cookie") ?? "";
+  expect(callbackCookieHeader).toContain("HttpOnly");
+  expect(callbackCookieHeader).toContain("Secure");
+  expect(callbackCookieHeader).toContain("SameSite=Lax");
+
+  const sessionCookie = cookiePairFrom(
+    callbackResponse,
+    "__Host-folio-sso-session"
+  );
+  const wrongOriginClaim = await handle(
+    new Request("https://folio.example.test/api/legacy-sso/session", {
+      headers: {
+        Cookie: sessionCookie,
+        Origin: "https://attacker.example.test",
+      },
+      method: "POST",
+    })
+  );
+  expect(wrongOriginClaim.status).toBe(403);
+  expect(wrongOriginClaim.headers.has("set-cookie")).toBe(false);
+  const claimResponse = await handle(
+    new Request(
+      "https://folio.example.test/api/legacy-sso/session",
+      {
+        headers: {
+          Cookie: sessionCookie,
+          Origin: "https://folio.example.test",
+        },
+        method: "POST",
+      }
+    )
+  );
+  expect(claimResponse.status).toBe(200);
+  const claimBody = await claimResponse.json();
+  if (
+    !claimBody ||
+    typeof claimBody !== "object" ||
+    Array.isArray(claimBody) ||
+    !("token" in claimBody) ||
+    typeof claimBody.token !== "string"
+  ) {
+    throw new Error("The SSO session handoff did not return a bearer");
+  }
+  const bearer = claimBody.token;
+  expect(callbackResponse.headers.get("location")).not.toContain(bearer);
+  const sessionResponse = await handle(
+    new Request("https://folio.example.test/api/session", {
+      headers: { Authorization: `Bearer ${bearer}` },
+    })
+  );
+  expect(sessionResponse.status).toBe(200);
+  expect(await sessionResponse.json()).toMatchObject({
+    user: {
+      email,
+      id: user.id,
+      mustChangePassword: false,
+      name: "Ticket 12 linked User",
+      role: "user",
+    },
+  });
+  const ssoFormResponse = await handle(
+    new Request(`https://folio.example.test/api/forms/${"b".repeat(32)}`, {
+      headers: { Authorization: `Bearer ${bearer}` },
+    })
+  );
+  expect(ssoFormResponse.status).toBe(404);
+  const editorCapability = createEditorCapability({
+    action: "save-draft",
+    actorId: user.id,
+    documentKey: "ticket-12-document",
+    formId: crypto.randomUUID(),
+    leaseId: crypto.randomUUID(),
+    leaseProof: "ticket-12-lease-proof",
+    role: "user",
+    targetId: crypto.randomUUID(),
+    targetType: "response",
+  });
+  const capabilityRequest = (token: string) =>
+    handle(
+      new Request(
+        `https://folio.example.test/api/forms/${"b".repeat(32)}/draft`,
+        {
+          body: JSON.stringify({
+            documentKey: "ticket-12-document",
+            responseId: crypto.randomUUID(),
+          }),
+          headers: {
+            ...jsonHeaders,
+            Authorization: `Bearer ${token}`,
+            "X-Editor-Capability": editorCapability,
+          },
+          method: "POST",
+        }
+      )
+    );
+  expect((await capabilityRequest(bearer)).status).toBe(404);
+
+  const localBearer = await bearerFor(
+    email,
+    password,
+    `ticket-12-local-${crypto.randomUUID()}`
+  );
+  const localFormResponse = await handle(
+    new Request(`https://folio.example.test/api/forms/${"b".repeat(32)}`, {
+      headers: { Authorization: `Bearer ${localBearer}` },
+    })
+  );
+  expect(localFormResponse.status).toBe(403);
+  expect(await localFormResponse.json()).toMatchObject({
+    error: "password_change_required",
+  });
+  expect((await capabilityRequest(localBearer)).status).toBe(401);
+
+  const callbackReplay = await handle(
+    new Request(callbackUrl, {
+      headers: { Cookie: browserStart.preLoginCookie },
+    })
+  );
+  expect(callbackReplay.status).toBe(303);
+  expect(callbackReplay.headers.get("location")).toBe(
+    "/login?legacySso=failed"
+  );
+  const sessionReplay = await handle(
+    new Request("https://folio.example.test/api/legacy-sso/session", {
+      headers: {
+        Cookie: sessionCookie,
+        Origin: "https://folio.example.test",
+      },
+      method: "POST",
+    })
+  );
+  expect(sessionReplay.status).toBe(401);
+});
+
+test("rejects unsafe returns and mismatched callback state or cookie", async () => {
+  const email = `ticket-12-binding-${crypto.randomUUID()}@example.com`;
+  const password = "Ticket12-binding-test-password";
+  const user = await createCredentialFixture({
+    email,
+    name: "Ticket 12 binding User",
+    password,
+  });
+  const identity = {
+    email,
+    email_verified: true,
+    sub: `legacy-${crypto.randomUUID()}`,
+  };
+  const clientId = `folio-${crypto.randomUUID()}`;
+  const clientSecret = `ticket-12-test-secret-${crypto.randomUUID()}`;
+  const providerId = `legacy-${crypto.randomUUID()}`;
+  await prisma.account.create({
+    data: {
+      accountId: identity.sub,
+      id: crypto.randomUUID(),
+      providerId,
+      userId: user.id,
+    },
+  });
+  legacySsoMock = startLegacySsoMock({
+    callbackUrl: legacySsoCallbackUrl,
+    clientId,
+    clientSecret,
+    identity,
+  });
+  const ssoApp = createLegacySsoTestApp({
+    authorizeUrl: legacySsoMock.authorizeUrl,
+    callbackUrl: legacySsoCallbackUrl,
+    clientId,
+    clientSecret,
+    exchangeUrl: legacySsoMock.exchangeUrl,
+    providerId,
+  });
+  const handle: LegacySsoHttpHandler = (request) => ssoApp.handle(request);
+  for (const unsafeReturn of [
+    "//attacker.example/",
+    "https://attacker.example/",
+    "/admin",
+    `/forms/${"a".repeat(32)}/fill?access_token=secret`,
+  ]) {
+    const unsafeStartUrl = new URL(
+      "/api/legacy-sso/start",
+      "https://folio.example.test"
+    );
+    unsafeStartUrl.searchParams.set("returnTo", unsafeReturn);
+    const unsafeStart = await handle(new Request(unsafeStartUrl));
+    expect(unsafeStart.status).toBe(400);
+    expect(unsafeStart.headers.has("set-cookie")).toBe(false);
+  }
+
+  const returnTo = `/forms/${"c".repeat(32)}/fill`;
+  const browserStart = await startLegacySsoBrowser(handle, returnTo);
+  const oldBackendResponse = await fetch(browserStart.authorizationUrl, {
+    redirect: "manual",
+  });
+  expect(oldBackendResponse.status).toBe(303);
+  const callbackLocation = oldBackendResponse.headers.get("location");
+  if (!callbackLocation) {
+    throw new Error("The test old backend did not return a callback");
+  }
+  const callbackUrl = new URL(callbackLocation);
+  const wrongStateUrl = new URL(callbackUrl);
+  wrongStateUrl.searchParams.set("state", "x".repeat(43));
+  const wrongStateResponse = await handle(
+    new Request(wrongStateUrl, {
+      headers: { Cookie: browserStart.preLoginCookie },
+    })
+  );
+  expect(wrongStateResponse.headers.get("location")).toBe(
+    "/login?legacySso=failed"
+  );
+  const wrongCookieResponse = await handle(
+    new Request(callbackUrl, {
+      headers: { Cookie: `__Host-folio-sso=${"y".repeat(43)}` },
+    })
+  );
+  expect(wrongCookieResponse.headers.get("location")).toBe(
+    "/login?legacySso=failed"
+  );
+  const wrongHostUrl = new URL(callbackUrl);
+  wrongHostUrl.hostname = "attacker.example.test";
+  const wrongHostResponse = await handle(
+    new Request(wrongHostUrl, {
+      headers: { Cookie: browserStart.preLoginCookie },
+    })
+  );
+  expect(wrongHostResponse.headers.get("location")).toBe(
+    "/login?legacySso=failed"
+  );
+  const wrongProtocolResponse = await handle(
+    new Request(callbackUrl, {
+      headers: {
+        Cookie: browserStart.preLoginCookie,
+        "X-Forwarded-Proto": "http",
+      },
+    })
+  );
+  expect(wrongProtocolResponse.headers.get("location")).toBe(
+    "/login?legacySso=failed"
+  );
+
+  const validCallback = await handle(
+    new Request(callbackUrl, {
+      headers: { Cookie: browserStart.preLoginCookie },
+    })
+  );
+  expect(validCallback.status).toBe(303);
+  expect(validCallback.headers.get("location")).toBe(returnTo);
+  expect(
+    await (
+      await handle(
+        new Request("https://folio.example.test/api/legacy-sso/status")
+      )
+    ).json()
+  ).toEqual({ enabled: true });
+
+  const separatedHandoff = await handle(
+    new Request("https://folio.example.test/api/legacy-sso/session", {
+      headers: {
+        Cookie: prefillCookie,
+        Origin: "https://folio.example.test",
+      },
+      method: "POST",
+    })
+  );
+  expect(separatedHandoff.status).toBe(401);
+  expect(
+    (await handle(new Request("https://folio.example.test/prefill/handoff")))
+      .status
+  ).toBe(405);
+  expect(
+    await (
+      await app.handle(new Request("http://test.local/api/legacy-sso/status"))
+    ).json()
+  ).toEqual({ enabled: false });
+});
+
+test("rejects unlinked, unverified, disabled, email-mismatched, and Admin identities", async () => {
+  const email = `ticket-12-eligibility-${crypto.randomUUID()}@example.com`;
+  const password = "Ticket12-eligibility-test-password";
+  const user = await createCredentialFixture({
+    email,
+    name: "Ticket 12 eligible User",
+    password,
+  });
+  const identity = {
+    email,
+    email_verified: false,
+    sub: `legacy-${crypto.randomUUID()}`,
+  };
+  const linkedSubject = identity.sub;
+  const clientId = `folio-${crypto.randomUUID()}`;
+  const clientSecret = `ticket-12-test-secret-${crypto.randomUUID()}`;
+  const providerId = `legacy-${crypto.randomUUID()}`;
+  await prisma.account.create({
+    data: {
+      accountId: identity.sub,
+      id: crypto.randomUUID(),
+      providerId,
+      userId: user.id,
+    },
+  });
+  legacySsoMock = startLegacySsoMock({
+    callbackUrl: legacySsoCallbackUrl,
+    clientId,
+    clientSecret,
+    identity,
+  });
+  const ssoApp = createLegacySsoTestApp({
+    authorizeUrl: legacySsoMock.authorizeUrl,
+    callbackUrl: legacySsoCallbackUrl,
+    clientId,
+    clientSecret,
+    exchangeUrl: legacySsoMock.exchangeUrl,
+    providerId,
+  });
+  const handle: LegacySsoHttpHandler = (request) => ssoApp.handle(request);
+  const rejectCurrentIdentity = async () => {
+    const browserStart = await startLegacySsoBrowser(
+      handle,
+      `/forms/${"d".repeat(32)}/fill`
+    );
+    const oldBackendResponse = await fetch(browserStart.authorizationUrl, {
+      redirect: "manual",
+    });
+    expect(oldBackendResponse.status).toBe(303);
+    const location = oldBackendResponse.headers.get("location");
+    if (!location) {
+      throw new Error("The test old backend did not return a callback");
+    }
+    const callbackResponse = await handle(
+      new Request(location, {
+        headers: { Cookie: browserStart.preLoginCookie },
+      })
+    );
+    expect(callbackResponse.status).toBe(303);
+    expect(callbackResponse.headers.get("location")).toBe(
+      "/login?legacySso=failed"
+    );
+  };
+  const userCountBefore = await prisma.user.count();
+  await rejectCurrentIdentity();
+  identity.email_verified = true;
+  identity.email = `different-${crypto.randomUUID()}@example.com`;
+  await rejectCurrentIdentity();
+  identity.email = email;
+  identity.sub = `unlinked-${crypto.randomUUID()}`;
+  await rejectCurrentIdentity();
+  identity.sub = linkedSubject;
+  await prisma.user.update({
+    data: { enabled: false },
+    where: { id: user.id },
+  });
+  await rejectCurrentIdentity();
+  await prisma.user.update({
+    data: { enabled: true, role: "admin" },
+    where: { id: user.id },
+  });
+  await rejectCurrentIdentity();
+  expect(await prisma.user.count()).toBe(userCountBefore);
+  expect(await prisma.session.count({ where: { userId: user.id } })).toBe(0);
+});
+
+test("expires browser-bound SSO transactions and session handoffs", async () => {
+  let appNow = new Date();
+  const backendNow = new Date();
+  const email = `ticket-12-expiry-${crypto.randomUUID()}@example.com`;
+  const user = await createCredentialFixture({
+    email,
+    name: "Ticket 12 expiry User",
+    password: "Ticket12-expiry-test-password",
+  });
+  const identity = {
+    email,
+    email_verified: true,
+    sub: `legacy-${crypto.randomUUID()}`,
+  };
+  const clientId = `folio-${crypto.randomUUID()}`;
+  const clientSecret = `ticket-12-test-secret-${crypto.randomUUID()}`;
+  const providerId = `legacy-${crypto.randomUUID()}`;
+  await prisma.account.create({
+    data: {
+      accountId: identity.sub,
+      id: crypto.randomUUID(),
+      providerId,
+      userId: user.id,
+    },
+  });
+  legacySsoMock = startLegacySsoMock({
+    callbackUrl: legacySsoCallbackUrl,
+    clientId,
+    clientSecret,
+    clock: () => new Date(backendNow),
+    identity,
+  });
+  const ssoApp = createLegacySsoTestApp(
+    {
+      authorizeUrl: legacySsoMock.authorizeUrl,
+      callbackUrl: legacySsoCallbackUrl,
+      clientId,
+      clientSecret,
+      exchangeUrl: legacySsoMock.exchangeUrl,
+      providerId,
+    },
+    () => new Date(appNow)
+  );
+  const handle: LegacySsoHttpHandler = (request) => ssoApp.handle(request);
+  const returnTo = `/forms/${"e".repeat(32)}/fill`;
+  const expiredStart = await startLegacySsoBrowser(handle, returnTo);
+  const expiredAuthorization = await fetch(expiredStart.authorizationUrl, {
+    redirect: "manual",
+  });
+  expect(expiredAuthorization.status).toBe(303);
+  const expiredCallbackUrl = expiredAuthorization.headers.get("location");
+  if (!expiredCallbackUrl) {
+    throw new Error("The test old backend did not return an expiring code");
+  }
+  appNow = new Date(appNow.getTime() + 5 * 60_000 + 1);
+  const expiredCallback = await handle(
+    new Request(expiredCallbackUrl, {
+      headers: { Cookie: expiredStart.preLoginCookie },
+    })
+  );
+  expect(expiredCallback.headers.get("location")).toBe(
+    "/login?legacySso=failed"
+  );
+
+  const validStart = await startLegacySsoBrowser(handle, returnTo);
+  const validAuthorization = await fetch(validStart.authorizationUrl, {
+    redirect: "manual",
+  });
+  const validCallbackUrl = validAuthorization.headers.get("location");
+  if (!validCallbackUrl) {
+    throw new Error("The test old backend did not return a valid code");
+  }
+  const validCallback = await handle(
+    new Request(validCallbackUrl, {
+      headers: { Cookie: validStart.preLoginCookie },
+    })
+  );
+  expect(validCallback.headers.get("location")).toBe(returnTo);
+  const sessionCookie = cookiePairFrom(
+    validCallback,
+    "__Host-folio-sso-session"
+  );
+  appNow = new Date(appNow.getTime() + 60_001);
+  const expiredSession = await handle(
+    new Request("https://folio.example.test/api/legacy-sso/session", {
+      headers: {
+        Cookie: sessionCookie,
+        Origin: "https://folio.example.test",
+      },
+      method: "POST",
+    })
+  );
+  expect(expiredSession.status).toBe(401);
+});
+
+test("old-backend codes bind client, callback, verifier, expiry, and single use", async () => {
+  let now = new Date();
+  const callbackUrl = legacySsoCallbackUrl;
+  const clientId = `folio-${crypto.randomUUID()}`;
+  const clientSecret = `ticket-12-test-secret-${crypto.randomUUID()}`;
+  const identity = {
+    email: `ticket-12-mock-${crypto.randomUUID()}@example.com`,
+    email_verified: true,
+    sub: `legacy-${crypto.randomUUID()}`,
+  };
+  legacySsoMock = startLegacySsoMock({
+    callbackUrl,
+    clientId,
+    clientSecret,
+    codeLifetimeMs: 1000,
+    clock: () => new Date(now),
+    identity,
+  });
+  const verifier = "v".repeat(43);
+  const challenge = createHash("sha256")
+    .update(verifier)
+    .digest("base64url");
+  const state = "s".repeat(43);
+  const authorize = new URL(legacySsoMock.authorizeUrl);
+  authorize.searchParams.set("client_id", clientId);
+  authorize.searchParams.set("redirect_uri", callbackUrl);
+  authorize.searchParams.set("state", state);
+  authorize.searchParams.set("code_challenge", challenge);
+  authorize.searchParams.set("code_challenge_method", "S256");
+
+  const wrongClientAuthorize = new URL(authorize);
+  wrongClientAuthorize.searchParams.set("client_id", "other-client");
+  expect(
+    (await fetch(wrongClientAuthorize, { redirect: "manual" })).status
+  ).toBe(400);
+  const wrongCallbackAuthorize = new URL(authorize);
+  wrongCallbackAuthorize.searchParams.set(
+    "redirect_uri",
+    "https://attacker.example.test/callback"
+  );
+  expect(
+    (await fetch(wrongCallbackAuthorize, { redirect: "manual" })).status
+  ).toBe(400);
+  const authorizeResponse = await fetch(authorize, { redirect: "manual" });
+  expect(authorizeResponse.status).toBe(303);
+  const callbackLocation = authorizeResponse.headers.get("location");
+  if (!callbackLocation) {
+    throw new Error("The test old backend did not issue an authorization code");
+  }
+  const code = new URL(callbackLocation).searchParams.get("code");
+  if (!code) {
+    throw new Error("The test old backend callback omitted its code");
+  }
+
+  const exchange = async ({
+    clientId: exchangeClientId = clientId,
+    codeVerifier = verifier,
+    redirectUri = callbackUrl,
+  }: {
+    clientId?: string;
+    codeVerifier?: string;
+    redirectUri?: string;
+  } = {}) =>
+    fetch(legacySsoMock.exchangeUrl, {
+      body: new URLSearchParams({
+        client_id: exchangeClientId,
+        code,
+        code_verifier: codeVerifier,
+        grant_type: "authorization_code",
+        redirect_uri: redirectUri,
+      }),
+      headers: {
+        Authorization: `Basic ${Buffer.from(
+          `${clientId}:${clientSecret}`
+        ).toString("base64")}`,
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      method: "POST",
+    });
+  expect((await exchange({ clientId: "other-client" })).status).toBe(400);
+  expect(
+    (
+      await exchange({
+        redirectUri: "https://attacker.example.test/callback",
+      })
+    ).status
+  ).toBe(400);
+  expect((await exchange({ codeVerifier: "w".repeat(43) })).status).toBe(400);
+  expect((await exchange()).status).toBe(200);
+  expect((await exchange()).status).toBe(400);
+
+  const expiredAuthorization = await fetch(authorize, { redirect: "manual" });
+  const expiredLocation = expiredAuthorization.headers.get("location");
+  if (!expiredLocation) {
+    throw new Error("The test old backend did not issue an expiring code");
+  }
+  const expiredCode = new URL(expiredLocation).searchParams.get("code");
+  if (!expiredCode) {
+    throw new Error("The test old backend callback omitted its expiring code");
+  }
+  now = new Date(now.getTime() + 1001);
+  const expiredResponse = await fetch(legacySsoMock.exchangeUrl, {
+    body: new URLSearchParams({
+      client_id: clientId,
+      code: expiredCode,
+      code_verifier: verifier,
+      grant_type: "authorization_code",
+      redirect_uri: callbackUrl,
+    }),
+    headers: {
+      Authorization: `Basic ${Buffer.from(
+        `${clientId}:${clientSecret}`
+      ).toString("base64")}`,
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    method: "POST",
+  });
+  expect(expiredResponse.status).toBe(400);
+});
 test("serves authenticated Admin and User workflows through HTTP", async () => {
   const adminEmail = `ticket-02-admin-${crypto.randomUUID()}@example.com`;
   const userEmail = `ticket-02-user-${crypto.randomUUID()}@example.com`;

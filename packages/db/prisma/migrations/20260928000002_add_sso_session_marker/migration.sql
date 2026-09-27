@@ -1,0 +1,1 @@
+ALTER TABLE "session" ADD COLUMN "is_sso" BOOLEAN NOT NULL DEFAULT false;

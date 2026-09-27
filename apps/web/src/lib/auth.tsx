@@ -2,10 +2,12 @@ import { createContext, useContext, useEffect, useState } from "react";
 
 import {
   ApiError,
+  claimLegacySsoSession,
   clearToken,
   getSession,
   getToken,
   replacePassword as requestReplacePassword,
+  setToken,
   signIn as requestSignIn,
   signOut as requestSignOut,
 } from "@/lib/api";
@@ -65,24 +67,26 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
   const [expiresAt, setExpiresAt] = useState<string | null>(null);
 
   useEffect(() => {
-    const sessionToken = getToken();
     let active = true;
-    if (!sessionToken) {
-      setLoading(false);
-      return () => {
-        active = false;
-      };
-    }
-
     const loadSession = async () => {
+      let sessionToken = getToken();
       try {
+        if (!sessionToken) {
+          sessionToken = await claimLegacySsoSession();
+          if (sessionToken) {
+            setToken(sessionToken);
+          }
+        }
+        if (!sessionToken) {
+          return;
+        }
         const session = await getSession();
         if (active && getToken() === sessionToken) {
           setUser(session.user);
           setExpiresAt(session.session.expiresAt);
         }
       } catch {
-        if (active && getToken() === sessionToken) {
+        if (active && sessionToken && getToken() === sessionToken) {
           clearToken();
           setUser(null);
           setExpiresAt(null);

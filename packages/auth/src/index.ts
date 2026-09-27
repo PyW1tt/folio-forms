@@ -37,8 +37,14 @@ export function createAuth() {
     },
     plugins: [bearer()],
     rateLimit: { enabled: false },
-    secret: env.BETTER_AUTH_SECRET,
     session: {
+      additionalFields: {
+        isSso: {
+          defaultValue: false,
+          input: false,
+          type: "boolean",
+        },
+      },
       disableSessionRefresh: true,
       expiresIn: sessionDurationSeconds,
     },

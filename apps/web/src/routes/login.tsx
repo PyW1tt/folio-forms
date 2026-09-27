@@ -8,18 +8,23 @@ import type { FormEvent } from "react";
 import { useEffect, useRef, useState } from "react";
 
 import { Button, Card, Input, Notice, Spinner } from "@/components/ui";
-import { safeReturnPath } from "@/lib/api";
+import {
+  API_ORIGIN,
+  legacySsoEnabled as checkLegacySsoEnabled,
+  safeReturnPath,
+} from "@/lib/api";
 import { authErrorMessage, roleFor, useAuth } from "@/lib/auth";
 
 const LoginRoute = () => {
   const { loading: authLoading, signIn, user } = useAuth();
   const navigate = useNavigate();
-  const { returnTo } = useSearch({ from: "/login" });
+  const { legacySso, returnTo } = useSearch({ from: "/login" });
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [legacySsoAvailable, setLegacySsoAvailable] = useState(false);
   const errorRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -27,6 +32,30 @@ const LoginRoute = () => {
       errorRef.current?.focus();
     }
   }, [error]);
+
+  useEffect(() => {
+    let active = true;
+    void checkLegacySsoEnabled()
+      .then((enabled) => {
+        if (active) {
+          setLegacySsoAvailable(enabled);
+        }
+      })
+      .catch(() => {
+        if (active) {
+          setLegacySsoAvailable(false);
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (legacySso === "failed") {
+      setError("ไม่สามารถเข้าสู่ระบบผ่านระบบเดิมได้ กรุณาลองอีกครั้ง");
+    }
+  }, [legacySso]);
 
   useEffect(() => {
     if (!user) {
@@ -103,6 +132,13 @@ const LoginRoute = () => {
       setBusy(false);
     }
   };
+  const startLegacySso = () => {
+    const startUrl = new URL("/api/legacy-sso/start", API_ORIGIN);
+    if (returnTo) {
+      startUrl.searchParams.set("returnTo", returnTo);
+    }
+    window.location.assign(startUrl.href);
+  };
 
   return (
     <div className="grid min-h-screen place-items-center bg-[var(--ink)] px-5 py-12">
@@ -173,6 +209,25 @@ const LoginRoute = () => {
               <ArrowRight size={16} />
             </Button>
           </form>
+          {legacySsoAvailable ? (
+            <div className="mt-5 space-y-4">
+              <div className="flex items-center gap-3 text-xs text-[var(--ink-soft)]">
+                <span className="h-px flex-1 bg-[var(--line)]" />
+                <span>หรือเข้าสู่ระบบผ่านระบบเดิม</span>
+                <span className="h-px flex-1 bg-[var(--line)]" />
+              </div>
+              <Button
+                className="w-full"
+                size="lg"
+                type="button"
+                variant="secondary"
+                onClick={startLegacySso}
+              >
+                <LockKeyhole size={17} />
+                เข้าสู่ระบบผ่านระบบเดิม
+              </Button>
+            </div>
+          ) : null}
         </Card>
         <p className="mt-5 text-center text-xs text-[#b8c5c5]">
           พื้นที่ทำงานภายใน · ใช้โทเค็นเซสชันแบบไม่เปิดเผยข้อมูล
@@ -186,5 +241,6 @@ export const Route = createFileRoute("/login")({
   component: LoginRoute,
   validateSearch: (search) => ({
     returnTo: safeReturnPath(search.returnTo) ?? undefined,
+    legacySso: search.legacySso === "failed" ? "failed" : undefined,
   }),
 });

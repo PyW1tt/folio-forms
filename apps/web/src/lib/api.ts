@@ -416,6 +416,38 @@ export const downloadArtifact = async (path: string, filename: string) => {
 };
 
 export const getSession = () => request<Session>("/api/session");
+export const legacySsoEnabled = async (): Promise<boolean> => {
+  const result = await request<{ enabled?: unknown }>(
+    "/api/legacy-sso/status"
+  );
+  return result.enabled === true;
+};
+
+export const claimLegacySsoSession = async (): Promise<string | null> => {
+  const response = await fetch(`${API_ORIGIN}/api/legacy-sso/session`, {
+    credentials: "include",
+    method: "POST",
+  });
+  if (!response.ok) {
+    return null;
+  }
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch {
+    return null;
+  }
+  if (
+    !body ||
+    typeof body !== "object" ||
+    Array.isArray(body) ||
+    !("token" in body)
+  ) {
+    return null;
+  }
+  const token = body.token;
+  return typeof token === "string" && token.length > 0 ? token : null;
+};
 
 export const signIn = async (
   email: string,
