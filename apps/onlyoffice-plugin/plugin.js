@@ -2712,8 +2712,36 @@ function actionRequest(action, data, reason) {
   throw new Error(`Unsupported form action: ${action || "none"}`);
 }
 
+function isActionAllowedInMode(action) {
+  switch (runtimeOptions.action) {
+    case ACTIONS.TEMPLATE_EDIT: {
+      return (
+        action === ACTIONS.CONFIGURE_FIELDS ||
+        action === ACTIONS.PUBLISH ||
+        action === ACTIONS.SAVE_TEMPLATE
+      );
+    }
+    case ACTIONS.FILL:
+    case ACTIONS.DRAFT: {
+      return action === ACTIONS.SAVE_DRAFT || action === ACTIONS.SUBMIT;
+    }
+    case ACTIONS.CORRECTION: {
+      return action === ACTIONS.SAVE_CORRECTION;
+    }
+    case ACTIONS.SUBMIT: {
+      return action === ACTIONS.SUBMIT;
+    }
+    default: {
+      return false;
+    }
+  }
+}
+
 function requestActionCapability(action) {
-  if (!CAPABILITY_ACTIONS.includes(action)) {
+  if (
+    !CAPABILITY_ACTIONS.includes(action) ||
+    !isActionAllowedInMode(action)
+  ) {
     return Promise.reject(
       new Error(`Unsupported form action: ${action || "none"}`)
     );
@@ -3089,6 +3117,7 @@ function initializePlugin() {
 
   pluginInitialized = true;
   runtimeOptions = normalizeRuntimeOptions();
+  exposeFormBridge();
   startBridge();
 
   if (runtimeOptions.action === ACTIONS.TEMPLATE_EDIT) {
@@ -3115,23 +3144,40 @@ function initializePlugin() {
   startInitializationWhenReady();
 }
 
-window.FormBridge = Object.assign(window.FormBridge || {}, {
-  applyPrefill,
-  applySchemaPointer,
-  copySchemaPointer,
-  extractFormData,
-  getFieldRules: loadFieldRules,
-  getPanelState,
-  getRuntimeOptions: () => runtimeOptions,
-  loadSchemaPage,
-  pollOperation,
-  refreshSelection,
-  runAction,
-  saveFieldRule,
-  selectSchemaPointer,
-  setSchemaQuery,
-  submitForm,
-});
+function exposeFormBridge() {
+  const formBridge = Object.assign(window.FormBridge || {}, {
+    applyPrefill,
+    extractFormData,
+    getRuntimeOptions: () => runtimeOptions,
+    pollOperation,
+    runAction,
+    submitForm,
+  });
+  if (runtimeOptions.action === ACTIONS.TEMPLATE_EDIT) {
+    Object.assign(formBridge, {
+      applySchemaPointer,
+      copySchemaPointer,
+      getFieldRules: loadFieldRules,
+      getPanelState,
+      loadSchemaPage,
+      refreshSelection,
+      saveFieldRule,
+      selectSchemaPointer,
+      setSchemaQuery,
+    });
+  } else {
+    delete formBridge.applySchemaPointer;
+    delete formBridge.copySchemaPointer;
+    delete formBridge.getFieldRules;
+    delete formBridge.getPanelState;
+    delete formBridge.loadSchemaPage;
+    delete formBridge.refreshSelection;
+    delete formBridge.saveFieldRule;
+    delete formBridge.selectSchemaPointer;
+    delete formBridge.setSchemaQuery;
+  }
+  window.FormBridge = formBridge;
+}
 /**
  * ONLYOFFICE plugin entry point.
  *

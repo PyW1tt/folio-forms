@@ -1353,11 +1353,14 @@ test("loads persisted field rules into the selected panel", async () => {
   });
 });
 
-test("emits a safe no-selection payload and keeps the panel mode-scoped", async () => {
+test("keeps field configuration available only in template-edit mode", async () => {
   const templateHarness = createHarness({ action: "template-edit" });
   acknowledgeBridge(templateHarness);
   await flushPlugin();
   expect(templateHarness.element("field-panel").hidden).toBe(false);
+  expect(typeof templateHarness.window.FormBridge.saveFieldRule).toBe(
+    "function"
+  );
   expect(
     templateHarness.messages.find(
       ({ message }) => message.type === "field-selection"
@@ -1371,6 +1374,20 @@ test("emits a safe no-selection payload and keeps the panel mode-scoped", async 
 
   const fillHarness = createHarness({ action: "fill" });
   expect(fillHarness.element("field-panel").hidden).toBe(true);
+  expect(fillHarness.window.FormBridge.applySchemaPointer).toBeUndefined();
+  expect(fillHarness.window.FormBridge.getFieldRules).toBeUndefined();
+  expect(fillHarness.window.FormBridge.saveFieldRule).toBeUndefined();
+  for (const action of ["configure-fields", "publish", "save-template"]) {
+    await expect(
+      fillHarness.window.FormBridge.runAction(action)
+    ).resolves.toMatchObject({ ok: false });
+  }
+  expect(fillHarness.requests).toHaveLength(0);
+  expect(
+    fillHarness.messages.filter(
+      ({ message }) => message.type === "capability-request"
+    )
+  ).toHaveLength(0);
 });
 
 test("reports field-rule API failures without exposing a value payload", async () => {

@@ -71,9 +71,12 @@
       }
 
       #field-panel {
+        align-content: start;
         display: grid;
         gap: 10px;
+        max-height: calc(100vh - 20px);
         max-width: 340px;
+        overflow-y: auto;
       }
 
       #field-panel[hidden] {
