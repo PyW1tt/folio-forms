@@ -208,6 +208,7 @@ export interface LegacySsoMockOptions {
   clientId: string;
   clientSecret: string;
   identity: LegacySsoMockIdentity;
+  authorizationCode?: string;
   codeLifetimeMs?: number;
   clock?: () => Date;
 }
@@ -267,7 +268,8 @@ export const createLegacySsoMockHandler = (
       ) {
         return Response.json({ error: "invalid_request" }, { status: 400 });
       }
-      const code = randomBytes(32).toString("base64url");
+      const code =
+        options.authorizationCode ?? randomBytes(32).toString("base64url");
       codes.set(code, {
         callbackUrl: options.callbackUrl,
         challenge: query.get("code_challenge") ?? "",

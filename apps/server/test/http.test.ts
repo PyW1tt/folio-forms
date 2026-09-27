@@ -599,6 +599,13 @@ test("rewrites public ONLYOFFICE callback paths to the internal base", () => {
 
 const legacySsoCallbackUrl =
   "https://folio.example.test/api/legacy-sso/callback";
+const legacySsoWebOrigin = new URL(
+  process.env.CORS_ORIGIN ?? "http://localhost:5173"
+).origin;
+const legacySsoFailedLocation = new URL(
+  "/login?legacySso=failed",
+  legacySsoWebOrigin
+).href;
 
 test("linked role=user completes browser-bound SSO and receives a normal session", async () => {
   const email = `ticket-12-linked-${crypto.randomUUID()}@example.com`;
@@ -616,6 +623,7 @@ test("linked role=user completes browser-bound SSO and receives a normal session
   };
   const clientId = `folio-${crypto.randomUUID()}`;
   const clientSecret = `ticket-12-test-secret-${crypto.randomUUID()}`;
+  const authorizationCode = "ticket-12+/=opaque-code";
   const providerId = `legacy-${crypto.randomUUID()}`;
   await prisma.account.create({
     data: {
@@ -630,6 +638,7 @@ test("linked role=user completes browser-bound SSO and receives a normal session
     clientId,
     clientSecret,
     identity,
+    authorizationCode,
   });
   const ssoApp = createLegacySsoTestApp({
     authorizeUrl: legacySsoMock.authorizeUrl,
@@ -673,13 +682,21 @@ test("linked role=user completes browser-bound SSO and receives a normal session
   }
   const callbackUrl = new URL(callbackLocation);
   expect([...callbackUrl.searchParams.keys()].sort()).toEqual(["code", "state"]);
+  expect(callbackUrl.searchParams.get("code")).toBe(authorizationCode);
   const callbackResponse = await handle(
     new Request(callbackUrl, {
-      headers: { Cookie: browserStart.preLoginCookie },
+      headers: {
+        Cookie: browserStart.preLoginCookie,
+        Host: "attacker.example.test",
+        "X-Forwarded-Host": "attacker.example.test",
+        "X-Forwarded-Proto": "https",
+      },
     })
   );
   expect(callbackResponse.status).toBe(303);
-  expect(callbackResponse.headers.get("location")).toBe(returnTo);
+  expect(callbackResponse.headers.get("location")).toBe(
+    new URL(returnTo, legacySsoWebOrigin).href
+  );
   expect(callbackResponse.headers.get("referrer-policy")).toBe("no-referrer");
   expect(callbackLocation).not.toContain(clientSecret);
   const callbackCookieHeader =
@@ -803,7 +820,7 @@ test("linked role=user completes browser-bound SSO and receives a normal session
   );
   expect(callbackReplay.status).toBe(303);
   expect(callbackReplay.headers.get("location")).toBe(
-    "/login?legacySso=failed"
+    legacySsoFailedLocation
   );
   const sessionReplay = await handle(
     new Request("https://folio.example.test/api/legacy-sso/session", {
@@ -891,7 +908,7 @@ test("rejects unsafe returns and mismatched callback state or cookie", async () 
     })
   );
   expect(wrongStateResponse.headers.get("location")).toBe(
-    "/login?legacySso=failed"
+    legacySsoFailedLocation
   );
   const wrongCookieResponse = await handle(
     new Request(callbackUrl, {
@@ -899,7 +916,7 @@ test("rejects unsafe returns and mismatched callback state or cookie", async () 
     })
   );
   expect(wrongCookieResponse.headers.get("location")).toBe(
-    "/login?legacySso=failed"
+    legacySsoFailedLocation
   );
   const wrongHostUrl = new URL(callbackUrl);
   wrongHostUrl.hostname = "attacker.example.test";
@@ -909,7 +926,7 @@ test("rejects unsafe returns and mismatched callback state or cookie", async () 
     })
   );
   expect(wrongHostResponse.headers.get("location")).toBe(
-    "/login?legacySso=failed"
+    legacySsoFailedLocation
   );
   const wrongProtocolResponse = await handle(
     new Request(callbackUrl, {
@@ -920,7 +937,7 @@ test("rejects unsafe returns and mismatched callback state or cookie", async () 
     })
   );
   expect(wrongProtocolResponse.headers.get("location")).toBe(
-    "/login?legacySso=failed"
+    legacySsoFailedLocation
   );
 
   const validCallback = await handle(
@@ -929,7 +946,9 @@ test("rejects unsafe returns and mismatched callback state or cookie", async () 
     })
   );
   expect(validCallback.status).toBe(303);
-  expect(validCallback.headers.get("location")).toBe(returnTo);
+  expect(validCallback.headers.get("location")).toBe(
+    new URL(returnTo, legacySsoWebOrigin).href
+  );
   expect(
     await (
       await handle(
@@ -1019,7 +1038,7 @@ test("rejects unlinked, unverified, disabled, email-mismatched, and Admin identi
     );
     expect(callbackResponse.status).toBe(303);
     expect(callbackResponse.headers.get("location")).toBe(
-      "/login?legacySso=failed"
+      legacySsoFailedLocation
     );
   };
   const userCountBefore = await prisma.user.count();
@@ -1106,7 +1125,7 @@ test("expires browser-bound SSO transactions and session handoffs", async () => 
     })
   );
   expect(expiredCallback.headers.get("location")).toBe(
-    "/login?legacySso=failed"
+    legacySsoFailedLocation
   );
 
   const validStart = await startLegacySsoBrowser(handle, returnTo);
@@ -1122,7 +1141,9 @@ test("expires browser-bound SSO transactions and session handoffs", async () => 
       headers: { Cookie: validStart.preLoginCookie },
     })
   );
-  expect(validCallback.headers.get("location")).toBe(returnTo);
+  expect(validCallback.headers.get("location")).toBe(
+    new URL(returnTo, legacySsoWebOrigin).href
+  );
   const sessionCookie = cookiePairFrom(
     validCallback,
     "__Host-folio-sso-session"

@@ -208,7 +208,7 @@ const callbackOrigins = new Set(
     (origin): origin is string => Boolean(origin)
   )
 );
-const corsOrigin = originOf(env.CORS_ORIGIN);
+const corsOrigin = new URL(env.CORS_ORIGIN).origin;
 const pluginOrigins = new Set(
   [env.API_BASE, env.ONLYOFFICE_URL, env.CORS_ORIGIN]
     .map(originOf)
@@ -1430,7 +1430,7 @@ function hostOnlySsoCookie(name: string, value: string, maxAge: number): string 
 function legacySsoFailureResponse(): globalThis.Response {
   const headers = new Headers({
     "Cache-Control": "no-store",
-    Location: "/login?legacySso=failed",
+    Location: new URL("/login?legacySso=failed", corsOrigin).href,
     "Referrer-Policy": "no-referrer",
   });
   headers.append("Set-Cookie", hostOnlySsoCookie(legacySsoCookieName, "", 0));
@@ -1711,7 +1711,6 @@ async function completeLegacySso(
   if (
     !code ||
     code.length > handoffCodeMaximumLength ||
-    !/^[A-Za-z0-9._~-]+$/u.test(code) ||
     !state ||
     !/^[A-Za-z0-9_-]{43}$/u.test(state) ||
     !transactionId
@@ -1778,7 +1777,7 @@ async function completeLegacySso(
   const transferId = await createSsoSessionTransfer(linkedAccount.user.id, now);
   const headers = new Headers({
     "Cache-Control": "no-store",
-    Location: transaction.returnTo,
+    Location: new URL(transaction.returnTo, corsOrigin).href,
     "Referrer-Policy": "no-referrer",
   });
   headers.append("Set-Cookie", hostOnlySsoCookie(legacySsoCookieName, "", 0));
