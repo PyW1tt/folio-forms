@@ -11482,7 +11482,7 @@ test("Ticket 17 AI Authoring requires Admin consent and uploads a validated DOCX
     );
     const originalGetLastAssistantText =
       AgentSession.prototype.getLastAssistantText;
-    const originalDispose = AgentSession.prototype.dispose;
+    const originalFailedGenerationDispose = AgentSession.prototype.dispose;
     const originalUint8ArrayFill = Uint8Array.prototype.fill;
     let generatedDocumentZeroed = false;
     AgentSession.prototype.getLastAssistantText = () => {
@@ -11534,7 +11534,7 @@ test("Ticket 17 AI Authoring requires Admin consent and uploads a validated DOCX
     } finally {
       AgentSession.prototype.getLastAssistantText =
         originalGetLastAssistantText;
-      AgentSession.prototype.dispose = originalDispose;
+      AgentSession.prototype.dispose = originalFailedGenerationDispose;
       Uint8Array.prototype.fill = originalUint8ArrayFill;
     }
 
