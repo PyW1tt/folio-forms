@@ -1519,6 +1519,620 @@ test("old-backend codes bind client, callback, verifier, expiry, and single use"
   });
   expect(expiredResponse.status).toBe(400);
 });
+test("Ticket 06 native text forms preserve drafts, Prefill, and Fill Method", async () => {
+  const adminPassword = "Ticket06-admin-password";
+  const userPassword = "Ticket06-user-password";
+  const adminEmail = `ticket-06-admin-${crypto.randomUUID()}@example.com`;
+  const userEmail = `ticket-06-user-${crypto.randomUUID()}@example.com`;
+  await createCredentialFixture({
+    email: adminEmail,
+    name: "Ticket 06 Admin",
+    password: adminPassword,
+    role: "admin",
+  });
+  await createCredentialFixture({
+    email: userEmail,
+    name: "Ticket 06 User",
+    password: userPassword,
+  });
+  const adminBearer = await bearerFor(adminEmail, adminPassword);
+  const userBearer = await bearerFor(userEmail, userPassword);
+  const capabilityHeaders = (
+    capability: string
+  ): Record<string, string> => ({
+    ...jsonHeaders,
+    "X-Editor-Capability": capability,
+  });
+  const formTemplate = docxXmlFixture({
+    document: contentControlDocument(
+      `<w:p><w:r><w:t>Static layout</w:t></w:r></w:p>` +
+        contentControl({
+          alias: "Full name",
+          placeholderText: "Enter full name",
+          tag: "full_name",
+          type: "<w:text/>",
+        }) +
+        contentControl({
+          alias: "Comments",
+          placeholderText: "Add comments",
+          tag: "comments",
+          type: "<w:text/>",
+        })
+    ),
+  });
+  const createResponse = await app.handle(
+    formCreationRequest({
+      authorization: adminBearer,
+      source: "upload",
+      template: { bytes: formTemplate, name: "native-text.docx" },
+      title: "Ticket 06 Native Text Form",
+    })
+  );
+  expect(createResponse.status).toBe(200);
+  const createdBody = (await createResponse.json()) as {
+    form?: { publicId?: string };
+  };
+  const publicId = createdBody.form?.publicId;
+  if (!publicId) {
+    throw new Error("The Ticket 06 text form was not created");
+  }
+  const createdForm = await prisma.form.findUniqueOrThrow({
+    select: { fillMethod: true, id: true },
+    where: { publicId },
+  });
+  expect(createdForm.fillMethod).toBe("onlyoffice");
+  const patchFillMethod = (fillMethod: "native" | "onlyoffice") =>
+    app.handle(
+      new Request(`http://test.local/api/admin/forms/${publicId}`, {
+        body: JSON.stringify({ fillMethod }),
+        headers: { ...jsonHeaders, Authorization: `Bearer ${adminBearer}` },
+        method: "PATCH",
+      })
+    );
+  const prematureNativeResponse = await patchFillMethod("native");
+  expect(prematureNativeResponse.status).toBe(409);
+  expect(await prematureNativeResponse.json()).toMatchObject({
+    error: "native_fill_unsupported",
+  });
+  const adminEditorResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${publicId}/editor-config`, {
+      headers: { Authorization: `Bearer ${adminBearer}` },
+    })
+  );
+  expect(adminEditorResponse.status).toBe(200);
+  const adminEditor = (await adminEditorResponse.json()) as EditorConfigBody;
+  const configureFieldsCapability =
+    adminEditor.bridge.capabilities["configure-fields"];
+  if (!configureFieldsCapability) {
+    throw new Error("The Ticket 06 field configuration capability is missing");
+  }
+  const requiredFieldResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${publicId}/field-rules`, {
+      body: JSON.stringify({
+        documentKey: adminEditor.config.document.key,
+        prefillPointer: null,
+        prefillPolicy: "editable",
+        previousTag: null,
+        required: true,
+        tag: "full_name",
+      }),
+      headers: capabilityHeaders(configureFieldsCapability),
+      method: "PATCH",
+    })
+  );
+  expect(requiredFieldResponse.status).toBe(200);
+  const publishEditorResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${publicId}/editor-config`, {
+      headers: { Authorization: `Bearer ${adminBearer}` },
+    })
+  );
+  const publishEditor =
+    (await publishEditorResponse.json()) as EditorConfigBody;
+  const publishCapability = publishEditor.bridge.capabilities.publish;
+  if (!publishCapability) {
+    throw new Error("The Ticket 06 publish capability is missing");
+  }
+  const publishResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${publicId}/publish`, {
+      body: JSON.stringify({
+        documentKey: publishEditor.config.document.key,
+      }),
+      headers: capabilityHeaders(publishCapability),
+      method: "POST",
+    })
+  );
+  expect(publishResponse.status).toBe(202);
+  const publishBody = (await publishResponse.json()) as {
+    operationCapability?: string;
+    operationId?: string;
+  };
+  if (!publishBody.operationCapability || !publishBody.operationId) {
+    throw new Error("The Ticket 06 publish operation was not created");
+  }
+  expect(
+    (
+      await waitForOperation(publishBody.operationId, {
+        "X-Editor-Capability": publishBody.operationCapability,
+      })
+    ).status
+  ).toBe("completed");
+  const nativeMethodResponse = await patchFillMethod("native");
+  expect(nativeMethodResponse.status).toBe(200);
+  expect(await nativeMethodResponse.json()).toMatchObject({
+    form: { fillMethod: "native" },
+  });
+  const adminDetailResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${publicId}`, {
+      headers: { Authorization: `Bearer ${adminBearer}` },
+    })
+  );
+  expect(await adminDetailResponse.json()).toMatchObject({
+    form: { fillMethod: "native", nativeFillAvailable: true },
+  });
+  const publicFormResponse = await app.handle(
+    new Request(`http://test.local/api/forms/${publicId}`, {
+      headers: { Authorization: `Bearer ${userBearer}` },
+    })
+  );
+  expect(await publicFormResponse.json()).toMatchObject({
+    form: { fillMethod: "native" },
+  });
+  const startResponse = await app.handle(
+    new Request(`http://test.local/api/forms/${publicId}/start`, {
+      headers: { Authorization: `Bearer ${userBearer}` },
+      method: "POST",
+    })
+  );
+  expect(startResponse.status).toBe(200);
+  const startBody = (await startResponse.json()) as {
+    editorConfigUrl?: string;
+    fillMethod?: string;
+    response?: { id?: string };
+  };
+  const responseId = startBody.response?.id;
+  const editorConfigUrl = startBody.editorConfigUrl;
+  if (!responseId || !editorConfigUrl) {
+    throw new Error("The Ticket 06 native response did not start");
+  }
+  expect(startBody.fillMethod).toBe("native");
+  const prefillValues = { full_name: "Trusted Prefill" };
+  const prefillLocks = { full_name: true };
+  await prisma.prefillSnapshot.update({
+    data: { lockedFields: prefillLocks, values: prefillValues },
+    where: { responseId },
+  });
+  interface NativeResponseConfig {
+    capabilities: Record<"save-draft" | "submit", string>;
+    data: Record<string, unknown>;
+    documentKey: string;
+    fields: {
+      label: string;
+      placeholder: string | null;
+      position: number;
+      required: boolean;
+      tag: string;
+      type: string;
+    }[];
+    fillMethod: string;
+    lockedFields: Record<string, boolean>;
+    responseId: string;
+  }
+  const getNativeConfig = async (): Promise<NativeResponseConfig> => {
+    const response = await app.handle(
+      new Request(new URL(editorConfigUrl, "http://test.local"), {
+        headers: { Authorization: `Bearer ${userBearer}` },
+      })
+    );
+    expect(response.status).toBe(200);
+    return (await response.json()) as NativeResponseConfig;
+  };
+  let nativeConfig = await getNativeConfig();
+  expect(nativeConfig).toMatchObject({
+    data: prefillValues,
+    fillMethod: "native",
+    lockedFields: prefillLocks,
+    responseId,
+  });
+  expect(
+    nativeConfig.fields.map(
+      ({ label, placeholder, position, required, tag, type }) => ({
+        label,
+        placeholder,
+        position,
+        required,
+        tag,
+        type,
+      })
+    )
+  ).toEqual([
+    {
+      label: "Full name",
+      placeholder: "Enter full name",
+      position: 0,
+      required: true,
+      tag: "full_name",
+      type: "text",
+    },
+    {
+      label: "Comments",
+      placeholder: "Add comments",
+      position: 1,
+      required: false,
+      tag: "comments",
+      type: "text",
+    },
+  ]);
+  const nativeDraftRequest = (
+    config: NativeResponseConfig,
+    data: Record<string, unknown>,
+    targetApp = app
+  ) =>
+    targetApp.handle(
+      new Request(`http://test.local/api/forms/${publicId}/draft`, {
+        body: JSON.stringify({
+          data,
+          documentKey: config.documentKey,
+          fillMethod: "native",
+          responseId,
+        }),
+        headers: capabilityHeaders(config.capabilities["save-draft"]),
+        method: "POST",
+      })
+    );
+  const nativeSubmitRequest = (
+    config: NativeResponseConfig,
+    data: Record<string, unknown>
+  ) =>
+    app.handle(
+      new Request(`http://test.local/api/forms/${publicId}/submit`, {
+        body: JSON.stringify({
+          data,
+          documentKey: config.documentKey,
+          fillMethod: "native",
+          responseId,
+        }),
+        headers: capabilityHeaders(config.capabilities.submit),
+        method: "POST",
+      })
+    );
+  const operationsBeforeInvalidInput = await prisma.operation.count({
+    where: { responseId },
+  });
+  const invalidDraftResponse = await nativeDraftRequest(nativeConfig, {
+    comments: "x".repeat(10_001),
+  });
+  expect(invalidDraftResponse.status).toBe(422);
+  expect(await invalidDraftResponse.json()).toMatchObject({
+    error: "invalid_response_data",
+  });
+  await prisma.prefillSnapshot.update({
+    data: { lockedFields: {}, values: {} },
+    where: { responseId },
+  });
+  const invalidRequiredSubmit = await nativeSubmitRequest(nativeConfig, {
+    comments: "Missing required name",
+  });
+  expect(invalidRequiredSubmit.status).toBe(422);
+  expect(await invalidRequiredSubmit.json()).toMatchObject({
+    error: "invalid_response_data",
+  });
+  expect(await prisma.operation.count({ where: { responseId } })).toBe(
+    operationsBeforeInvalidInput
+  );
+  await prisma.prefillSnapshot.update({
+    data: { lockedFields: prefillLocks, values: prefillValues },
+    where: { responseId },
+  });
+  const draftData = {
+    comments: "Saved native answer",
+    full_name: "Tampered client value",
+  };
+  const failedStorageApp = createApp({
+    legacySso: null,
+    onlyOffice: {
+      convertDocxToPdf: () =>
+        Promise.resolve(new TextEncoder().encode("%PDF-native")),
+      forceSave: () => Promise.resolve(false),
+    },
+    prefillReturnUrl: "https://source.example.test/forms/return",
+    putObject: async () => {
+      throw new Error("Ticket 06 storage failure");
+    },
+  });
+  const stableBeforeFailure = await prisma.response.findUniqueOrThrow({
+    select: {
+      draftData: true,
+      draftDocumentKey: true,
+      draftObjectKey: true,
+      status: true,
+    },
+    where: { id: responseId },
+  });
+  const stableDocument = await readObject(stableBeforeFailure.draftObjectKey!);
+  const failedSaveResponse = await nativeDraftRequest(
+    nativeConfig,
+    draftData,
+    failedStorageApp
+  );
+  expect(failedSaveResponse.status).toBe(202);
+  const failedSaveBody = (await failedSaveResponse.json()) as {
+    operationCapability?: string;
+    operationId?: string;
+  };
+  if (!failedSaveBody.operationCapability || !failedSaveBody.operationId) {
+    throw new Error("The Ticket 06 failed save operation was not created");
+  }
+  expect(
+    await waitForOperation(failedSaveBody.operationId, {
+      "X-Editor-Capability": failedSaveBody.operationCapability,
+    })
+  ).toMatchObject({ error: "document_save_failed", status: "failed" });
+  expect(
+    await prisma.response.findUniqueOrThrow({
+      select: {
+        draftData: true,
+        draftDocumentKey: true,
+        draftObjectKey: true,
+        status: true,
+      },
+      where: { id: responseId },
+    })
+  ).toEqual(stableBeforeFailure);
+  expect(await readObject(stableBeforeFailure.draftObjectKey!)).toEqual(
+    stableDocument
+  );
+  const saveResponse = await nativeDraftRequest(nativeConfig, draftData);
+  expect(saveResponse.status).toBe(202);
+  const saveBody = (await saveResponse.json()) as {
+    operationCapability?: string;
+    operationId?: string;
+  };
+  if (!saveBody.operationCapability || !saveBody.operationId) {
+    throw new Error("The Ticket 06 save operation was not created");
+  }
+  expect(
+    await waitForOperation(saveBody.operationId, {
+      "X-Editor-Capability": saveBody.operationCapability,
+    })
+  ).toMatchObject({ status: "completed" });
+  const savedResponse = await prisma.response.findUniqueOrThrow({
+    select: { draftData: true, draftDocumentKey: true, draftObjectKey: true },
+    where: { id: responseId },
+  });
+  expect(savedResponse.draftData).toEqual({
+    comments: "Saved native answer",
+    full_name: "Trusted Prefill",
+  });
+  const savedArchive = unzipSync(await readObject(savedResponse.draftObjectKey!));
+  const savedDocumentXml = new TextDecoder().decode(
+    savedArchive["word/document.xml"]
+  );
+  expect(savedDocumentXml).toContain("Static layout");
+  expect(savedDocumentXml).toContain("Trusted Prefill");
+  expect(savedDocumentXml).toContain("Saved native answer");
+  expect(savedDocumentXml).not.toContain("Tampered client value");
+  let pdfConversions = 0;
+  const pdfApp = createApp({
+    onlyOffice: {
+      convertDocxToPdf: () => {
+        pdfConversions += 1;
+        return Promise.resolve(new TextEncoder().encode("%PDF-native"));
+      },
+      forceSave: () => Promise.resolve(false),
+    },
+    prefillReturnUrl: "https://source.example.test/forms/return",
+  });
+  expect(pdfConversions).toBe(0);
+  const pdfResponse = await pdfApp.handle(
+    new Request(`http://test.local/api/responses/${responseId}/draft/pdf`, {
+      headers: { Authorization: `Bearer ${userBearer}` },
+    })
+  );
+  expect(pdfResponse.status).toBe(200);
+  expect(await pdfResponse.text()).toBe("%PDF-native");
+  expect(pdfConversions).toBe(1);
+  const resumeResponse = await app.handle(
+    new Request(`http://test.local/api/forms/${publicId}/start`, {
+      headers: { Authorization: `Bearer ${userBearer}` },
+      method: "POST",
+    })
+  );
+  const resumeBody = (await resumeResponse.json()) as {
+    editorConfigUrl?: string;
+    fillMethod?: string;
+    response?: { id?: string };
+  };
+  expect(resumeBody).toMatchObject({
+    fillMethod: "native",
+    response: { id: responseId },
+  });
+  if (!resumeBody.editorConfigUrl) {
+    throw new Error("The saved Ticket 06 response did not reopen");
+  }
+  nativeConfig = await getNativeConfig();
+  expect(nativeConfig).toMatchObject({
+    data: { comments: "Saved native answer", full_name: "Trusted Prefill" },
+    lockedFields: prefillLocks,
+  });
+  const onlyOfficeMethodResponse = await patchFillMethod("onlyoffice");
+  expect(onlyOfficeMethodResponse.status).toBe(200);
+  const staleNativeSave = await nativeDraftRequest(nativeConfig, draftData);
+  expect(staleNativeSave.status).toBe(409);
+  expect(await staleNativeSave.json()).toMatchObject({
+    error: "fill_method_changed",
+  });
+  const onlyOfficeStartResponse = await app.handle(
+    new Request(`http://test.local/api/forms/${publicId}/start`, {
+      headers: { Authorization: `Bearer ${userBearer}` },
+      method: "POST",
+    })
+  );
+  const onlyOfficeStart = (await onlyOfficeStartResponse.json()) as {
+    editorConfigUrl?: string;
+    fillMethod?: string;
+  };
+  expect(onlyOfficeStart.fillMethod).toBe("onlyoffice");
+  if (!onlyOfficeStart.editorConfigUrl) {
+    throw new Error("The switched Ticket 06 response did not reopen");
+  }
+  const onlyOfficeConfigResponse = await app.handle(
+    new Request(
+      new URL(onlyOfficeStart.editorConfigUrl, "http://test.local"),
+      { headers: { Authorization: `Bearer ${userBearer}` } }
+    )
+  );
+  const onlyOfficeConfig = (await onlyOfficeConfigResponse.json()) as {
+    config?: { document?: { key?: string } };
+    fillMethod?: string;
+  };
+  expect(onlyOfficeConfig.fillMethod).toBe("onlyoffice");
+  expect(onlyOfficeConfig.config?.document?.key).toBe(
+    savedResponse.draftDocumentKey
+  );
+  const nativeAgainResponse = await patchFillMethod("native");
+  expect(nativeAgainResponse.status).toBe(200);
+  const nativeAgainStartResponse = await app.handle(
+    new Request(`http://test.local/api/forms/${publicId}/start`, {
+      headers: { Authorization: `Bearer ${userBearer}` },
+      method: "POST",
+    })
+  );
+  const nativeAgainStart = (await nativeAgainStartResponse.json()) as {
+    editorConfigUrl?: string;
+    fillMethod?: string;
+  };
+  expect(nativeAgainStart.fillMethod).toBe("native");
+  nativeConfig = await getNativeConfig();
+  expect(nativeConfig).toMatchObject({
+    data: { comments: "Saved native answer", full_name: "Trusted Prefill" },
+    lockedFields: prefillLocks,
+  });
+  const submitResponse = await nativeSubmitRequest(nativeConfig, draftData);
+  expect(submitResponse.status).toBe(202);
+  const submitBody = (await submitResponse.json()) as {
+    operationCapability?: string;
+    operationId?: string;
+    submissionId?: string;
+  };
+  if (!submitBody.operationCapability || !submitBody.operationId) {
+    throw new Error("The Ticket 06 submit operation was not created");
+  }
+  expect(
+    await waitForOperation(submitBody.operationId, {
+      "X-Editor-Capability": submitBody.operationCapability,
+    })
+  ).toMatchObject({ status: "completed" });
+  const submission = await prisma.submission.findUniqueOrThrow({
+    select: { data: true, objectKey: true, responseId: true },
+    where: { id: submitBody.submissionId },
+  });
+  expect(submission).toMatchObject({
+    data: {
+      comments: "Saved native answer",
+      full_name: "Trusted Prefill",
+    },
+    responseId,
+  });
+  const submissionXml = new TextDecoder().decode(
+    unzipSync(await readObject(submission.objectKey))["word/document.xml"]
+  );
+  expect(submissionXml).toContain("Trusted Prefill");
+  expect(submissionXml).toContain("Saved native answer");
+  const submittedResponse = await prisma.response.findUniqueOrThrow({
+    select: { status: true },
+    where: { id: responseId },
+  });
+  expect(submittedResponse.status).toBe("submitted");
+  const submittedStartResponse = await app.handle(
+    new Request(`http://test.local/api/forms/${publicId}/start`, {
+      headers: { Authorization: `Bearer ${userBearer}` },
+      method: "POST",
+    })
+  );
+  expect(await submittedStartResponse.json()).toMatchObject({
+    submissionId: submitBody.submissionId,
+  });
+
+  const checkboxTemplate = docxXmlFixture({
+    document: contentControlDocument(
+      contentControl({
+        alias: "Accept terms",
+        tag: "accept_terms",
+        type: "<w14:checkbox/>",
+      })
+    ),
+  });
+  const checkboxCreateResponse = await app.handle(
+    formCreationRequest({
+      authorization: adminBearer,
+      source: "upload",
+      template: { bytes: checkboxTemplate, name: "checkbox.docx" },
+      title: "Ticket 06 Checkbox Form",
+    })
+  );
+  const checkboxCreated = (await checkboxCreateResponse.json()) as {
+    form?: { publicId?: string };
+  };
+  const checkboxPublicId = checkboxCreated.form?.publicId;
+  if (!checkboxPublicId) {
+    throw new Error("The Ticket 06 checkbox form was not created");
+  }
+  const checkboxEditorResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/forms/${checkboxPublicId}/editor-config`,
+      { headers: { Authorization: `Bearer ${adminBearer}` } }
+    )
+  );
+  const checkboxEditor =
+    (await checkboxEditorResponse.json()) as EditorConfigBody;
+  const checkboxPublishCapability = checkboxEditor.bridge.capabilities.publish;
+  if (!checkboxPublishCapability) {
+    throw new Error("The Ticket 06 checkbox publish capability is missing");
+  }
+  const checkboxPublishResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${checkboxPublicId}/publish`, {
+      body: JSON.stringify({
+        documentKey: checkboxEditor.config.document.key,
+      }),
+      headers: capabilityHeaders(checkboxPublishCapability),
+      method: "POST",
+    })
+  );
+  const checkboxPublishBody = (await checkboxPublishResponse.json()) as {
+    operationCapability?: string;
+    operationId?: string;
+  };
+  if (
+    !checkboxPublishBody.operationCapability ||
+    !checkboxPublishBody.operationId
+  ) {
+    throw new Error("The Ticket 06 checkbox publish operation was not created");
+  }
+  expect(
+    await waitForOperation(checkboxPublishBody.operationId, {
+      "X-Editor-Capability": checkboxPublishBody.operationCapability,
+    })
+  ).toMatchObject({ status: "completed" });
+  const unsupportedNativeResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${checkboxPublicId}`, {
+      body: JSON.stringify({ fillMethod: "native" }),
+      headers: { ...jsonHeaders, Authorization: `Bearer ${adminBearer}` },
+      method: "PATCH",
+    })
+  );
+  expect(unsupportedNativeResponse.status).toBe(409);
+  expect(await unsupportedNativeResponse.json()).toMatchObject({
+    error: "native_fill_unsupported",
+  });
+  const checkboxDetailResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${checkboxPublicId}`, {
+      headers: { Authorization: `Bearer ${adminBearer}` },
+    })
+  );
+  expect(await checkboxDetailResponse.json()).toMatchObject({
+    form: { fillMethod: "onlyoffice", nativeFillAvailable: false },
+  });
+});
 test("serves authenticated Admin and User workflows through HTTP", async () => {
   const adminEmail = `ticket-02-admin-${crypto.randomUUID()}@example.com`;
   const userEmail = `ticket-02-user-${crypto.randomUUID()}@example.com`;

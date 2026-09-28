@@ -72,6 +72,7 @@ export interface AdminUserCredentialResponse extends AdminUserMutationResponse {
 }
 
 export type FormStatus = "draft" | "published" | "archived";
+export type FillMethod = "onlyoffice" | "native";
 export interface FormSummary {
   publicId: string;
   title: string;
@@ -83,6 +84,8 @@ export interface FormSummary {
   hasTemplateDraft: boolean;
   activeDraftCount: number;
   submissionCount: number;
+  fillMethod: FillMethod;
+  nativeFillAvailable?: boolean;
 }
 export type FormDetail = FormSummary & {
   editorConfigUrl: string;
@@ -186,6 +189,7 @@ export interface Operation {
   id: string;
   status: "pending" | "processing" | "completed" | "failed";
   error?: string;
+  result?: Record<string, unknown>;
 }
 export const formatDate = (value: string | Date | undefined) => {
   if (!value) {

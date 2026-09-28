@@ -14,6 +14,7 @@ import type { OperationType } from "@onlyoffice/db";
 import {
   AuditOutcome,
   FieldType,
+  FillMethod,
   FormStatus,
   HandoffStatus,
   OperationStatus,
@@ -25,7 +26,7 @@ import {
 } from "@onlyoffice/db";
 import { env } from "@onlyoffice/env/server";
 import { Elysia } from "elysia";
-import { unzipSync } from "fflate";
+import { strToU8, unzipSync, zipSync } from "fflate";
 import { SaxesParser } from "saxes";
 import {
   AiAuthoringError,
@@ -513,6 +514,8 @@ type OperationErrorCode =
   | "callback_document_unavailable"
   | "callback_key_mismatch"
   | "callback_processing_failed"
+  | "document_save_failed"
+  | "fill_method_changed"
   | "force_save_failed"
   | "invalid_template"
   | "onlyoffice_document_error"
@@ -536,6 +539,8 @@ type FormAuditErrorCode =
   | "callback_claim_invalid"
   | "callback_document_unavailable"
   | "callback_key_mismatch"
+  | "fill_method_changed"
+  | "native_fill_unsupported"
   | "callback_processing_failed"
   | "document_unavailable"
   | "editor_capability_required"
@@ -566,6 +571,7 @@ interface FormAuditMetadata {
   source?: FormSource;
   sourcePublicId?: string;
   status?: FormStatus;
+  fillMethod?: FillMethod;
 }
 interface OperationMetadata extends JsonRecord {
   action: OperationAction;
@@ -612,6 +618,7 @@ interface CallbackPayload {
 export interface AppOptions {
   clock?: () => Date;
   deleteObject?: (key: string) => Promise<void>;
+  putObject?: typeof putObject;
   legacySso?: LegacySsoConfig | null;
   omniRoute?: OmniRouteConfig | null;
   onlyOffice?: OnlyOfficeClient;
@@ -856,6 +863,7 @@ function correctionInput(body: unknown): CorrectionInput {
 }
 interface FormMetadataInput {
   description?: string | null;
+  fillMethod?: FillMethod;
   status?: FormStatus;
   title?: string;
 }
@@ -868,20 +876,31 @@ async function readFormMetadataInput(
   if (
     keys.length === 0 ||
     keys.some(
-      (key) => key !== "description" && key !== "status" && key !== "title"
+      (key) =>
+        key !== "description" &&
+        key !== "fillMethod" &&
+        key !== "status" &&
+        key !== "title"
     )
   ) {
     fail(
       400,
       "invalid_request",
-      "Only title, description, and status are accepted"
+      "Only title, description, fillMethod, and status are accepted"
     );
   }
   if (Object.hasOwn(input, "status") && keys.length !== 1) {
     fail(
       400,
       "invalid_request",
-      "Status changes must not include title or description"
+      "Status changes must not include other metadata"
+    );
+  }
+  if (Object.hasOwn(input, "fillMethod") && keys.length !== 1) {
+    fail(
+      400,
+      "invalid_request",
+      "Fill Method changes must not include other metadata"
     );
   }
   const metadata: FormMetadataInput = {};
@@ -917,6 +936,19 @@ async function readFormMetadataInput(
       fail(400, "invalid_request", "status must be archived or published");
     }
     metadata.status = input.status;
+  }
+  if (Object.hasOwn(input, "fillMethod")) {
+    if (
+      input.fillMethod !== FillMethod.native &&
+      input.fillMethod !== FillMethod.onlyoffice
+    ) {
+      fail(
+        400,
+        "invalid_request",
+        "fillMethod must be native or onlyoffice"
+      );
+    }
+    metadata.fillMethod = input.fillMethod;
   }
   return metadata;
 }
@@ -3211,6 +3243,8 @@ const formAuditErrorCodes: Record<string, true> = {
   callback_document_unavailable: true,
   callback_key_mismatch: true,
   callback_processing_failed: true,
+  fill_method_changed: true,
+  native_fill_unsupported: true,
   document_unavailable: true,
   editor_capability_required: true,
   editor_capability_scope_mismatch: true,
@@ -3769,9 +3803,41 @@ function formDto(
     status: form.status,
     submissionCount,
     title: form.title,
+    fillMethod: form.fillMethod,
     updatedAt: form.updatedAt,
     version: form.version,
   };
+}
+function supportsNativeTextFill(
+  fields: readonly { type: FieldType }[]
+): boolean {
+  return (
+    fields.length > 0 && fields.every(({ type }) => type === FieldType.text)
+  );
+}
+
+async function nativeTextFields(publishedTemplateId: string) {
+  const manifest = await prisma.fieldManifest.findUnique({
+    include: { fields: { orderBy: { position: "asc" } } },
+    where: { publishedTemplateId },
+  });
+  if (!manifest || !supportsNativeTextFill(manifest.fields)) {
+    fail(
+      409,
+      "native_fill_unsupported",
+      "Native filling requires a published text-only form"
+    );
+  }
+  return manifest.fields.map(
+    ({ label, placeholder, position, required, tag }) => ({
+      label,
+      placeholder,
+      position,
+      required,
+      tag,
+      type: FieldType.text,
+    })
+  );
 }
 
 function responseSummary(
@@ -5589,6 +5655,21 @@ async function normalizeResponseData(
   }
   return data;
 }
+function requireCurrentFillMethod(
+  form: FormWithDocuments,
+  input: JsonRecord
+): void {
+  const requestedFillMethod = input.fillMethod ?? FillMethod.onlyoffice;
+  if (
+    requestedFillMethod !== FillMethod.native &&
+    requestedFillMethod !== FillMethod.onlyoffice
+  ) {
+    fail(400, "invalid_request", "fillMethod must be native or onlyoffice");
+  }
+  if (requestedFillMethod !== form.fillMethod) {
+    fail(409, "fill_method_changed", "The form Fill Method changed");
+  }
+}
 function changedResponseData(
   previous: JsonRecord,
   next: JsonRecord
@@ -5645,6 +5726,7 @@ async function createOperation(input: {
   capabilityScope: Omit<EditorCapabilityScope, "action" | "operationId">;
   documentKey: string;
   formId: string;
+  expectedFillMethod?: FillMethod;
   metadata: OperationMetadata;
   ownerUserId: string;
   responseId?: string;
@@ -5656,9 +5738,12 @@ async function createOperation(input: {
 }): Promise<Operation> {
   try {
     return await prisma.$transaction(async (tx) => {
-      const [lockedForm] = await tx.$queryRaw<{ id: string }[]>(
+      const [lockedForm] = await tx.$queryRaw<{
+        fillMethod: FillMethod;
+        id: string;
+      }[]>(
         Prisma.sql`
-          SELECT "id"
+          SELECT "id", "fill_method" AS "fillMethod"
           FROM "forms"
           WHERE "id" = ${input.formId}::uuid
           FOR UPDATE
@@ -5666,6 +5751,12 @@ async function createOperation(input: {
       );
       if (!lockedForm) {
         fail(404, "not_found", "Form was not found");
+      }
+      if (
+        input.expectedFillMethod !== undefined &&
+        lockedForm.fillMethod !== input.expectedFillMethod
+      ) {
+        fail(409, "fill_method_changed", "The form Fill Method changed");
       }
       await lockActiveEditorLease(
         tx,
@@ -6511,6 +6602,196 @@ async function validateResponseDocument(
   }
   validateResponsePictureControls(bytes, manifest.fields, enforceRequired);
 }
+interface NativeTextControlFrame {
+  block: boolean;
+  contentEnd: number | null;
+  contentName: string | null;
+  contentPrefix: string;
+  contentSelfClosing: boolean;
+  contentStart: number | null;
+  contentTokenStart: number | null;
+  inPropertiesDepth: number;
+  tag: string | null;
+}
+
+function nativeTextControlXml(xml: string, data: JsonRecord): string {
+  const controls: NativeTextControlFrame[] = [];
+  const elements: { local: string; uri: string }[] = [];
+  const patches: { end: number; replacement: string; start: number }[] = [];
+  const parser = new SaxesParser({ position: true, xmlns: true });
+  parser.on("doctype", () => {
+    fail(422, "invalid_template", "DOCX XML document types are not allowed");
+  });
+  parser.on("opentag", (tag) => {
+    if (tag.local === "sdt" && templateWordNamespaces.has(tag.uri)) {
+      controls.push({
+        block: !elements.some(
+          (element) =>
+            element.local === "p" && templateWordNamespaces.has(element.uri)
+        ),
+        contentEnd: null,
+        contentName: null,
+        contentPrefix: "",
+        contentSelfClosing: false,
+        contentStart: null,
+        contentTokenStart: null,
+        inPropertiesDepth: 0,
+        tag: null,
+      });
+    } else {
+      const frame = controls.at(-1);
+      if (frame) {
+        if (tag.local === "sdtPr" && templateWordNamespaces.has(tag.uri)) {
+          frame.inPropertiesDepth = 1;
+        } else if (frame.inPropertiesDepth > 0) {
+          if (
+            frame.inPropertiesDepth === 1 &&
+            tag.local === "tag" &&
+            templateWordNamespaces.has(tag.uri)
+          ) {
+            frame.tag = templateControlAttribute(
+              templateXmlElement(tag),
+              "val"
+            ) ?? null;
+          }
+          if (
+            tag.local === "showingPlcHdr" &&
+            templateWordNamespaces.has(tag.uri)
+          ) {
+            const start = xml.lastIndexOf("<", parser.position - 1);
+            if (start >= 0) {
+              patches.push({
+                end: parser.position,
+                replacement: "",
+                start,
+              });
+            }
+          }
+          frame.inPropertiesDepth += 1;
+        } else if (
+          tag.local === "sdtContent" &&
+          templateWordNamespaces.has(tag.uri)
+        ) {
+          const start = xml.lastIndexOf("<", parser.position - 1);
+          const openingTag = start < 0 ? "" : xml.slice(start, parser.position);
+          frame.contentName = tag.name;
+          frame.contentPrefix = tag.name.includes(":")
+            ? tag.name.slice(0, tag.name.indexOf(":") + 1)
+            : "";
+          frame.contentSelfClosing = /\/\s*>$/u.test(openingTag);
+          frame.contentStart = frame.contentSelfClosing ? null : parser.position;
+          frame.contentTokenStart = frame.contentSelfClosing ? start : null;
+        }
+      }
+    }
+    elements.push({ local: tag.local, uri: tag.uri });
+  });
+  parser.on("closetag", (tag) => {
+    const frame = controls.at(-1);
+    if (frame) {
+      if (tag.local === "sdtPr" && templateWordNamespaces.has(tag.uri)) {
+        frame.inPropertiesDepth = 0;
+      } else if (frame.inPropertiesDepth > 0) {
+        frame.inPropertiesDepth -= 1;
+      } else if (
+        tag.local === "sdtContent" &&
+        templateWordNamespaces.has(tag.uri)
+      ) {
+        frame.contentEnd = frame.contentSelfClosing
+          ? parser.position
+          : xml.lastIndexOf("</", parser.position - 1);
+      } else if (tag.local === "sdt" && templateWordNamespaces.has(tag.uri)) {
+        const completed = controls.pop();
+        if (!completed?.tag || !completed.contentName) {
+          fail(422, "invalid_template", "A text field is incomplete");
+        }
+        const value = data[completed.tag];
+        const lines = (typeof value === "string" ? value : "").split(
+          /\r\n|\r|\n/u
+        );
+        const text = lines
+          .map(
+            (line, index) =>
+              `${index > 0 ? `<${completed.contentPrefix}br/>` : ""}<${completed.contentPrefix}t xml:space="preserve">${htmlEscape(line)}</${completed.contentPrefix}t>`
+          )
+          .join("");
+        const run = `<${completed.contentPrefix}r>${text}</${completed.contentPrefix}r>`;
+        const content = completed.block
+          ? `<${completed.contentPrefix}p>${run}</${completed.contentPrefix}p>`
+          : run;
+        if (completed.contentSelfClosing) {
+          if (
+            completed.contentTokenStart === null ||
+            completed.contentEnd === null
+          ) {
+            fail(422, "invalid_template", "A text field is incomplete");
+          }
+          patches.push({
+            end: completed.contentEnd,
+            replacement: `<${completed.contentName}>${content}</${completed.contentName}>`,
+            start: completed.contentTokenStart,
+          });
+        } else if (
+          completed.contentStart !== null &&
+          completed.contentEnd !== null &&
+          completed.contentEnd >= completed.contentStart
+        ) {
+          patches.push({
+            end: completed.contentEnd,
+            replacement: content,
+            start: completed.contentStart,
+          });
+        } else {
+          fail(422, "invalid_template", "A text field is incomplete");
+        }
+      }
+    }
+    elements.pop();
+  });
+  try {
+    parser.write(xml).close();
+  } catch {
+    fail(422, "invalid_template", "The DOCX package contains invalid XML");
+  }
+  let result = xml;
+  for (const patch of patches.sort((left, right) => right.start - left.start)) {
+    result =
+      result.slice(0, patch.start) +
+      patch.replacement +
+      result.slice(patch.end);
+  }
+  return result;
+}
+
+async function nativeTextResponseDocument(
+  publishedTemplateId: string,
+  data: JsonRecord
+): Promise<Uint8Array> {
+  const publishedTemplate = await prisma.publishedTemplate.findUnique({
+    select: { objectKey: true },
+    where: { id: publishedTemplateId },
+  });
+  if (!publishedTemplate?.objectKey) {
+    fail(409, "document_unavailable", "The published document is unavailable");
+  }
+  const { archive, xmlPaths } = safeTemplateArchive(
+    await readObject(publishedTemplate.objectKey)
+  );
+  const controlParts = reachableTemplateControlParts(archive, xmlPaths);
+  if (controlParts.size === 0) {
+    fail(422, "invalid_template", "The published document has no text fields");
+  }
+  for (const archivePath of controlParts) {
+    const xml = nativeTextControlXml(
+      templateArchiveText(archive, archivePath),
+      data
+    );
+    archive[archivePath] = strToU8(
+      xml.replace(/encoding=(["'])UTF-16(?:LE|BE)?\1/iu, 'encoding="UTF-8"')
+    );
+  }
+  return zipSync(archive);
+}
 
 async function completeDraftOperation(
   operation: Operation,
@@ -6668,6 +6949,72 @@ async function completeSubmitOperation(
     { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
   );
   return { cleanupObjectKeys };
+}
+async function processNativeResponseOperation(
+  operation: Operation,
+  storeObject: typeof putObject
+): Promise<void> {
+  const metadata = operationMetadata(operation.metadata);
+  try {
+    if (
+      (metadata.action !== "save-draft" && metadata.action !== "submit") ||
+      !operation.documentKey ||
+      !metadata.responseId ||
+      !metadata.data ||
+      !metadata.finalObjectKey ||
+      !metadata.stagedObjectKey
+    ) {
+      fail(500, "invalid_operation", "Native response operation is incomplete");
+    }
+    const claimed = await prisma.operation.updateMany({
+      data: { status: OperationStatus.processing, updatedAt: new Date() },
+      where: { id: operation.id, status: OperationStatus.pending },
+    });
+    if (claimed.count !== 1) {
+      return;
+    }
+    const response = await prisma.response.findUnique({
+      select: {
+        draftDocumentKey: true,
+        publishedTemplateId: true,
+        status: true,
+      },
+      where: { id: metadata.responseId },
+    });
+    const expectedStatus =
+      metadata.action === "submit"
+        ? ResponseStatus.submitting
+        : ResponseStatus.draft;
+    if (
+      !response ||
+      response.status !== expectedStatus ||
+      response.draftDocumentKey !== operation.documentKey
+    ) {
+      fail(409, "stale_operation", "The response is no longer editable");
+    }
+    const bytes = await nativeTextResponseDocument(
+      response.publishedTemplateId,
+      metadata.data
+    );
+    await storeObject(metadata.stagedObjectKey, bytes, DOCX_CONTENT_TYPE);
+    await storeObject(metadata.finalObjectKey, bytes, DOCX_CONTENT_TYPE);
+    const completion =
+      metadata.action === "submit"
+        ? await completeSubmitOperation(operation, metadata, bytes)
+        : await completeDraftOperation(operation, metadata, bytes);
+    await deleteObjects(completion.cleanupObjectKeys);
+  } catch (error) {
+    await deleteObjects([metadata.stagedObjectKey]);
+    if (metadata.finalObjectKey) {
+      await deleteObjectUnlessCanonical(metadata.finalObjectKey);
+    }
+    await updateOperationFailed(
+      operation.id,
+      error instanceof HttpError && error.code === "invalid_template"
+        ? "invalid_template"
+        : "document_save_failed"
+    );
+  }
 }
 async function completeCorrectionOperation(
   operation: Operation,
@@ -8419,7 +8766,35 @@ async function userEditorConfig(
     capabilityScope.targetId,
     form.id
   );
-  return editorConfig(
+  if (form.fillMethod === FillMethod.native) {
+    return {
+      capabilities: {
+        "save-draft": actionEditorCapability(
+          identity,
+          capabilityScope,
+          "save-draft",
+          lease
+        ),
+        submit: actionEditorCapability(
+          identity,
+          capabilityScope,
+          "submit",
+          lease
+        ),
+      },
+      data:
+        response.draftData === null
+          ? jsonRecord(snapshot?.values ?? {})
+          : jsonRecord(response.draftData),
+      documentKey: response.draftDocumentKey,
+      fields: await nativeTextFields(publishedTemplate.id),
+      fillMethod: FillMethod.native,
+      lockedFields: snapshot ? jsonRecord(snapshot.lockedFields) : {},
+      responseId: response.id,
+    };
+  }
+  return {
+    ...editorConfig(
     {
       action:
         requestedAction === "submit"
@@ -8454,12 +8829,15 @@ async function userEditorConfig(
       responseId: response.id,
     },
     identity
-  );
+    ),
+    fillMethod: FillMethod.onlyoffice,
+  };
 }
 
 export function createApp(options: AppOptions = {}) {
   const onlyOffice = options.onlyOffice ?? createOnlyOfficeClient();
   const removeObject = options.deleteObject ?? deleteObject;
+  const storeObject = options.putObject ?? putObject;
   const allowedCallbackOrigins = options.onlyOfficeCallbackOrigins
     ? new Set(options.onlyOfficeCallbackOrigins)
     : callbackOrigins;
@@ -9392,6 +9770,52 @@ export function createApp(options: AppOptions = {}) {
               "Only a published Form can change archive state"
             );
           }
+          if (input.fillMethod !== undefined) {
+            if (input.fillMethod !== current.fillMethod) {
+              const activeOperation = await tx.operation.findFirst({
+                select: { id: true },
+                where: {
+                  formId: current.id,
+                  status: {
+                    in: [OperationStatus.pending, OperationStatus.processing],
+                  },
+                },
+              });
+              if (activeOperation) {
+                fail(
+                  409,
+                  "operation_in_progress",
+                  "A response operation is in progress"
+                );
+              }
+            }
+            if (input.fillMethod === FillMethod.native) {
+              if (
+                !current.publishedTemplate ||
+                (current.status !== FormStatus.published &&
+                  current.status !== FormStatus.archived)
+              ) {
+                fail(
+                  409,
+                  "native_fill_unsupported",
+                  "Native filling requires a published text-only form"
+                );
+              }
+              const manifest = await tx.fieldManifest.findUnique({
+                include: { fields: { select: { type: true } } },
+                where: {
+                  publishedTemplateId: current.publishedTemplate.id,
+                },
+              });
+              if (!manifest || !supportsNativeTextFill(manifest.fields)) {
+                fail(
+                  409,
+                  "native_fill_unsupported",
+                  "Native filling requires a published text-only form"
+                );
+              }
+            }
+          }
           const form = await tx.form.update({
             data: {
               ...(input.title === undefined ? {} : { title: input.title }),
@@ -9399,6 +9823,9 @@ export function createApp(options: AppOptions = {}) {
                 ? { description: input.description }
                 : {}),
               ...(input.status === undefined ? {} : { status: input.status }),
+              ...(input.fillMethod === undefined
+                ? {}
+                : { fillMethod: input.fillMethod }),
             },
             include: { publishedTemplate: true, templateDraft: true },
             where: { id: current.id },
@@ -9407,8 +9834,12 @@ export function createApp(options: AppOptions = {}) {
             action: auditAction,
             actorId: identity.id,
             outcome: AuditOutcome.success,
-            safeMetadata:
-              input.status === undefined ? {} : { status: input.status },
+            safeMetadata: {
+              ...(input.status === undefined ? {} : { status: input.status }),
+              ...(input.fillMethod === undefined
+                ? {}
+                : { fillMethod: input.fillMethod }),
+            },
             targetId: form.publicId,
           });
           return form;
@@ -9907,9 +10338,23 @@ export function createApp(options: AppOptions = {}) {
         }),
         prisma.submission.count({ where: { formId: form.id } }),
       ]);
+      const manifest = form.publishedTemplate
+        ? await prisma.fieldManifest.findUnique({
+            select: { fields: { select: { type: true } } },
+            where: {
+              publishedTemplateId: form.publishedTemplate.id,
+            },
+          })
+        : null;
+      const nativeFillAvailable = supportsNativeTextFill(
+        manifest?.fields ?? []
+      );
       return {
         editorConfigUrl: `/api/admin/forms/${form.publicId}/editor-config`,
-        form: formDto(form, { activeDraftCount, submissionCount }),
+        form: {
+          ...formDto(form, { activeDraftCount, submissionCount }),
+          nativeFillAvailable,
+        },
       };
     })
     .get(
@@ -11032,6 +11477,7 @@ export function createApp(options: AppOptions = {}) {
       return {
         form: {
           description: form.description ?? "",
+          fillMethod: form.fillMethod,
           publicId: form.publicId,
           published: Boolean(
             form.publishedTemplate?.objectKey &&
@@ -11108,6 +11554,7 @@ export function createApp(options: AppOptions = {}) {
           fail(500, "internal_error", "The submitted receipt is unavailable");
         }
         return {
+          fillMethod: form.fillMethod,
           receiptUrl: `/receipt/${existing.submission.id}`,
           response: responseSummary(existing, {
             submissionId: existing.submission.id,
@@ -11137,6 +11584,7 @@ export function createApp(options: AppOptions = {}) {
           await deleteObjects(redeemed.cleanupObjectKeys);
           set.headers["Set-Cookie"] = pendingClaimCookie("", 0);
           return {
+            fillMethod: form.fillMethod,
             editorConfigUrl: `/api/forms/${form.publicId}/editor-config?responseId=${redeemed.response.id}&action=fill`,
             prefill: {
               data: jsonRecord(redeemed.response.prefillSnapshot?.values),
@@ -11168,6 +11616,7 @@ export function createApp(options: AppOptions = {}) {
           );
         }
         return {
+          fillMethod: form.fillMethod,
           editorConfigUrl: `/api/forms/${form.publicId}/editor-config?responseId=${existing.id}&action=${existing.draftData ? "draft" : "fill"}`,
           prefill: existing.draftData ? null : undefined,
           response: responseSummary(existing),
@@ -11312,6 +11761,7 @@ export function createApp(options: AppOptions = {}) {
         }
         await deleteObjects([existing?.draftObjectKey, unusedDraftObjectKey]);
         return {
+          fillMethod: form.fillMethod,
           editorConfigUrl: `/api/forms/${form.publicId}/editor-config?responseId=${response.id}&action=${response.draftData ? "draft" : "fill"}`,
           prefill: response.draftData ? null : { data: {}, editableFields: {} },
           response: responseSummary(response),
@@ -11332,6 +11782,7 @@ export function createApp(options: AppOptions = {}) {
             (await objectExists(current.draftObjectKey))
           ) {
             return {
+              fillMethod: form.fillMethod,
               editorConfigUrl: `/api/forms/${form.publicId}/editor-config?responseId=${current.id}&action=${current.draftData ? "draft" : "fill"}`,
               prefill: current.draftData
                 ? null
@@ -11628,6 +12079,7 @@ export function createApp(options: AppOptions = {}) {
         const { actor: identity } = authorization;
         const form = await findFormByPublicId(params.publicId);
         const input = asRecord(body);
+        requireCurrentFillMethod(form, input);
         const responseId = requiredString(input, "responseId");
         const documentKey = requiredString(input, "documentKey");
         const response = await findOwnedResponse(
@@ -11690,6 +12142,7 @@ export function createApp(options: AppOptions = {}) {
           authorization,
           capabilityScope,
           documentKey,
+          expectedFillMethod: form.fillMethod,
           formId: form.id,
           metadata,
           ownerUserId: identity.id,
@@ -11700,7 +12153,11 @@ export function createApp(options: AppOptions = {}) {
           type: operationTypeForAction["save-draft"],
         });
         set.status = 202;
-        launchForceSave(operation, onlyOffice, allowedCallbackOrigins);
+        if (form.fillMethod === FillMethod.native) {
+          void processNativeResponseOperation(operation, storeObject);
+        } else {
+          launchForceSave(operation, onlyOffice, allowedCallbackOrigins);
+        }
         return {
           operationCapability: operationEditorCapability(
             identity,
@@ -11720,6 +12177,7 @@ export function createApp(options: AppOptions = {}) {
         const { actor: identity } = authorization;
         const form = await findFormByPublicId(params.publicId);
         const input = asRecord(body);
+        requireCurrentFillMethod(form, input);
         const responseId = requiredString(input, "responseId");
         const documentKey = requiredString(input, "documentKey");
         const response = await findOwnedResponse(
@@ -11789,6 +12247,19 @@ export function createApp(options: AppOptions = {}) {
         try {
           operation = await prisma.$transaction(
             async (tx) => {
+              const [lockedForm] = await tx.$queryRaw<
+                { fillMethod: FillMethod }[]
+              >(
+                Prisma.sql`
+                  SELECT "fill_method" AS "fillMethod"
+                  FROM "forms"
+                  WHERE "id" = ${form.id}::uuid
+                  FOR UPDATE
+                `
+              );
+              if (!lockedForm || lockedForm.fillMethod !== form.fillMethod) {
+                fail(409, "fill_method_changed", "The form Fill Method changed");
+              }
               await lockActiveEditorLease(tx, authorization, capabilityScope);
               const activeOperation = await tx.operation.findFirst({
                 where: {
@@ -11852,7 +12323,11 @@ export function createApp(options: AppOptions = {}) {
           throw error;
         }
         set.status = 202;
-        launchForceSave(operation, onlyOffice, allowedCallbackOrigins);
+        if (form.fillMethod === FillMethod.native) {
+          void processNativeResponseOperation(operation, storeObject);
+        } else {
+          launchForceSave(operation, onlyOffice, allowedCallbackOrigins);
+        }
         return {
           operationCapability: operationEditorCapability(
             identity,

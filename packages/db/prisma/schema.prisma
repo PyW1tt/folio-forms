@@ -17,6 +17,11 @@ enum FormStatus {
   published
   archived
 }
+enum FillMethod {
+  onlyoffice
+  native
+}
+
 
 enum FieldType {
   text
@@ -160,6 +165,7 @@ model Form {
   description String?
   publicId    String     @unique @map("public_id")
   status      FormStatus @default(draft)
+  fillMethod  FillMethod @default(onlyoffice) @map("fill_method")
   version     Int        @default(0)
   createdBy   String?    @map("created_by")
   createdAt   DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)

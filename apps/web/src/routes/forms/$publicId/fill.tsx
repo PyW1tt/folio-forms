@@ -11,6 +11,8 @@ import { ArrowLeft, CheckCircle2, Monitor } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
 import { OnlyOfficeEditor } from "@/components/onlyoffice-editor";
+import { NativeTextForm } from "@/components/native-text-form";
+import type { NativeTextField } from "@/components/native-text-form";
 import type { EditorBridgeMessage } from "@/components/onlyoffice-editor";
 import { Button, Notice, Spinner } from "@/components/ui";
 import {
@@ -18,10 +20,12 @@ import {
   apiDelete,
   apiGet,
   apiPost,
+  waitForOperation,
   downloadArtifact,
   safeReturnPath,
 } from "@/lib/api";
 import type { Operation } from "@/lib/api";
+import type { FillMethod } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import {
   createDeferred,
@@ -43,6 +47,9 @@ const formRequestError = (error: unknown, fallback: string) => {
     }
     if (error.code === "form_unavailable") {
       return "แบบฟอร์มนี้เก็บถาวรแล้วและยังไม่รับคำตอบใหม่";
+    }
+    if (error.code === "fill_method_changed") {
+      return "วิธีกรอกแบบฟอร์มเปลี่ยนแล้ว กรุณาโหลดแบบฟอร์มใหม่ก่อนบันทึก";
     }
   }
   return fallback;
@@ -79,7 +86,29 @@ class DraftSaveError extends Error {
 interface PublicForm {
   title: string;
   description?: string;
+  fillMethod: FillMethod;
 }
+
+interface NativeEditorConfig {
+  capabilities: Record<"save-draft" | "submit", string>;
+  data: Record<string, unknown>;
+  documentKey: string;
+  fields: NativeTextField[];
+  fillMethod: "native";
+  lockedFields: Record<string, boolean>;
+  responseId: string;
+}
+
+const nativeValuesFromConfig = (
+  config: NativeEditorConfig
+): Record<string, string> => {
+  const values: Record<string, string> = {};
+  for (const field of config.fields) {
+    const value = config.data[field.tag];
+    values[field.tag] = typeof value === "string" ? value : "";
+  }
+  return values;
+};
 
 // oxlint-disable-next-line complexity -- Coordinates the public form editor, draft lifecycle, and exit confirmation.
 const FillRoute = () => {
@@ -89,6 +118,10 @@ const FillRoute = () => {
   const navigate = useNavigate();
   const [form, setForm] = useState<PublicForm | null>(null);
   const [editorConfigUrl, setEditorConfigUrl] = useState<string | null>(null);
+  const [nativeConfig, setNativeConfig] =
+    useState<NativeEditorConfig | null>(null);
+  const [nativeValues, setNativeValues] = useState<Record<string, string>>({});
+  const [nativeSaving, setNativeSaving] = useState(false);
   const [editorRevision, setEditorRevision] = useState(0);
   const [activeResponseId, setActiveResponseId] = useState(responseId);
   const [loading, setLoading] = useState(true);
@@ -113,6 +146,7 @@ const FillRoute = () => {
     reject: (reason?: unknown) => void;
     resolve: (value: boolean | PromiseLike<boolean>) => void;
   } | null>(null);
+  const nativeSaveGuardRef = useRef(false);
   const reauthResolverRef = useRef<((allowed: boolean) => void) | null>(null);
   const allowNavigationRef = useRef(false);
   const navigationBlockerRef = useRef<{
@@ -150,6 +184,8 @@ const FillRoute = () => {
     setLoading(true);
     setForm(null);
     setEditorConfigUrl(null);
+    setNativeConfig(null);
+    setNativeValues({});
     setError(null);
     setHandoffError(false);
     const loadForm = async () => {
@@ -224,6 +260,7 @@ const FillRoute = () => {
       try {
         const result = await apiPost<{
           editorConfigUrl?: string;
+          fillMethod: FillMethod;
           response?: { id: string };
           submissionId?: string;
         }>(`/api/forms/${publicId}/start`, {
@@ -239,7 +276,30 @@ const FillRoute = () => {
         if (cancelled) {
           return;
         }
+        if (result.fillMethod === "native" && !result.editorConfigUrl) {
+          throw new Error("Native form configuration is unavailable");
+        }
+        const config =
+          result.fillMethod === "native" && result.editorConfigUrl
+            ? await apiGet<
+                NativeEditorConfig | { fillMethod: "onlyoffice" }
+              >(result.editorConfigUrl)
+            : null;
+        if (cancelled) {
+          return;
+        }
+        const fillMethod = config?.fillMethod ?? result.fillMethod;
         setActiveResponseId(result.response?.id ?? activeResponseId);
+        setForm((current) =>
+          current ? { ...current, fillMethod } : current
+        );
+        if (config?.fillMethod === "native") {
+          setNativeConfig(config);
+          setNativeValues(nativeValuesFromConfig(config));
+        } else {
+          setNativeConfig(null);
+          setNativeValues({});
+        }
         setEditorConfigUrl(result.editorConfigUrl ?? null);
       } catch (caughtError) {
         if (!cancelled) {
@@ -355,6 +415,147 @@ const FillRoute = () => {
       }
     }
   };
+  const saveNativeResponse = async (
+    action: "save-draft" | "submit",
+    options: { exitAfterSave?: boolean; exportFormat?: ExportFormat } = {}
+  ) => {
+    if (!activeResponseId || !nativeConfig || !editorConfigUrl) {
+      return;
+    }
+    if (
+      nativeSaveGuardRef.current ||
+      operation?.status === "pending" ||
+      operation?.status === "processing" ||
+      exportAfterSave ||
+      saveBeforeExit ||
+      discardBusy
+    ) {
+      return;
+    }
+    nativeSaveGuardRef.current = true;
+    setNativeSaving(true);
+    setSaveBeforeExit(options.exitAfterSave ?? false);
+    setExportAfterSave(options.exportFormat ?? null);
+    setOperationError(null);
+    setSuccess(null);
+    setError(null);
+    let saved = false;
+    try {
+      const latestConfig = await apiGet<
+        NativeEditorConfig | { fillMethod: "onlyoffice" }
+      >(editorConfigUrl);
+      if (latestConfig.fillMethod !== "native") {
+        setForm((current) =>
+          current ? { ...current, fillMethod: "onlyoffice" } : current
+        );
+        setNativeConfig(null);
+        setNativeValues({});
+        throw new Error("The form Fill Method changed");
+      }
+      if (latestConfig.documentKey !== nativeConfig.documentKey) {
+        setNativeConfig(latestConfig);
+        if (!dirty) {
+          setNativeValues(nativeValuesFromConfig(latestConfig));
+        }
+        throw new Error("The saved response changed in another session");
+      }
+      setNativeConfig(latestConfig);
+      const endpoint = action === "save-draft" ? "draft" : "submit";
+      const { operationId } = await apiPost<{ operationId: string }>(
+        `/api/forms/${publicId}/${endpoint}`,
+        {
+          data: nativeValues,
+          documentKey: latestConfig.documentKey,
+          fillMethod: "native",
+          responseId: latestConfig.responseId,
+        },
+        latestConfig.capabilities[action]
+      );
+      setOperation({ id: operationId, status: "pending" });
+      const completed = await waitForOperation(operationId, setOperation);
+      setOperation(completed);
+      saved = true;
+      setDirty(false);
+      if (action === "submit") {
+        const submissionId = completed.result?.submissionId;
+        if (typeof submissionId !== "string") {
+          throw new Error("The submitted receipt is unavailable");
+        }
+        allowNavigationRef.current = true;
+        await navigate({
+          params: { submissionId },
+          to: "/receipt/$submissionId",
+        });
+        return;
+      }
+      const refreshedConfig = await apiGet<
+        NativeEditorConfig | { fillMethod: "onlyoffice" }
+      >(editorConfigUrl);
+      setForm((current) =>
+        current
+          ? { ...current, fillMethod: refreshedConfig.fillMethod }
+          : current
+      );
+      if (refreshedConfig.fillMethod === "native") {
+        setNativeConfig(refreshedConfig);
+        setNativeValues(nativeValuesFromConfig(refreshedConfig));
+      } else {
+        setNativeConfig(null);
+        setNativeValues({});
+      }
+      setOperationError(null);
+      setSuccess(
+        options.exportFormat
+          ? options.exportFormat === "docx"
+            ? "บันทึกและดาวน์โหลด DOCX แล้ว"
+            : "บันทึกและดาวน์โหลด PDF แล้ว"
+          : "บันทึกฉบับร่างคำตอบแล้ว"
+      );
+      if (options.exportFormat) {
+        await downloadArtifact(
+          `/api/responses/${activeResponseId}/draft/${options.exportFormat}`,
+          `response-${activeResponseId}.${options.exportFormat}`
+        );
+        setExportAfterSave(null);
+      }
+      if (options.exitAfterSave) {
+        const intent = exitIntent;
+        setSaveBeforeExit(false);
+        if (intent === "reauth") {
+          setExitIntent(null);
+          reauthResolverRef.current?.(true);
+          reauthResolverRef.current = null;
+        } else if (intent === "dashboard") {
+          allowNavigationRef.current = true;
+          setExitIntent(null);
+          await navigate({ to: "/dashboard" });
+        } else {
+          allowNavigationRef.current = true;
+          navigationBlockerRef.current?.proceed();
+          setExitIntent(null);
+        }
+      }
+    } catch (caughtError) {
+      setSaveBeforeExit(false);
+      setExportAfterSave(null);
+      setOperationError(
+        formRequestError(
+          caughtError,
+          action === "submit"
+            ? "ส่งแบบฟอร์มไม่สำเร็จ กรุณาลองใหม่"
+            : saved
+              ? options.exportFormat
+                ? "บันทึกแล้ว แต่ดาวน์โหลดไฟล์ไม่สำเร็จ กรุณาลองใหม่"
+                : "บันทึกแล้ว แต่โหลดคำตอบล่าสุดไม่สำเร็จ กรุณาโหลดแบบฟอร์มใหม่"
+              : "บันทึกฉบับร่างไม่สำเร็จ กรุณาลองใหม่"
+        )
+      );
+      setSuccess(null);
+    } finally {
+      nativeSaveGuardRef.current = false;
+      setNativeSaving(false);
+    }
+  };
 
   const fillPath = safeReturnPath(
     `/forms/${publicId}/fill${
@@ -412,7 +613,7 @@ const FillRoute = () => {
   const operationBusy =
     operation?.status === "pending" || operation?.status === "processing";
   const saveFlowBusy = isSaveFlowBusy(
-    operationBusy,
+    operationBusy || nativeSaving,
     exportAfterSave,
     saveBeforeExit
   );
@@ -433,6 +634,10 @@ const FillRoute = () => {
     if (!activeResponseId || saveFlowBusy || discardBusy) {
       return;
     }
+    if (nativeConfig) {
+      void saveNativeResponse("save-draft", { exitAfterSave: true });
+      return;
+    }
     setSaveBeforeExit(true);
     setOperationError(null);
     setSuccess(null);
@@ -445,6 +650,10 @@ const FillRoute = () => {
       discardBusy ||
       exportSaveResolverRef.current
     ) {
+      return;
+    }
+    if (nativeConfig) {
+      void saveNativeResponse("save-draft", { exportFormat: format });
       return;
     }
     const saveCompletion = createDeferred<boolean>();
@@ -614,14 +823,20 @@ const FillRoute = () => {
               {form.title}
             </h1>
             <p className="mt-2 max-w-2xl text-[var(--ink-soft)]">
-              {form.description ??
-                "กรอกข้อมูลด้านล่าง แล้วเลือกบันทึกฉบับร่างหรือส่งคำตอบจากแท็บ Form ในตัวแก้ไขเอกสาร"}
+              {form.description ||
+                "กรอกข้อมูลด้านล่าง แล้วบันทึกฉบับร่างหรือส่งแบบฟอร์ม"}
             </p>
           </div>
-          <div className="flex items-center gap-2 text-sm text-[var(--ink-soft)]">
-            <Monitor />
-            แนะนำให้ใช้ตัวแก้ไขบนคอมพิวเตอร์
-          </div>
+          {nativeConfig ? (
+            <span className="text-sm text-[var(--ink-soft)]">
+              แบบฟอร์ม Native
+            </span>
+          ) : (
+            <div className="flex items-center gap-2 text-sm text-[var(--ink-soft)]">
+              <Monitor />
+              แนะนำให้ใช้ตัวแก้ไขบนคอมพิวเตอร์
+            </div>
+          )}
         </div>
         {error ? (
           <div className="mb-4">
@@ -631,7 +846,7 @@ const FillRoute = () => {
         {operationError ? (
           <div className="mb-4">
             <Notice tone="danger">
-              {operationError} ตัวแก้ไขยังเปิดอยู่ คุณสามารถลองใหม่ได้
+              {operationError} คุณสามารถแก้ไขข้อมูลแล้วลองใหม่ได้
             </Notice>
           </div>
         ) : null}
@@ -645,7 +860,7 @@ const FillRoute = () => {
             </Notice>
           </div>
         ) : null}
-        {operationBusy ? (
+        {(operationBusy || nativeSaving) ? (
           <div className="mb-4">
             <Notice>
               <span className="inline-flex items-center gap-2">
@@ -657,48 +872,73 @@ const FillRoute = () => {
             </Notice>
           </div>
         ) : null}
-        <div className="mb-4 rounded-[10px] border border-[var(--accent)]/35 bg-[var(--accent-soft)] px-4 py-3 text-sm text-[var(--ink)]">
-          <strong>ใช้แท็บ Form ในตัวแก้ไขเอกสาร</strong> เพื่อเลือกบันทึกฉบับร่างหรือส่งคำตอบ
-          ระบบจะแสดงความคืบหน้าที่นี่
-        </div>
-        <div className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-[10px] border border-[var(--line)] bg-[var(--paper)] px-4 py-3">
+        <div className="mb-4 flex items-center justify-between gap-3 rounded-[10px] border border-[var(--line)] bg-[var(--paper)] px-4 py-3">
           <div className="text-sm text-[var(--ink-soft)]">
             สถานะ: {dirty ? "มีการเปลี่ยนแปลงที่ยังไม่ได้บันทึก" : "บันทึกแล้ว"}
           </div>
-          <div className="flex flex-wrap gap-2">
-            <Button
-              type="button"
-              variant="secondary"
-              size="sm"
-              onClick={() => saveAndExport("docx")}
-              disabled={saveFlowBusy || discardBusy}
-            >
-              {exportAfterSave === "docx" ? <Spinner /> : null}
-              บันทึกและดาวน์โหลด DOCX
-            </Button>
-            <Button
-              type="button"
-              variant="secondary"
-              size="sm"
-              onClick={() => saveAndExport("pdf")}
-              disabled={saveFlowBusy || discardBusy}
-            >
-              {exportAfterSave === "pdf" ? <Spinner /> : null}
-              บันทึกและดาวน์โหลด PDF
-            </Button>
-          </div>
         </div>
-        <div className="overflow-hidden rounded-[var(--radius)] border border-[var(--line-strong)] bg-[var(--muted)] shadow-inner">
-          <OnlyOfficeEditor
-            clearDirtyRequest={clearDirtyRequest}
-            configUrl={editorConfigUrl ?? undefined}
-            onBridgeMessage={handleBridgeMessage}
-            onDirtyChange={setDirty}
-            revision={editorRevision}
-            saveRequest={saveRequest}
-            title={`กรอกแบบฟอร์ม ${form.title}`}
+        {nativeConfig ? (
+          <NativeTextForm
+            fields={nativeConfig.fields}
+            lockedFields={nativeConfig.lockedFields}
+            operationBusy={
+              operationBusy ||
+              nativeSaving ||
+              Boolean(exportAfterSave) ||
+              saveBeforeExit
+            }
+            values={nativeValues}
+            onChange={(tag, value) => {
+              setNativeValues((current) => ({ ...current, [tag]: value }));
+              setDirty(true);
+              setOperationError(null);
+            }}
+            onExportDocx={() => saveAndExport("docx")}
+            onExportPdf={() => saveAndExport("pdf")}
+            onSave={() => void saveNativeResponse("save-draft")}
+            onSubmit={() => void saveNativeResponse("submit")}
           />
-        </div>
+        ) : (
+          <>
+            <div className="mb-4 rounded-[10px] border border-[var(--accent)]/35 bg-[var(--accent-soft)] px-4 py-3 text-sm text-[var(--ink)]">
+              <strong>ใช้แท็บ Form ในตัวแก้ไขเอกสาร</strong> เพื่อเลือกบันทึกฉบับร่างหรือส่งคำตอบ
+              ระบบจะแสดงความคืบหน้าที่นี่
+            </div>
+            <div className="mb-4 flex flex-wrap items-center justify-end gap-3 rounded-[10px] border border-[var(--line)] bg-[var(--paper)] px-4 py-3">
+              <Button
+                type="button"
+                variant="secondary"
+                size="sm"
+                onClick={() => saveAndExport("docx")}
+                disabled={saveFlowBusy || discardBusy}
+              >
+                {exportAfterSave === "docx" ? <Spinner /> : null}
+                บันทึกและดาวน์โหลด DOCX
+              </Button>
+              <Button
+                type="button"
+                variant="secondary"
+                size="sm"
+                onClick={() => saveAndExport("pdf")}
+                disabled={saveFlowBusy || discardBusy}
+              >
+                {exportAfterSave === "pdf" ? <Spinner /> : null}
+                บันทึกและดาวน์โหลด PDF
+              </Button>
+            </div>
+            <div className="overflow-hidden rounded-[var(--radius)] border border-[var(--line-strong)] bg-[var(--muted)] shadow-inner">
+              <OnlyOfficeEditor
+                clearDirtyRequest={clearDirtyRequest}
+                configUrl={editorConfigUrl ?? undefined}
+                onBridgeMessage={handleBridgeMessage}
+                onDirtyChange={setDirty}
+                revision={editorRevision}
+                saveRequest={saveRequest}
+                title={`กรอกแบบฟอร์ม ${form.title}`}
+              />
+            </div>
+          </>
+        )}
       </main>
     </div>
   );

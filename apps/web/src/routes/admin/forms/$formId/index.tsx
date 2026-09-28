@@ -39,7 +39,7 @@ import {
   apiPost,
   waitForOperation,
 } from "@/lib/api";
-import type { FormDetail, FormSummary } from "@/lib/api";
+import type { FillMethod, FormDetail, FormSummary } from "@/lib/api";
 
 interface FormDetailResponse {
   editorConfigUrl: string;
@@ -89,6 +89,9 @@ const detailErrorMessage = (caughtError: unknown, fallback: string): string => {
       }
       case "form_not_published": {
         return "เก็บถาวรหรือยกเลิกเก็บถาวรได้เฉพาะแบบฟอร์มที่เผยแพร่แล้ว";
+      }
+      case "native_fill_unsupported": {
+        return "Native ใช้ได้เมื่อ Field ที่เผยแพร่ทุกช่องเป็น Text";
       }
       case "form_unavailable": {
         return "แบบฟอร์มนี้ยังไม่พร้อมรับคำตอบใหม่";
@@ -142,7 +145,7 @@ const FormEditorRoute = () => {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [metadataBusy, setMetadataBusy] = useState<
-    "archive" | "save" | "duplicate" | null
+    "archive" | "fill-method" | "save" | "duplicate" | null
   >(null);
   const [busy, setBusy] = useState<"save" | "publish" | null>(null);
   const [title, setTitle] = useState("");
@@ -382,6 +385,44 @@ const FormEditorRoute = () => {
         detailErrorMessage(
           caughtError,
           "บันทึกข้อมูลแบบฟอร์มไม่สำเร็จ กรุณาลองใหม่อีกครั้ง"
+        )
+      );
+    } finally {
+      setMetadataBusy(null);
+      metadataGuardRef.current = false;
+    }
+  };
+  const updateFillMethod = async (fillMethod: FillMethod) => {
+    if (
+      !metadataCanAct ||
+      metadataGuardRef.current ||
+      fillMethod === loadedForm.fillMethod
+    ) {
+      return;
+    }
+    metadataGuardRef.current = true;
+    setMetadataBusy("fill-method");
+    setError(null);
+    setNotice(null);
+    setOperationStatus(null);
+    try {
+      const payload = await apiPatch<FormMutationResponse>(
+        `/api/admin/forms/${publicId}`,
+        { fillMethod }
+      );
+      setForm((currentForm) =>
+        currentForm ? { ...currentForm, ...payload.form } : currentForm
+      );
+      setNotice(
+        fillMethod === "native"
+          ? "เปลี่ยนเป็นแบบฟอร์ม Native แล้ว"
+          : "เปลี่ยนเป็น ONLYOFFICE แล้ว"
+      );
+    } catch (caughtError) {
+      setError(
+        detailErrorMessage(
+          caughtError,
+          "เปลี่ยนวิธีกรอกแบบฟอร์มไม่สำเร็จ กรุณาลองใหม่อีกครั้ง"
         )
       );
     } finally {
@@ -743,6 +784,53 @@ const FormEditorRoute = () => {
               </Button>
             </div>
           </form>
+          <div
+            className="mt-5 space-y-2"
+            aria-busy={metadataBusy === "fill-method"}
+          >
+            <label
+              className="text-sm font-semibold"
+              htmlFor="form-fill-method"
+            >
+              Fill Method
+            </label>
+            <select
+              className="min-h-11 w-full rounded-[10px] border border-[var(--line-strong)] bg-[var(--paper)] px-3 text-[var(--ink)] shadow-sm focus:border-[var(--ink)] focus:outline-none"
+              disabled={!metadataCanAct || loadedForm.status === "draft"}
+              id="form-fill-method"
+              onChange={(event) => {
+                const value = event.target.value;
+                if (value === "native" || value === "onlyoffice") {
+                  void updateFillMethod(value);
+                }
+              }}
+              value={loadedForm.fillMethod}
+            >
+              <option value="onlyoffice">ONLYOFFICE</option>
+              <option
+                disabled={!loadedForm.nativeFillAvailable}
+                value="native"
+              >
+                Native text form
+              </option>
+            </select>
+            <p
+              className="text-xs text-[var(--ink-soft)]"
+              id="form-fill-method-help"
+            >
+              {loadedForm.status === "draft"
+                ? "Fill Method can be changed after publishing."
+                : loadedForm.nativeFillAvailable
+                  ? "This method applies to new and existing Draft responses."
+                  : "Native is available only when every published Field uses text."}
+            </p>
+            {metadataBusy === "fill-method" ? (
+              <p className="inline-flex items-center gap-2 text-xs" role="status">
+                <Spinner />
+                Updating Fill Method…
+              </p>
+            ) : null}
+          </div>
         </div>
       </section>
       <div className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-[var(--radius)] border border-[var(--line)] bg-[var(--paper)] p-4">

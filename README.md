@@ -1,6 +1,6 @@
 # Folio Forms
 
-Production-oriented MMVP for designing, publishing, and completing DOCX forms with ONLYOFFICE Docs.
+Production-oriented MMVP for designing, publishing, and completing DOCX forms through ONLYOFFICE or a single-page native text form.
 
 The application provides:
 
