@@ -47,6 +47,9 @@ export interface AuthoringOwner {
   authSessionId: string;
   userId: string;
 }
+export interface AuthoringRequestReservation {
+  readonly ownerSessionId: string;
+}
 export class AiAuthoringError extends Error {
   constructor(
     readonly status: number,
@@ -74,6 +77,8 @@ interface PendingGeneration {
   done: Promise<void>;
   finish: () => void;
   piSession?: AgentSession;
+  reservation: AuthoringRequestReservation;
+  started: boolean;
 }
 
 export interface AuthoringPreview {
@@ -263,12 +268,66 @@ export class AiAuthoringSessions {
     return validOmniRouteConfig(this.config);
   }
 
+  reserveRequest(ownerSessionId: string): AuthoringRequestReservation {
+    if (this.endedOwnerSessions.has(ownerSessionId)) {
+      throw new AiAuthoringError(
+        404,
+        "not_found",
+        "AI authoring session was not found"
+      );
+    }
+    let finish!: () => void;
+    const reservation = { ownerSessionId };
+    const pending: PendingGeneration = {
+      cancelled: false,
+      done: new Promise<void>((resolve) => {
+        finish = resolve;
+      }),
+      finish: () => finish(),
+      reservation,
+      started: false,
+    };
+    const ownerPending =
+      this.pendingGenerations.get(ownerSessionId) ??
+      new Set<PendingGeneration>();
+    ownerPending.add(pending);
+    this.pendingGenerations.set(ownerSessionId, ownerPending);
+    return reservation;
+  }
+
+  releaseRequest(reservation: AuthoringRequestReservation): void {
+    const pending = [
+      ...(this.pendingGenerations.get(reservation.ownerSessionId) ?? []),
+    ].find((generation) => generation.reservation === reservation);
+    if (pending) {
+      this.finishPending(reservation.ownerSessionId, pending);
+    }
+  }
+
   async create(
     owner: AuthoringOwner,
     prompt: string,
     consent: unknown,
-    validateDocument: (document: Uint8Array) => void
+    validateDocument: (document: Uint8Array) => void,
+    reservation: AuthoringRequestReservation,
+    isOwnerSessionCurrent: () => Promise<boolean>
   ): Promise<AuthoringPreview> {
+    const ownerPending = this.pendingGenerations.get(owner.authSessionId);
+    const pending = [...(ownerPending ?? [])].find(
+      (generation) => generation.reservation === reservation
+    );
+    if (
+      !pending ||
+      reservation.ownerSessionId !== owner.authSessionId ||
+      pending.cancelled ||
+      this.endedOwnerSessions.has(owner.authSessionId)
+    ) {
+      throw new AiAuthoringError(
+        404,
+        "not_found",
+        "AI authoring session was not found"
+      );
+    }
     if (!this.enabled || !this.config) {
       throw new AiAuthoringError(
         503,
@@ -293,32 +352,23 @@ export class AiAuthoringSessions {
         "AI authoring prompt is invalid"
       );
     }
-    if (this.endedOwnerSessions.has(owner.authSessionId)) {
-      throw new AiAuthoringError(
-        404,
-        "not_found",
-        "AI authoring session was not found"
-      );
-    }
-
-    let finish!: () => void;
-    const pending: PendingGeneration = {
-      cancelled: false,
-      done: new Promise<void>((resolve) => {
-        finish = resolve;
-      }),
-      finish: () => finish(),
-    };
-    const ownerPending =
-      this.pendingGenerations.get(owner.authSessionId) ??
-      new Set<PendingGeneration>();
-    ownerPending.add(pending);
-    this.pendingGenerations.set(owner.authSessionId, ownerPending);
+    pending.started = true;
 
     let tempDirectory: string | undefined;
     let piSession: AgentSession | undefined;
     let generated: GeneratedTemplate | undefined;
     try {
+      const isCurrent = await isOwnerSessionCurrent();
+      if (pending.cancelled) {
+        throw new Error("AI authoring generation was cancelled");
+      }
+      if (!isCurrent) {
+        throw new AiAuthoringError(
+          404,
+          "not_found",
+          "AI authoring session was not found"
+        );
+      }
       tempDirectory = await mkdtemp(path.join(tmpdir(), "folio-authoring-"));
       if (pending.cancelled) {
         throw new Error("AI authoring generation was cancelled");
@@ -449,12 +499,15 @@ export class AiAuthoringSessions {
       this.sessions.set(sessionId, session);
       this.touch(sessionId, session);
       return this.preview(sessionId, session);
-    } catch {
+    } catch (error) {
       await piSession?.abort().catch(() => undefined);
       piSession?.dispose();
       generated?.document.fill(0);
       if (tempDirectory) {
         await rm(tempDirectory, { force: true, recursive: true });
+      }
+      if (error instanceof AiAuthoringError) {
+        throw error;
       }
       throw new AiAuthoringError(
         502,
@@ -462,11 +515,7 @@ export class AiAuthoringSessions {
         "OmniRoute could not create a valid DOCX"
       );
     } finally {
-      ownerPending.delete(pending);
-      if (ownerPending.size === 0) {
-        this.pendingGenerations.delete(owner.authSessionId);
-      }
-      pending.finish();
+      this.finishPending(owner.authSessionId, pending);
     }
   }
 
@@ -489,27 +538,46 @@ export class AiAuthoringSessions {
     revokeOwnerSession?: () => Promise<unknown>
   ): Promise<void> {
     this.endedOwnerSessions.add(ownerSessionId);
-    let ownerSessionRevoked = !revokeOwnerSession;
     try {
-      const pending = [...(this.pendingGenerations.get(ownerSessionId) ?? [])];
+      const pending = [
+        ...(this.pendingGenerations.get(ownerSessionId) ?? []),
+      ];
       for (const generation of pending) {
         generation.cancelled = true;
       }
+      const active = pending.filter((generation) => generation.started);
       await Promise.allSettled(
-        pending.map((generation) => generation.piSession?.abort())
+        active.map((generation) => generation.piSession?.abort())
       );
-      await Promise.all(pending.map((generation) => generation.done));
-      for (const [sessionId, session] of this.sessions) {
-        if (session.ownerSessionId === ownerSessionId) {
-          await this.dispose(sessionId, session);
+      await Promise.all(active.map((generation) => generation.done));
+      for (const generation of pending) {
+        if (!generation.started) {
+          this.finishPending(ownerSessionId, generation);
         }
       }
-      await revokeOwnerSession?.();
-      ownerSessionRevoked = true;
-    } finally {
-      if (ownerSessionRevoked) {
-        this.endedOwnerSessions.delete(ownerSessionId);
+      const errors: unknown[] = [];
+      for (const [sessionId, session] of this.sessions) {
+        if (session.ownerSessionId === ownerSessionId) {
+          try {
+            await this.dispose(sessionId, session);
+          } catch (error) {
+            errors.push(error);
+          }
+        }
       }
+      try {
+        await revokeOwnerSession?.();
+      } catch (error) {
+        errors.push(error);
+      }
+      if (errors.length === 1) {
+        throw errors[0];
+      }
+      if (errors.length > 1) {
+        throw new AggregateError(errors, "AI authoring sign-out failed");
+      }
+    } finally {
+      this.endedOwnerSessions.delete(ownerSessionId);
     }
   }
   async close(): Promise<void> {
@@ -519,6 +587,20 @@ export class AiAuthoringSessions {
     for (const [sessionId, session] of this.sessions) {
       await this.dispose(sessionId, session);
     }
+  }
+
+  private finishPending(
+    ownerSessionId: string,
+    pending: PendingGeneration
+  ): void {
+    const ownerPending = this.pendingGenerations.get(ownerSessionId);
+    if (!ownerPending?.delete(pending)) {
+      return;
+    }
+    if (ownerPending.size === 0) {
+      this.pendingGenerations.delete(ownerSessionId);
+    }
+    pending.finish();
   }
 
   private async sessionFor(

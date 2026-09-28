@@ -10206,7 +10206,7 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   }
   expect(tombstoneMutationBlocked).toBe(true);
 });
-test("Ticket 17 sign-out tombstones clear after auth revocation", async () => {
+test("Ticket 17 sign-out always revokes and clears tombstones after failures", async () => {
   const authoring = new AiAuthoringSessions(null);
   const endedOwnerSessions = Reflect.get(
     authoring,
@@ -10233,6 +10233,61 @@ test("Ticket 17 sign-out tombstones clear after auth revocation", async () => {
 
   for (const ownerSessionId of ["normal-sign-out-2", "normal-sign-out-3"]) {
     await authoring.endForSession(ownerSessionId, async () => undefined);
+  }
+  expect(endedOwnerSessions.size).toBe(0);
+  const sessions = Reflect.get(authoring, "sessions") as Map<
+    string,
+    {
+      document: { document: Uint8Array };
+      lastActivity: Date;
+      ownerSessionId: string;
+      piSession: { dispose: () => void };
+      prompt: string;
+      reply: string;
+      tempDirectory: string;
+      userId: string;
+    }
+  >;
+  const cleanupError = new Error("local AI authoring cleanup failed");
+  sessions.set("cleanup-failure", {
+    document: { document: new Uint8Array([1]) },
+    lastActivity: new Date(),
+    ownerSessionId: "cleanup-failure",
+    piSession: {
+      dispose: () => {
+        throw cleanupError;
+      },
+    },
+    prompt: "",
+    reply: "",
+    tempDirectory: "/unused",
+    userId: "user",
+  });
+  let revocationAttempted = false;
+  let cleanupErrorPropagated = false;
+  try {
+    await authoring.endForSession("cleanup-failure", async () => {
+      revocationAttempted = true;
+    });
+  } catch (error) {
+    cleanupErrorPropagated = error === cleanupError;
+  }
+  expect(revocationAttempted).toBe(true);
+  expect(cleanupErrorPropagated).toBe(true);
+  expect(endedOwnerSessions.has("cleanup-failure")).toBe(false);
+
+  for (const ownerSessionId of ["failed-sign-out", "failed-sign-out"]) {
+    const revocationError = new Error("session revocation failed");
+    let revocationErrorPropagated = false;
+    try {
+      await authoring.endForSession(ownerSessionId, async () => {
+        throw revocationError;
+      });
+    } catch (error) {
+      revocationErrorPropagated = error === revocationError;
+    }
+    expect(revocationErrorPropagated).toBe(true);
+    expect(endedOwnerSessions.has(ownerSessionId)).toBe(false);
   }
   expect(endedOwnerSessions.size).toBe(0);
 });
@@ -10456,9 +10511,99 @@ test("Ticket 17 AI Authoring requires Admin consent and uploads a validated DOCX
       name: "Ticket 17 User",
       password: userPassword,
     });
+
+    const delayedBodyAdmin = await createCredentialFixture({
+      email: `ticket-17-delayed-body-${crypto.randomUUID()}@example.com`,
+      name: "Ticket 17 Delayed Body Admin",
+      password: "Ticket17-delayed-body-password",
+      role: "admin",
+    });
     adminBearer = await bearerFor(admin.email, adminPassword);
     otherAdminBearer = await bearerFor(otherAdmin.email, otherAdminPassword);
     userBearer = await bearerFor(user.email, userPassword);
+    const delayedBodyBearer = await bearerFor(
+      delayedBodyAdmin.email,
+      "Ticket17-delayed-body-password"
+    );
+    let notifyBodyRead!: () => void;
+    const bodyRead = new Promise<void>((resolve) => {
+      notifyBodyRead = resolve;
+    });
+    let releaseBody!: () => void;
+    const bodyGate = new Promise<void>((resolve) => {
+      releaseBody = resolve;
+    });
+    let bodyReadNotified = false;
+    let delayedCreate: Promise<globalThis.Response> | undefined;
+    try {
+      const requestBody = new ReadableStream<Uint8Array>(
+        {
+          pull(controller) {
+            if (!bodyReadNotified) {
+              bodyReadNotified = true;
+              notifyBodyRead();
+            }
+            return bodyGate.then(() => {
+              controller.enqueue(
+                new TextEncoder().encode(
+                  JSON.stringify({
+                    consent: true,
+                    prompt: "Create an equipment request form",
+                  })
+                )
+              );
+              controller.close();
+            });
+          },
+        },
+        { highWaterMark: 0 }
+      );
+      const delayedRequestInit = {
+        body: requestBody,
+        duplex: "half" as const,
+        headers: {
+          ...jsonHeaders,
+          Authorization: `Bearer ${delayedBodyBearer}`,
+        },
+        method: "POST",
+      };
+      delayedCreate = aiApp.handle(
+        new Request(
+          "http://test.local/api/admin/ai-authoring/sessions",
+          delayedRequestInit
+        )
+      );
+      await bodyRead;
+      const callsBeforeSignOut = upstreamCalls;
+      const delayedSignOut = await aiApp.handle(
+        new Request("http://test.local/api/auth/sign-out", {
+          headers: { Authorization: `Bearer ${delayedBodyBearer}` },
+          method: "POST",
+        })
+      );
+      expect(delayedSignOut.status).toBe(200);
+      releaseBody();
+      const staleCreate = await delayedCreate;
+      expect(staleCreate.status).toBe(404);
+      expect(upstreamCalls).toBe(callsBeforeSignOut);
+      const delayedBodySession = await aiApp.handle(
+        new Request("http://test.local/api/session", {
+          headers: { Authorization: `Bearer ${delayedBodyBearer}` },
+        })
+      );
+      expect(delayedBodySession.status).toBe(401);
+    } finally {
+      await aiApp
+        .handle(
+          new Request("http://test.local/api/auth/sign-out", {
+            headers: { Authorization: `Bearer ${delayedBodyBearer}` },
+            method: "POST",
+          })
+        )
+        .catch(() => undefined);
+      releaseBody();
+      await delayedCreate?.catch(() => undefined);
+    }
     const unauthenticatedStatus = await aiApp.handle(
       new Request("http://test.local/api/admin/ai-authoring")
     );

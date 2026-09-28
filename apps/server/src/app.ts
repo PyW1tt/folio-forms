@@ -9112,22 +9112,38 @@ export function createApp(options: AppOptions = {}) {
       async ({ request }) => {
         const identity = await requireIdentity(request);
         requireAdmin(identity);
-        const input = await readJsonRecord(request, accountBodyMaximumBytes);
-        if (
-          Object.keys(input).length !== 2 ||
-          !Object.hasOwn(input, "consent") ||
-          !Object.hasOwn(input, "prompt") ||
-          typeof input.prompt !== "string"
-        ) {
-          fail(400, "invalid_request", "Only consent and prompt are accepted");
+        const reservation = aiAuthoring.reserveRequest(identity.sessionId);
+        try {
+          const input = await readJsonRecord(request, accountBodyMaximumBytes);
+          if (
+            Object.keys(input).length !== 2 ||
+            !Object.hasOwn(input, "consent") ||
+            !Object.hasOwn(input, "prompt") ||
+            typeof input.prompt !== "string"
+          ) {
+            fail(400, "invalid_request", "Only consent and prompt are accepted");
+          }
+          const session = await aiAuthoring.create(
+            { authSessionId: identity.sessionId, userId: identity.id },
+            input.prompt,
+            input.consent,
+            (document) => validateTemplateControls(document),
+            reservation,
+            async () => {
+              const currentIdentity = await identityFor(request);
+              return (
+                currentIdentity !== null &&
+                currentIdentity.id === identity.id &&
+                currentIdentity.sessionId === identity.sessionId &&
+                currentIdentity.role === "admin" &&
+                (!currentIdentity.mustChangePassword || currentIdentity.isSso)
+              );
+            }
+          );
+          return { session };
+        } finally {
+          aiAuthoring.releaseRequest(reservation);
         }
-        const session = await aiAuthoring.create(
-          { authSessionId: identity.sessionId, userId: identity.id },
-          input.prompt,
-          input.consent,
-          (document) => validateTemplateControls(document)
-        );
-        return { session };
       },
       { parse: "none" }
     )
