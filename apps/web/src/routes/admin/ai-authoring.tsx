@@ -174,7 +174,13 @@ const AiAuthoringRoute = () => {
       setPrompt("");
       setConsent(false);
     } catch (caughtError) {
-      setError(authoringErrorMessage(caughtError));
+      if (caughtError instanceof ApiError && caughtError.status === 404) {
+        setPreview(null);
+        setPrompt("");
+        setConsent(false);
+      } else {
+        setError(authoringErrorMessage(caughtError));
+      }
     } finally {
       setBusy(false);
     }

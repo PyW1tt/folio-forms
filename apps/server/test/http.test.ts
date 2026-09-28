@@ -10220,6 +10220,20 @@ test("Ticket 17 AI Authoring requires Admin consent and uploads a validated DOCX
     title: "Equipment Request",
   };
   let upstreamCalls = 0;
+  let omitAssistantSummary = false;
+  let blockNextProviderRequest = false;
+  let notifyProviderBlocked!: () => void;
+  const providerBlocked = new Promise<void>((resolve) => {
+    notifyProviderBlocked = resolve;
+  });
+  let releaseProviderResponse!: () => void;
+  const providerResponseGate = new Promise<void>((resolve) => {
+    releaseProviderResponse = resolve;
+  });
+  let notifyProviderAborted!: () => void;
+  const providerAborted = new Promise<void>((resolve) => {
+    notifyProviderAborted = resolve;
+  });
   const upstream = Bun.serve({
     fetch: async (request) => {
       upstreamCalls += 1;
@@ -10240,6 +10254,14 @@ test("Ticket 17 AI Authoring requires Admin consent and uploads a validated DOCX
           (tool) => tool.function?.name === "create_template_docx"
         )
       ).toBe(true);
+      if (blockNextProviderRequest) {
+        blockNextProviderRequest = false;
+        request.signal.addEventListener("abort", notifyProviderAborted, {
+          once: true,
+        });
+        notifyProviderBlocked();
+        await providerResponseGate;
+      }
       const toolCall = upstreamCalls % 2 === 1;
       const completionChunks = toolCall
         ? [
@@ -10262,16 +10284,18 @@ test("Ticket 17 AI Authoring requires Admin consent and uploads a validated DOCX
             },
             { delta: {}, finish_reason: "tool_calls" },
           ]
-        : [
-            {
-              delta: {
-                content: "Created Equipment Request with one tagged field.",
-                role: "assistant",
+        : omitAssistantSummary
+          ? [{ delta: { role: "assistant" }, finish_reason: "stop" }]
+          : [
+              {
+                delta: {
+                  content: "Created Equipment Request with one tagged field.",
+                  role: "assistant",
+                },
+                finish_reason: null,
               },
-              finish_reason: null,
-            },
-            { delta: {}, finish_reason: "stop" },
-          ];
+              { delta: {}, finish_reason: "stop" },
+            ];
       const createdAt = Math.floor(Date.now() / 1000);
       const stream = completionChunks
         .map((chunk) =>
@@ -10605,7 +10629,12 @@ test("Ticket 17 AI Authoring requires Admin consent and uploads a validated DOCX
     );
     expect(endedDownload.status).toBe(404);
 
+    omitAssistantSummary = true;
     const second = await createPreview(adminBearer);
+    omitAssistantSummary = false;
+    expect(second.session.assistantMessage).toBe(
+      "Created Equipment Request with 1 tagged field."
+    );
     activeSessionId = second.session.sessionId;
     now = new Date(now.getTime() + 2 * 60 * 60 * 1000 - 1);
     const sessionStillActive = await aiApp.handle(
@@ -10637,7 +10666,46 @@ test("Ticket 17 AI Authoring requires Admin consent and uploads a validated DOCX
     signedOut = true;
     activeSessionId = undefined;
     expect(await temporaryDirectories()).not.toContain(third.directory);
-    expect(upstreamCalls).toBe(6);
+    const directoriesBeforePending = new Set(await temporaryDirectories());
+    blockNextProviderRequest = true;
+    const pendingCreate = aiApp.handle(
+      new Request("http://test.local/api/admin/ai-authoring/sessions", {
+        body: JSON.stringify({
+          consent: true,
+          prompt: "Create an equipment request form",
+        }),
+        headers: {
+          ...jsonHeaders,
+          Authorization: `Bearer ${otherAdminBearer}`,
+        },
+        method: "POST",
+      })
+    );
+    await providerBlocked;
+    const pendingDirectories = (await temporaryDirectories()).filter(
+      (directory) => !directoriesBeforePending.has(directory)
+    );
+    expect(pendingDirectories).toHaveLength(1);
+    const pendingDirectory = pendingDirectories[0];
+    if (!pendingDirectory) {
+      throw new Error("Pending AI Authoring did not create its temporary directory");
+    }
+    const signOutPending = aiApp.handle(
+      new Request("http://test.local/api/auth/sign-out", {
+        headers: { Authorization: `Bearer ${otherAdminBearer}` },
+        method: "POST",
+      })
+    );
+    await providerAborted;
+    releaseProviderResponse();
+    const [pendingResponse, pendingSignOutResponse] = await Promise.all([
+      pendingCreate,
+      signOutPending,
+    ]);
+    expect(pendingSignOutResponse.status).toBe(200);
+    expect(pendingResponse.status).toBe(502);
+    expect(await temporaryDirectories()).not.toContain(pendingDirectory);
+    expect(upstreamCalls).toBe(7);
 
   } finally {
     if (formPublicId && adminBearer && !signedOut) {

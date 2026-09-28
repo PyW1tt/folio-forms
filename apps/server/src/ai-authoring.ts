@@ -69,6 +69,12 @@ interface AuthoringSession {
   tempDirectory: string;
   userId: string;
 }
+interface PendingGeneration {
+  cancelled: boolean;
+  done: Promise<void>;
+  finish: () => void;
+  piSession?: AgentSession;
+}
 
 export interface AuthoringPreview {
   assistantMessage: string;
@@ -243,6 +249,11 @@ export const validOmniRouteConfig = (
 
 export class AiAuthoringSessions {
   private readonly sessions = new Map<string, AuthoringSession>();
+  private readonly pendingGenerations = new Map<
+    string,
+    Set<PendingGeneration>
+  >();
+  private readonly endedOwnerSessions = new Set<string>();
   constructor(
     private readonly config: OmniRouteConfig | null,
     private readonly now: () => Date = () => new Date()
@@ -282,11 +293,36 @@ export class AiAuthoringSessions {
         "AI authoring prompt is invalid"
       );
     }
+    if (this.endedOwnerSessions.has(owner.authSessionId)) {
+      throw new AiAuthoringError(
+        404,
+        "not_found",
+        "AI authoring session was not found"
+      );
+    }
 
-    const tempDirectory = await mkdtemp(path.join(tmpdir(), "folio-authoring-"));
+    let finish!: () => void;
+    const pending: PendingGeneration = {
+      cancelled: false,
+      done: new Promise<void>((resolve) => {
+        finish = resolve;
+      }),
+      finish: () => finish(),
+    };
+    const ownerPending =
+      this.pendingGenerations.get(owner.authSessionId) ??
+      new Set<PendingGeneration>();
+    ownerPending.add(pending);
+    this.pendingGenerations.set(owner.authSessionId, ownerPending);
+
+    let tempDirectory: string | undefined;
     let piSession: AgentSession | undefined;
     let generated: GeneratedTemplate | undefined;
     try {
+      tempDirectory = await mkdtemp(path.join(tmpdir(), "folio-authoring-"));
+      if (pending.cancelled) {
+        throw new Error("AI authoring generation was cancelled");
+      }
       const modelRuntime = await ModelRuntime.create({
         allowModelNetwork: false,
         authPath: path.join(tempDirectory, "auth.json"),
@@ -324,7 +360,10 @@ export class AiAuthoringSessions {
       const settingsManager = SettingsManager.inMemory({
         defaultTools: [],
         httpIdleTimeoutMs: upstreamTimeoutMs,
-        retry: { enabled: false, provider: { maxRetries: 0, timeoutMs: upstreamTimeoutMs } },
+        retry: {
+          enabled: false,
+          provider: { maxRetries: 0, timeoutMs: upstreamTimeoutMs },
+        },
       });
       const documentTool = {
         description:
@@ -338,6 +377,9 @@ export class AiAuthoringSessions {
             title: string;
           }
         ) => {
+          if (pending.cancelled) {
+            throw new Error("AI authoring generation was cancelled");
+          }
           if (generated) {
             throw new Error("Only one DOCX can be created in this session");
           }
@@ -371,14 +413,23 @@ export class AiAuthoringSessions {
         thinkingLevel: "off",
       });
       piSession = created.session;
+      pending.piSession = piSession;
+      if (pending.cancelled) {
+        throw new Error("AI authoring generation was cancelled");
+      }
       await piSession.prompt(promptFor(prompt.trim()), {
         expandPromptTemplates: false,
         source: "rpc",
       });
-      const reply = piSession.getLastAssistantText()?.trim();
-      if (!generated || !reply) {
+      if (pending.cancelled) {
+        throw new Error("AI authoring generation was cancelled");
+      }
+      if (!generated) {
         throw new Error("OmniRoute did not create a valid DOCX");
       }
+      const reply =
+        piSession.getLastAssistantText()?.trim() ||
+        `Created ${generated.title} with ${generated.fields.length} tagged field${generated.fields.length === 1 ? "" : "s"}.`;
       const session: AuthoringSession = {
         document: generated,
         lastActivity: this.now(),
@@ -394,14 +445,23 @@ export class AiAuthoringSessions {
       this.touch(sessionId, session);
       return this.preview(sessionId, session);
     } catch {
+      await piSession?.abort();
       piSession?.dispose();
       generated?.document.fill(0);
-      await rm(tempDirectory, { force: true, recursive: true });
+      if (tempDirectory) {
+        await rm(tempDirectory, { force: true, recursive: true });
+      }
       throw new AiAuthoringError(
         502,
         "ai_authoring_failed",
         "OmniRoute could not create a valid DOCX"
       );
+    } finally {
+      ownerPending.delete(pending);
+      if (ownerPending.size === 0) {
+        this.pendingGenerations.delete(owner.authSessionId);
+      }
+      pending.finish();
     }
   }
 
@@ -420,6 +480,15 @@ export class AiAuthoringSessions {
   }
 
   async endForSession(ownerSessionId: string): Promise<void> {
+    this.endedOwnerSessions.add(ownerSessionId);
+    const pending = [...(this.pendingGenerations.get(ownerSessionId) ?? [])];
+    for (const generation of pending) {
+      generation.cancelled = true;
+    }
+    await Promise.allSettled(
+      pending.map((generation) => generation.piSession?.abort())
+    );
+    await Promise.all(pending.map((generation) => generation.done));
     for (const [sessionId, session] of this.sessions) {
       if (session.ownerSessionId === ownerSessionId) {
         await this.dispose(sessionId, session);
@@ -427,6 +496,9 @@ export class AiAuthoringSessions {
     }
   }
   async close(): Promise<void> {
+    for (const ownerSessionId of [...this.pendingGenerations.keys()]) {
+      await this.endForSession(ownerSessionId);
+    }
     for (const [sessionId, session] of this.sessions) {
       await this.dispose(sessionId, session);
     }
