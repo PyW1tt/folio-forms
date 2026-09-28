@@ -140,6 +140,7 @@ const AdminResultDetailRoute = () => {
     ResponseRevisionsResponse["revisions"]
   >([]);
   const [fields, setFields] = useState<ReceiptField[]>([]);
+  const [fieldsError, setFieldsError] = useState<string | null>(null);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyError, setHistoryError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -194,6 +195,7 @@ const AdminResultDetailRoute = () => {
     let cancelled = false;
     setHistoryLoading(true);
     setHistoryError(null);
+    setFieldsError(null);
     const loadHistory = async () => {
       try {
         const [historyResult, submissionDataResult] = await Promise.allSettled([
@@ -213,6 +215,8 @@ const AdminResultDetailRoute = () => {
           }
           if (submissionDataResult.status === "fulfilled") {
             setFields(submissionDataResult.value.fields);
+          } else {
+            setFieldsError("ไม่สามารถโหลดข้อมูล Field ที่เผยแพร่ได้");
           }
         }
       } finally {
@@ -518,6 +522,7 @@ const AdminResultDetailRoute = () => {
               data={displayedData}
               documentAvailable={documentAvailable}
               fields={fields}
+              fieldsError={fieldsError}
               pictures={selectedPictures}
             />
           </Card>

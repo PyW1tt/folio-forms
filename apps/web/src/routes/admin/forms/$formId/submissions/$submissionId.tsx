@@ -22,7 +22,9 @@ const SubmissionDetailRoute = () => {
   const [pictures, setPictures] = useState<Record<string, boolean> | null>(
     null
   );
-  const [documentAvailable, setDocumentAvailable] = useState(false);
+  const [documentAvailable, setDocumentAvailable] = useState<boolean | null>(
+    null
+  );
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [historyError, setHistoryError] = useState<string | null>(null);
@@ -47,6 +49,7 @@ const SubmissionDetailRoute = () => {
     };
     const loadSubmission = async () => {
       setHistoryError(null);
+      setDocumentAvailable(null);
       try {
         const payload = await apiGet<{
           data: Record<string, unknown>;

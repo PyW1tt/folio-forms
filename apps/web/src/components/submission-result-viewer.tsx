@@ -67,12 +67,14 @@ export const SubmissionResultViewer = ({
   data,
   documentAvailable,
   fields,
+  fieldsError,
   pictures,
 }: {
   configUrl?: string;
   data: Record<string, unknown>;
-  documentAvailable: boolean;
+  documentAvailable: boolean | null;
   fields: ReceiptField[];
+  fieldsError?: string | null;
   pictures: Record<string, boolean> | null;
 }) => {
   const [activeTab, setActiveTab] = useState<"document" | "fields">(
@@ -136,14 +138,17 @@ export const SubmissionResultViewer = ({
         role="tabpanel"
         tabIndex={0}
       >
-        {activeTab === "document" && documentAvailable && configUrl ? (
+        {activeTab === "document" &&
+        documentAvailable !== false &&
+        configUrl ? (
           <OnlyOfficeEditor
             configUrl={configUrl}
             readOnly
             title="Read-only submission document"
           />
         ) : null}
-        {activeTab === "document" && (!documentAvailable || !configUrl) ? (
+        {activeTab === "document" &&
+        (documentAvailable === false || !configUrl) ? (
           <Notice>เอกสารสำหรับฉบับนี้ไม่พร้อมใช้งาน</Notice>
         ) : null}
       </div>
@@ -156,7 +161,11 @@ export const SubmissionResultViewer = ({
         tabIndex={0}
       >
         {activeTab === "fields" ? (
-          <SubmissionFields data={data} fields={fields} pictures={pictures} />
+          fieldsError ? (
+            <Notice tone="danger">{fieldsError}</Notice>
+          ) : (
+            <SubmissionFields data={data} fields={fields} pictures={pictures} />
+          )
         ) : null}
       </div>
     </div>
