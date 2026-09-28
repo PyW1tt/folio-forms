@@ -1,8 +1,9 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, test, vi } from "bun:test";
 // oxlint-disable no-await-in-loop complexity -- The end-to-end journey deliberately keeps sequential transitions in one test.
 import { createHash } from "node:crypto";
-import { readdir } from "node:fs/promises";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { basename, join } from "node:path";
 
 import { AgentSession } from "@earendil-works/pi-coding-agent";
 import { auth, ensureBootstrapAdmin } from "@onlyoffice/auth";
@@ -10230,6 +10231,54 @@ test("Ticket 17 sign-out always revokes and clears tombstones after failures", a
   releaseRevocation();
   await ending;
   expect(endedOwnerSessions.size).toBe(0);
+  const firstRevocationError = new Error("first concurrent revoke failed");
+  let releaseFirstConcurrentRevocation!: () => void;
+  const firstConcurrentRevocationGate = new Promise<void>((resolve) => {
+    releaseFirstConcurrentRevocation = resolve;
+  });
+  let notifyFirstConcurrentRevocation!: () => void;
+  const firstConcurrentRevocationStarted = new Promise<void>((resolve) => {
+    notifyFirstConcurrentRevocation = resolve;
+  });
+  const firstConcurrentEnd = authoring.endForSession(
+    "concurrent-sign-out",
+    async () => {
+      notifyFirstConcurrentRevocation();
+      await firstConcurrentRevocationGate;
+      throw firstRevocationError;
+    }
+  );
+  await firstConcurrentRevocationStarted;
+  let releaseSecondConcurrentRevocation!: () => void;
+  const secondConcurrentRevocationGate = new Promise<void>((resolve) => {
+    releaseSecondConcurrentRevocation = resolve;
+  });
+  let notifySecondConcurrentRevocation!: () => void;
+  const secondConcurrentRevocationStarted = new Promise<void>((resolve) => {
+    notifySecondConcurrentRevocation = resolve;
+  });
+  const secondConcurrentEnd = authoring.endForSession(
+    "concurrent-sign-out",
+    async () => {
+      notifySecondConcurrentRevocation();
+      await secondConcurrentRevocationGate;
+    }
+  );
+  await secondConcurrentRevocationStarted;
+  releaseFirstConcurrentRevocation();
+  let firstConcurrentErrorPropagated = false;
+  try {
+    await firstConcurrentEnd;
+  } catch (error) {
+    firstConcurrentErrorPropagated = error === firstRevocationError;
+  }
+  expect(firstConcurrentErrorPropagated).toBe(true);
+  expect(endedOwnerSessions.has("concurrent-sign-out")).toBe(true);
+  expect(() => authoring.reserveRequest("concurrent-sign-out")).toThrow();
+  releaseSecondConcurrentRevocation();
+  await secondConcurrentEnd;
+  expect(endedOwnerSessions.has("concurrent-sign-out")).toBe(false);
+
 
   for (const ownerSessionId of ["normal-sign-out-2", "normal-sign-out-3"]) {
     await authoring.endForSession(ownerSessionId, async () => undefined);
@@ -10239,6 +10288,7 @@ test("Ticket 17 sign-out always revokes and clears tombstones after failures", a
     string,
     {
       document: { document: Uint8Array };
+      expiryTimer?: unknown;
       lastActivity: Date;
       ownerSessionId: string;
       piSession: { dispose: () => void };
@@ -10249,8 +10299,18 @@ test("Ticket 17 sign-out always revokes and clears tombstones after failures", a
     }
   >;
   const cleanupError = new Error("local AI authoring cleanup failed");
+  const cleanupDirectory = await mkdtemp(
+    join(tmpdir(), "folio-authoring-cleanup-")
+  );
+  const cleanupDocument = new Uint8Array([1]);
+  let cleanupTimerFired = false;
+  vi.useFakeTimers();
+  const cleanupTimer = setTimeout(() => {
+    cleanupTimerFired = true;
+  }, 20);
   sessions.set("cleanup-failure", {
-    document: { document: new Uint8Array([1]) },
+    document: { document: cleanupDocument },
+    expiryTimer: cleanupTimer,
     lastActivity: new Date(),
     ownerSessionId: "cleanup-failure",
     piSession: {
@@ -10260,21 +10320,30 @@ test("Ticket 17 sign-out always revokes and clears tombstones after failures", a
     },
     prompt: "",
     reply: "",
-    tempDirectory: "/unused",
+    tempDirectory: cleanupDirectory,
     userId: "user",
   });
   let revocationAttempted = false;
   let cleanupErrorPropagated = false;
   try {
-    await authoring.endForSession("cleanup-failure", async () => {
-      revocationAttempted = true;
-    });
-  } catch (error) {
-    cleanupErrorPropagated = error === cleanupError;
+    try {
+      await authoring.endForSession("cleanup-failure", async () => {
+        revocationAttempted = true;
+      });
+    } catch (error) {
+      cleanupErrorPropagated = error === cleanupError;
+    }
+    expect(revocationAttempted).toBe(true);
+    expect(cleanupErrorPropagated).toBe(true);
+    expect(cleanupDocument).toEqual(new Uint8Array([0]));
+    vi.advanceTimersByTime(21);
+    expect(cleanupTimerFired).toBe(false);
+    expect(await readdir(tmpdir())).not.toContain(basename(cleanupDirectory));
+    expect(endedOwnerSessions.has("cleanup-failure")).toBe(false);
+  } finally {
+    vi.useRealTimers();
+    await rm(cleanupDirectory, { force: true, recursive: true });
   }
-  expect(revocationAttempted).toBe(true);
-  expect(cleanupErrorPropagated).toBe(true);
-  expect(endedOwnerSessions.has("cleanup-failure")).toBe(false);
 
   for (const ownerSessionId of ["failed-sign-out", "failed-sign-out"]) {
     const revocationError = new Error("session revocation failed");
@@ -10307,6 +10376,7 @@ test("Ticket 17 AI Authoring requires Admin consent and uploads a validated DOCX
     title: "Equipment Request",
   };
   let upstreamCalls = 0;
+  let forcedToolCalls: boolean[] = [];
   let omitAssistantSummary = false;
   let blockNextProviderRequest = false;
   let notifyProviderBlocked!: () => void;
@@ -10363,7 +10433,7 @@ test("Ticket 17 AI Authoring requires Admin consent and uploads a validated DOCX
         notifyProviderBlocked();
         await providerResponseGate;
       }
-      const toolCall = upstreamCalls % 2 === 1;
+      const toolCall = forcedToolCalls.shift() ?? upstreamCalls % 2 === 1;
       const completionChunks = toolCall
         ? [
             {
@@ -10487,9 +10557,15 @@ test("Ticket 17 AI Authoring requires Admin consent and uploads a validated DOCX
   const adminPassword = "Ticket17-admin-password";
   const otherAdminPassword = "Ticket17-other-admin-password";
   const userPassword = "Ticket17-user-password";
+  const delayedBodyPassword = "Ticket17-delayed-body-password";
+  const changedDelayedBodyPassword = "Ticket17-delayed-body-updated-password";
+  const changedOtherAdminPassword = "Ticket17-other-admin-updated-password";
   let adminBearer = "";
   let otherAdminBearer = "";
   let userBearer = "";
+  let mutationActorBearer = "";
+  let deletionActorBearer = "";
+  let cleanupTargetBearer = "";
   let activeSessionId: string | undefined;
   let formPublicId: string | undefined;
   let signedOut = false;
@@ -10515,7 +10591,7 @@ test("Ticket 17 AI Authoring requires Admin consent and uploads a validated DOCX
     const delayedBodyAdmin = await createCredentialFixture({
       email: `ticket-17-delayed-body-${crypto.randomUUID()}@example.com`,
       name: "Ticket 17 Delayed Body Admin",
-      password: "Ticket17-delayed-body-password",
+      password: delayedBodyPassword,
       role: "admin",
     });
     adminBearer = await bearerFor(admin.email, adminPassword);
@@ -10523,7 +10599,7 @@ test("Ticket 17 AI Authoring requires Admin consent and uploads a validated DOCX
     userBearer = await bearerFor(user.email, userPassword);
     const delayedBodyBearer = await bearerFor(
       delayedBodyAdmin.email,
-      "Ticket17-delayed-body-password"
+      delayedBodyPassword
     );
     let notifyBodyRead!: () => void;
     const bodyRead = new Promise<void>((resolve) => {
@@ -10970,6 +11046,201 @@ test("Ticket 17 AI Authoring requires Admin consent and uploads a validated DOCX
     expect(await temporaryDirectories()).not.toContain(pendingDirectory);
     expect(upstreamCalls).toBe(7);
 
+    mutationActorBearer = await bearerFor(
+      delayedBodyAdmin.email,
+      delayedBodyPassword
+    );
+    cleanupTargetBearer = await bearerFor(otherAdmin.email, otherAdminPassword);
+    forcedToolCalls = [true, false];
+    const roleSession = await createPreview(cleanupTargetBearer);
+    const demoteTarget = await aiApp.handle(
+      new Request(`http://test.local/api/admin/users/${otherAdmin.id}`, {
+        body: JSON.stringify({ role: "user" }),
+        headers: {
+          ...jsonHeaders,
+          Authorization: `Bearer ${mutationActorBearer}`,
+        },
+        method: "PATCH",
+      })
+    );
+    expect(demoteTarget.status).toBe(200);
+    expect(await temporaryDirectories()).not.toContain(roleSession.directory);
+    const demotedSessionStatus = await aiApp.handle(
+      new Request("http://test.local/api/session", {
+        headers: { Authorization: `Bearer ${cleanupTargetBearer}` },
+      })
+    );
+    expect(demotedSessionStatus.status).toBe(401);
+
+    const promoteTarget = await aiApp.handle(
+      new Request(`http://test.local/api/admin/users/${otherAdmin.id}`, {
+        body: JSON.stringify({ role: "admin" }),
+        headers: {
+          ...jsonHeaders,
+          Authorization: `Bearer ${mutationActorBearer}`,
+        },
+        method: "PATCH",
+      })
+    );
+    expect(promoteTarget.status).toBe(200);
+    cleanupTargetBearer = await bearerFor(otherAdmin.email, otherAdminPassword);
+    forcedToolCalls = [true, false];
+    const resetSession = await createPreview(cleanupTargetBearer);
+    const resetTargetPassword = await aiApp.handle(
+      new Request(
+        `http://test.local/api/admin/users/${otherAdmin.id}/password-reset`,
+        {
+          headers: { Authorization: `Bearer ${mutationActorBearer}` },
+          method: "POST",
+        }
+      )
+    );
+    expect(resetTargetPassword.status).toBe(200);
+    expect(await temporaryDirectories()).not.toContain(resetSession.directory);
+    const resetBody = (await resetTargetPassword.json()) as {
+      temporaryPassword: string;
+    };
+    const resetSessionStatus = await aiApp.handle(
+      new Request("http://test.local/api/session", {
+        headers: { Authorization: `Bearer ${cleanupTargetBearer}` },
+      })
+    );
+    expect(resetSessionStatus.status).toBe(401);
+
+    cleanupTargetBearer = await bearerFor(
+      otherAdmin.email,
+      resetBody.temporaryPassword
+    );
+    const changeTargetPassword = await aiApp.handle(
+      new Request("http://test.local/api/account/password", {
+        body: JSON.stringify({
+          currentPassword: resetBody.temporaryPassword,
+          newPassword: changedOtherAdminPassword,
+        }),
+        headers: {
+          ...jsonHeaders,
+          Authorization: `Bearer ${cleanupTargetBearer}`,
+        },
+        method: "POST",
+      })
+    );
+    expect(changeTargetPassword.status).toBe(200);
+    const changedPasswordSessionStatus = await aiApp.handle(
+      new Request("http://test.local/api/session", {
+        headers: { Authorization: `Bearer ${cleanupTargetBearer}` },
+      })
+    );
+    expect(changedPasswordSessionStatus.status).toBe(401);
+    cleanupTargetBearer = await bearerFor(
+      otherAdmin.email,
+      changedOtherAdminPassword
+    );
+    forcedToolCalls = [true, false];
+    const deleteSession = await createPreview(cleanupTargetBearer);
+    deletionActorBearer = await bearerFor(admin.email, adminPassword);
+    const deleteTarget = await aiApp.handle(
+      new Request(`http://test.local/api/admin/users/${otherAdmin.id}`, {
+        body: JSON.stringify({ confirm: true }),
+        headers: {
+          ...jsonHeaders,
+          Authorization: `Bearer ${deletionActorBearer}`,
+        },
+        method: "DELETE",
+      })
+    );
+    expect(deleteTarget.status).toBe(200);
+    expect(await temporaryDirectories()).not.toContain(deleteSession.directory);
+    const deletedSessionStatus = await aiApp.handle(
+      new Request("http://test.local/api/session", {
+        headers: { Authorization: `Bearer ${cleanupTargetBearer}` },
+      })
+    );
+    expect(deletedSessionStatus.status).toBe(401);
+
+    const directoriesBeforeFailedGeneration = new Set(
+      await temporaryDirectories()
+    );
+    const originalGetLastAssistantText =
+      AgentSession.prototype.getLastAssistantText;
+    const originalDispose = AgentSession.prototype.dispose;
+    const originalUint8ArrayFill = Uint8Array.prototype.fill;
+    let generatedDocumentZeroed = false;
+    AgentSession.prototype.getLastAssistantText = () => {
+      throw new Error("generation failed after DOCX creation");
+    };
+    AgentSession.prototype.dispose = () => {
+      throw new Error("Pi disposal failed");
+    };
+    Uint8Array.prototype.fill = function (
+      this: Uint8Array,
+      value: number,
+      start?: number,
+      end?: number
+    ): Uint8Array {
+      const isGeneratedDocument =
+        value === 0 && this[0] === 0x50 && this[1] === 0x4b;
+      const result = originalUint8ArrayFill.call(this, value, start, end);
+      if (isGeneratedDocument) {
+        generatedDocumentZeroed = this.every((byte) => byte === 0);
+      }
+      return result;
+    };
+    try {
+      forcedToolCalls = [true, false];
+      const failedGeneration = await aiApp.handle(
+        new Request("http://test.local/api/admin/ai-authoring/sessions", {
+          body: JSON.stringify({
+            consent: true,
+            prompt: "Create an equipment request form",
+          }),
+          headers: {
+            ...jsonHeaders,
+            Authorization: `Bearer ${mutationActorBearer}`,
+          },
+          method: "POST",
+        })
+      );
+      expect(failedGeneration.status).toBe(502);
+      const failedGenerationBody = (await failedGeneration.json()) as {
+        error?: string;
+      };
+      expect(failedGenerationBody.error).toBe("ai_authoring_failed");
+      expect(generatedDocumentZeroed).toBe(true);
+      expect(
+        (await temporaryDirectories()).filter(
+          (directory) => !directoriesBeforeFailedGeneration.has(directory)
+        )
+      ).toHaveLength(0);
+    } finally {
+      AgentSession.prototype.getLastAssistantText =
+        originalGetLastAssistantText;
+      AgentSession.prototype.dispose = originalDispose;
+      Uint8Array.prototype.fill = originalUint8ArrayFill;
+    }
+
+    forcedToolCalls = [true, false];
+    const actorSession = await createPreview(mutationActorBearer);
+    const changeActorPassword = await aiApp.handle(
+      new Request("http://test.local/api/account/password", {
+        body: JSON.stringify({
+          currentPassword: delayedBodyPassword,
+          newPassword: changedDelayedBodyPassword,
+        }),
+        headers: {
+          ...jsonHeaders,
+          Authorization: `Bearer ${mutationActorBearer}`,
+        },
+        method: "POST",
+      })
+    );
+    expect(changeActorPassword.status).toBe(200);
+    expect(await temporaryDirectories()).not.toContain(actorSession.directory);
+    const changedActorSessionStatus = await aiApp.handle(
+      new Request("http://test.local/api/session", {
+        headers: { Authorization: `Bearer ${mutationActorBearer}` },
+      })
+    );
+    expect(changedActorSessionStatus.status).toBe(401);
   } finally {
     restoreAgentSessionHooks?.();
     releasePromptPreflight();
@@ -11006,7 +11277,13 @@ test("Ticket 17 AI Authoring requires Admin consent and uploads a validated DOCX
         )
         .catch(() => undefined);
     }
-    for (const bearer of [otherAdminBearer, userBearer]) {
+    for (const bearer of [
+      otherAdminBearer,
+      userBearer,
+      mutationActorBearer,
+      deletionActorBearer,
+      cleanupTargetBearer,
+    ]) {
       if (bearer) {
         await aiApp
           .handle(

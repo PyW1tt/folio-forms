@@ -259,6 +259,7 @@ export class AiAuthoringSessions {
     Set<PendingGeneration>
   >();
   private readonly endedOwnerSessions = new Set<string>();
+  private readonly endingOwnerSessionCounts = new Map<string, number>();
   constructor(
     private readonly config: OmniRouteConfig | null,
     private readonly now: () => Date = () => new Date()
@@ -501,7 +502,11 @@ export class AiAuthoringSessions {
       return this.preview(sessionId, session);
     } catch (error) {
       await piSession?.abort().catch(() => undefined);
-      piSession?.dispose();
+      try {
+        piSession?.dispose();
+      } catch {
+        // Preserve generation error while still erasing generated data and files.
+      }
       generated?.document.fill(0);
       if (tempDirectory) {
         await rm(tempDirectory, { force: true, recursive: true });
@@ -537,6 +542,10 @@ export class AiAuthoringSessions {
     ownerSessionId: string,
     revokeOwnerSession?: () => Promise<unknown>
   ): Promise<void> {
+    this.endingOwnerSessionCounts.set(
+      ownerSessionId,
+      (this.endingOwnerSessionCounts.get(ownerSessionId) ?? 0) + 1
+    );
     this.endedOwnerSessions.add(ownerSessionId);
     try {
       const pending = [
@@ -577,7 +586,14 @@ export class AiAuthoringSessions {
         throw new AggregateError(errors, "AI authoring sign-out failed");
       }
     } finally {
-      this.endedOwnerSessions.delete(ownerSessionId);
+      const endingCount =
+        (this.endingOwnerSessionCounts.get(ownerSessionId) ?? 1) - 1;
+      if (endingCount === 0) {
+        this.endingOwnerSessionCounts.delete(ownerSessionId);
+        this.endedOwnerSessions.delete(ownerSessionId);
+      } else {
+        this.endingOwnerSessionCounts.set(ownerSessionId, endingCount);
+      }
     }
   }
   async close(): Promise<void> {
@@ -659,10 +675,30 @@ export class AiAuthoringSessions {
     }
     this.sessions.delete(sessionId);
     session.document.document.fill(0);
-    session.piSession.dispose();
     session.prompt = "";
     session.reply = "";
     clearTimeout(session.expiryTimer);
-    await rm(session.tempDirectory, { force: true, recursive: true });
+    let disposeError: unknown;
+    let disposeFailed = false;
+    try {
+      session.piSession.dispose();
+    } catch (error) {
+      disposeError = error;
+      disposeFailed = true;
+    }
+    try {
+      await rm(session.tempDirectory, { force: true, recursive: true });
+    } catch (error) {
+      if (disposeFailed) {
+        throw new AggregateError(
+          [disposeError, error],
+          "AI authoring session cleanup failed"
+        );
+      }
+      throw error;
+    }
+    if (disposeFailed) {
+      throw disposeError;
+    }
   }
 }

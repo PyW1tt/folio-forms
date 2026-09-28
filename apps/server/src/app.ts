@@ -2202,10 +2202,54 @@ function loginError(
   );
 }
 
+async function withAiAuthoringSessionsEnding<T>(
+  aiAuthoring: AiAuthoringSessions,
+  ownerSessionIds: readonly string[],
+  revokeOwnerSessions: () => Promise<T>
+): Promise<T> {
+  const uniqueSessionIds = [...new Set(ownerSessionIds)];
+  if (uniqueSessionIds.length === 0) {
+    return await revokeOwnerSessions();
+  }
+  let revocation: Promise<T> | undefined;
+  const revokeOnce = (): Promise<T> =>
+    (revocation ??= Promise.resolve().then(revokeOwnerSessions));
+  const endings = await Promise.allSettled(
+    uniqueSessionIds.map((sessionId) =>
+      aiAuthoring.endForSession(sessionId, revokeOnce)
+    )
+  );
+  const errors = [
+    ...new Set(
+      endings.flatMap((ending) =>
+        ending.status === "rejected" ? [ending.reason] : []
+      )
+    ),
+  ];
+  if (errors.length === 1) {
+    throw errors[0];
+  }
+  if (errors.length > 1) {
+    throw new AggregateError(errors, "AI authoring session cleanup failed");
+  }
+  return await (revocation ?? revokeOnce());
+}
+
+async function endAiAuthoringSessions(
+  aiAuthoring: AiAuthoringSessions,
+  ownerSessionIds: readonly string[]
+): Promise<void> {
+  await withAiAuthoringSessionsEnding(
+    aiAuthoring,
+    ownerSessionIds,
+    async () => undefined
+  );
+}
 async function handleEmailSignIn(
   request: Request,
   body: unknown,
-  sourceIp: string
+  sourceIp: string,
+  aiAuthoring: AiAuthoringSessions
 ): Promise<globalThis.Response> {
   if (!body || typeof body !== "object" || Array.isArray(body)) {
     return loginError(401, "invalid_credentials");
@@ -2242,7 +2286,15 @@ async function handleEmailSignIn(
   const user = await prisma.user.findUnique({ where: { email } });
   if (!user?.enabled) {
     if (user) {
-      await prisma.session.deleteMany({ where: { userId: user.id } });
+      const sessions = await prisma.session.findMany({
+        select: { id: true },
+        where: { userId: user.id },
+      });
+      await withAiAuthoringSessionsEnding(
+        aiAuthoring,
+        sessions.map(({ id }) => id),
+        () => prisma.session.deleteMany({ where: { userId: user.id } })
+      );
     }
     return loginError(401, "invalid_credentials");
   }
@@ -3329,6 +3381,7 @@ async function createResponseDeletionAudit({
 interface ResponseDeletionResult {
   alreadyDeleted: boolean;
   deleted: boolean;
+  ownerSessionIds: string[];
 }
 
 function responseDeletionPrefixes(
@@ -3352,6 +3405,7 @@ function responseDeletionKeyBelongs(
 
 async function deleteResponseData({
   actor,
+  aiAuthoring,
   allowActiveLease,
   missingOk,
   removeObject,
@@ -3359,6 +3413,7 @@ async function deleteResponseData({
   revokeOwnerSessions,
 }: {
   actor: Identity;
+  aiAuthoring: AiAuthoringSessions;
   allowActiveLease: boolean;
   missingOk: boolean;
   removeObject: (key: string) => Promise<void>;
@@ -3381,7 +3436,7 @@ async function deleteResponseData({
     if (remaining > 0) {
       fail(503, "deletion_cleanup_failed", "Response objects remain");
     }
-    return { alreadyDeleted: true, deleted: true };
+    return { alreadyDeleted: true, deleted: true, ownerSessionIds: [] };
   }
   const result = await prisma.$transaction(
     async (tx) => {
@@ -3395,7 +3450,11 @@ async function deleteResponseData({
       );
       if (!lockedResponse) {
         if (missingOk) {
-          return { alreadyDeleted: false, deleted: false };
+          return {
+            alreadyDeleted: false,
+            deleted: false,
+            ownerSessionIds: [],
+          };
         }
         fail(404, "not_found", "Response was not found");
       }
@@ -3408,7 +3467,11 @@ async function deleteResponseData({
       });
       if (!response) {
         if (missingOk) {
-          return { alreadyDeleted: false, deleted: false };
+          return {
+            alreadyDeleted: false,
+            deleted: false,
+            ownerSessionIds: [],
+          };
         }
         fail(404, "not_found", "Response was not found");
       }
@@ -3614,6 +3677,14 @@ async function deleteResponseData({
           ],
         },
       });
+      const ownerSessionIds = revokeOwnerSessions
+        ? (
+            await tx.session.findMany({
+              select: { id: true },
+              where: { userId: response.userId },
+            })
+          ).map(({ id }) => id)
+        : [];
       if (revokeOwnerSessions) {
         await tx.session.deleteMany({ where: { userId: response.userId } });
       }
@@ -3639,10 +3710,13 @@ async function deleteResponseData({
         targetId: response.id,
         tx,
       });
-      return { alreadyDeleted: false, deleted: true };
+      return { alreadyDeleted: false, deleted: true, ownerSessionIds };
     },
     { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
   );
+  if (result.deleted) {
+    await endAiAuthoringSessions(aiAuthoring, result.ownerSessionIds);
+  }
   if (!result.deleted) {
     return result;
   }
@@ -8589,7 +8663,7 @@ export function createApp(options: AppOptions = {}) {
         options.requestIp?.(request) ??
         server?.requestIP(request)?.address ??
         "unknown";
-      return handleEmailSignIn(request, body, sourceIp);
+      return handleEmailSignIn(request, body, sourceIp, aiAuthoring);
     })
     .get("/api/session", async ({ request }) => {
       const identity = await identityFor(request);
@@ -8677,7 +8751,7 @@ export function createApp(options: AppOptions = {}) {
       }
 
       const passwordHash = await authContext.password.hash(newPassword);
-      await prisma.$transaction(async (tx) => {
+      const revokedOwnerSessionIds = await prisma.$transaction(async (tx) => {
         const update = await tx.account.updateMany({
           data: { password: passwordHash },
           where: { id: account.id, password: currentHash },
@@ -8689,8 +8763,14 @@ export function createApp(options: AppOptions = {}) {
           data: { mustChangePassword: false },
           where: { id: identity.id },
         });
+        const sessions = await tx.session.findMany({
+          select: { id: true },
+          where: { userId: identity.id },
+        });
         await tx.session.deleteMany({ where: { userId: identity.id } });
+        return sessions.map(({ id }) => id);
       });
+      await endAiAuthoringSessions(aiAuthoring, revokedOwnerSessionIds);
       return { ok: true };
     })
     .get("/api/admin/users", async ({ request, query }) => {
@@ -8878,7 +8958,7 @@ export function createApp(options: AppOptions = {}) {
               updateData = { role: input.role };
             }
             setAction(action);
-            const user = await accountTransaction(identity, async (tx) => {
+            const result = await accountTransaction(identity, async (tx) => {
               const target = await lockAccountUser(tx, userId);
               const removesFinalAdmin =
                 target.role === "admin" &&
@@ -8930,6 +9010,14 @@ export function createApp(options: AppOptions = {}) {
                 select: adminUserSelect,
                 where: { id: target.id },
               });
+              const ownerSessionIds = revokeSessions
+                ? (
+                    await tx.session.findMany({
+                      select: { id: true },
+                      where: { userId: target.id },
+                    })
+                  ).map(({ id }) => id)
+                : [];
               if (revokeSessions) {
                 await tx.session.deleteMany({ where: { userId: target.id } });
               }
@@ -8940,9 +9028,10 @@ export function createApp(options: AppOptions = {}) {
                 safeMetadata: { change },
                 targetId: target.id,
               });
-              return updated;
+              return { ownerSessionIds, user: updated };
             });
-            return { user: accountUserSummary(user) };
+            await endAiAuthoringSessions(aiAuthoring, result.ownerSessionIds);
+            return { user: accountUserSummary(result.user) };
           }
         ),
       { parse: "none" }
@@ -8963,7 +9052,7 @@ export function createApp(options: AppOptions = {}) {
             if (Object.keys(input).length !== 1 || input.confirm !== true) {
               fail(400, "invalid_request", "confirm must be true");
             }
-            await accountTransaction(identity, async (tx) => {
+            const revokedOwnerSessionIds = await accountTransaction(identity, async (tx) => {
               const target = await lockAccountUser(tx, userId);
               if (target.role === "admin" && target.enabled) {
                 const enabledAdminCount = await tx.user.count({
@@ -9031,8 +9120,14 @@ export function createApp(options: AppOptions = {}) {
                 safeMetadata: { change: "deleted" },
                 targetId: target.id,
               });
+              const sessions = await tx.session.findMany({
+                select: { id: true },
+                where: { userId: target.id },
+              });
               await tx.user.delete({ where: { id: target.id } });
+              return sessions.map(({ id }) => id);
             });
+            await endAiAuthoringSessions(aiAuthoring, revokedOwnerSessionIds);
             return { deleted: true };
           }
         ),
@@ -9048,7 +9143,7 @@ export function createApp(options: AppOptions = {}) {
           async (identity) => {
             const userId = validateId(params.id, "User");
             const temporaryPassword = generateTemporaryPassword();
-            const user = await accountTransaction(identity, async (tx) => {
+            const result = await accountTransaction(identity, async (tx) => {
               const target = await lockAccountUser(tx, userId);
               const account = await tx.account.findFirst({
                 where: { providerId: "credential", userId: target.id },
@@ -9068,6 +9163,12 @@ export function createApp(options: AppOptions = {}) {
                 select: adminUserSelect,
                 where: { id: target.id },
               });
+              const ownerSessionIds = (
+                await tx.session.findMany({
+                  select: { id: true },
+                  where: { userId: target.id },
+                })
+              ).map(({ id }) => id);
               await tx.session.deleteMany({ where: { userId: target.id } });
               await createAccountAudit(tx, {
                 action: "reset_user_password",
@@ -9076,11 +9177,12 @@ export function createApp(options: AppOptions = {}) {
                 safeMetadata: { change: "password_reset" },
                 targetId: target.id,
               });
-              return updated;
+              return { ownerSessionIds, user: updated };
             });
+            await endAiAuthoringSessions(aiAuthoring, result.ownerSessionIds);
             return {
               temporaryPassword,
-              user: accountUserSummary(user),
+              user: accountUserSummary(result.user),
             };
           }
         ),
@@ -11349,6 +11451,7 @@ export function createApp(options: AppOptions = {}) {
           }
           const result = await deleteResponseData({
             actor: identity,
+            aiAuthoring,
             allowActiveLease: false,
             missingOk: false,
             removeObject,
@@ -11385,6 +11488,7 @@ export function createApp(options: AppOptions = {}) {
       try {
         await deleteResponseData({
           actor: identity,
+          aiAuthoring,
           allowActiveLease: true,
           missingOk: true,
           removeObject,
