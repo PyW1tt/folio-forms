@@ -3270,11 +3270,15 @@ const formAuditErrorCodes: Record<string, true> = {
   unauthorized: true,
 };
 
-function formAuditErrorCode(error: unknown): FormAuditErrorCode {
-  const code = error instanceof HttpError ? error.code : "internal_error";
+function formAuditErrorCodeFromCode(code: string): FormAuditErrorCode {
   return formAuditErrorCodes[code]
     ? (code as FormAuditErrorCode)
     : "internal_error";
+}
+
+function formAuditErrorCode(error: unknown): FormAuditErrorCode {
+  const code = error instanceof HttpError ? error.code : "internal_error";
+  return formAuditErrorCodeFromCode(code);
 }
 
 async function createFormAudit(
@@ -5857,7 +5861,7 @@ async function updateOperationFailed(
             : "save_template_draft",
         actorId: current.actorId,
         outcome: AuditOutcome.failure,
-        safeMetadata: { errorCode },
+        safeMetadata: { errorCode: formAuditErrorCodeFromCode(errorCode) },
         targetId,
       });
     }

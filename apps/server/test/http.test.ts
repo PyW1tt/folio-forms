@@ -1719,7 +1719,7 @@ test("Ticket 06 native text forms preserve drafts, Prefill, and Fill Method", as
   }
   const getNativeConfig = async (): Promise<NativeResponseConfig> => {
     const response = await app.handle(
-      new Request(new URL(editorConfigUrl, "http://test.local"), {
+      new Request(new URL(editorConfigUrl, "http://test.local").toString(), {
         headers: { Authorization: `Bearer ${userBearer}` },
       })
     );
@@ -1899,6 +1899,10 @@ test("Ticket 06 native text forms preserve drafts, Prefill, and Fill Method", as
     select: { draftData: true, draftDocumentKey: true, draftObjectKey: true },
     where: { id: responseId },
   });
+  const savedDraftDocumentKey = savedResponse.draftDocumentKey;
+  if (!savedDraftDocumentKey) {
+    throw new Error("The saved Ticket 06 draft has no document key");
+  }
   expect(savedResponse.draftData).toEqual({
     comments: "Saved native answer",
     full_name: "Trusted Prefill",
@@ -1977,7 +1981,7 @@ test("Ticket 06 native text forms preserve drafts, Prefill, and Fill Method", as
   }
   const onlyOfficeConfigResponse = await app.handle(
     new Request(
-      new URL(onlyOfficeStart.editorConfigUrl, "http://test.local"),
+      new URL(onlyOfficeStart.editorConfigUrl, "http://test.local").toString(),
       { headers: { Authorization: `Bearer ${userBearer}` } }
     )
   );
@@ -1987,7 +1991,7 @@ test("Ticket 06 native text forms preserve drafts, Prefill, and Fill Method", as
   };
   expect(onlyOfficeConfig.fillMethod).toBe("onlyoffice");
   expect(onlyOfficeConfig.config?.document?.key).toBe(
-    savedResponse.draftDocumentKey
+    savedDraftDocumentKey
   );
   const nativeAgainResponse = await patchFillMethod("native");
   expect(nativeAgainResponse.status).toBe(200);
