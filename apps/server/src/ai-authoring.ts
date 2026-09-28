@@ -419,6 +419,11 @@ export class AiAuthoringSessions {
       }
       await piSession.prompt(promptFor(prompt.trim()), {
         expandPromptTemplates: false,
+        preflightResult: (accepted) => {
+          if (accepted && pending.cancelled) {
+            throw new Error("AI authoring generation was cancelled");
+          }
+        },
         source: "rpc",
       });
       if (pending.cancelled) {
@@ -479,19 +484,31 @@ export class AiAuthoringSessions {
     await this.dispose(sessionId, session);
   }
 
-  async endForSession(ownerSessionId: string): Promise<void> {
+  async endForSession(
+    ownerSessionId: string,
+    revokeOwnerSession?: () => Promise<unknown>
+  ): Promise<void> {
     this.endedOwnerSessions.add(ownerSessionId);
-    const pending = [...(this.pendingGenerations.get(ownerSessionId) ?? [])];
-    for (const generation of pending) {
-      generation.cancelled = true;
-    }
-    await Promise.allSettled(
-      pending.map((generation) => generation.piSession?.abort())
-    );
-    await Promise.all(pending.map((generation) => generation.done));
-    for (const [sessionId, session] of this.sessions) {
-      if (session.ownerSessionId === ownerSessionId) {
-        await this.dispose(sessionId, session);
+    let ownerSessionRevoked = !revokeOwnerSession;
+    try {
+      const pending = [...(this.pendingGenerations.get(ownerSessionId) ?? [])];
+      for (const generation of pending) {
+        generation.cancelled = true;
+      }
+      await Promise.allSettled(
+        pending.map((generation) => generation.piSession?.abort())
+      );
+      await Promise.all(pending.map((generation) => generation.done));
+      for (const [sessionId, session] of this.sessions) {
+        if (session.ownerSessionId === ownerSessionId) {
+          await this.dispose(sessionId, session);
+        }
+      }
+      await revokeOwnerSession?.();
+      ownerSessionRevoked = true;
+    } finally {
+      if (ownerSessionRevoked) {
+        this.endedOwnerSessions.delete(ownerSessionId);
       }
     }
   }

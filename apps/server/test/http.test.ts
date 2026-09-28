@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 
+import { AgentSession } from "@earendil-works/pi-coding-agent";
 import { auth, ensureBootstrapAdmin } from "@onlyoffice/auth";
 import { prisma } from "@onlyoffice/db";
 import { strToU8, unzipSync, zipSync } from "fflate";
@@ -15,6 +16,7 @@ import {
 } from "prefill-mock/mock";
 import type { LegacySsoMockServer, PrefillMockServer } from "prefill-mock/mock";
 
+import { AiAuthoringSessions } from "../src/ai-authoring";
 import {
   createApp,
   type LegacySsoConfig,
@@ -10204,6 +10206,36 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   }
   expect(tombstoneMutationBlocked).toBe(true);
 });
+test("Ticket 17 sign-out tombstones clear after auth revocation", async () => {
+  const authoring = new AiAuthoringSessions(null);
+  const endedOwnerSessions = Reflect.get(
+    authoring,
+    "endedOwnerSessions"
+  ) as Set<string>;
+  let releaseRevocation!: () => void;
+  const revocationGate = new Promise<void>((resolve) => {
+    releaseRevocation = resolve;
+  });
+  let notifyRevocationStarted!: () => void;
+  const revocationStarted = new Promise<void>((resolve) => {
+    notifyRevocationStarted = resolve;
+  });
+
+  const ending = authoring.endForSession("normal-sign-out", async () => {
+    notifyRevocationStarted();
+    await revocationGate;
+  });
+  await revocationStarted;
+  expect(endedOwnerSessions.has("normal-sign-out")).toBe(true);
+  releaseRevocation();
+  await ending;
+  expect(endedOwnerSessions.size).toBe(0);
+
+  for (const ownerSessionId of ["normal-sign-out-2", "normal-sign-out-3"]) {
+    await authoring.endForSession(ownerSessionId, async () => undefined);
+  }
+  expect(endedOwnerSessions.size).toBe(0);
+});
 test("Ticket 17 AI Authoring requires Admin consent and uploads a validated DOCX", async () => {
   const model = "ticket-17-local-model";
   const serviceKey = `ticket-17-local-only-${crypto.randomUUID()}`;
@@ -10234,6 +10266,20 @@ test("Ticket 17 AI Authoring requires Admin consent and uploads a validated DOCX
   const providerAborted = new Promise<void>((resolve) => {
     notifyProviderAborted = resolve;
   });
+  let blockNextPromptPreflight = false;
+  let notifyPromptPreflightPaused!: () => void;
+  const promptPreflightPaused = new Promise<void>((resolve) => {
+    notifyPromptPreflightPaused = resolve;
+  });
+  let releasePromptPreflight!: () => void;
+  const promptPreflightGate = new Promise<void>((resolve) => {
+    releasePromptPreflight = resolve;
+  });
+  let notifyPromptAbortRequested!: () => void;
+  const promptAbortRequested = new Promise<void>((resolve) => {
+    notifyPromptAbortRequested = resolve;
+  });
+  let restoreAgentSessionHooks: (() => void) | undefined;
   const upstream = Bun.serve({
     fetch: async (request) => {
       upstreamCalls += 1;
@@ -10656,16 +10702,88 @@ test("Ticket 17 AI Authoring requires Admin consent and uploads a validated DOCX
 
     const third = await createPreview(adminBearer);
     activeSessionId = third.session.sessionId;
-    const signOutResponse = await aiApp.handle(
+    const agentPrototype = AgentSession.prototype as unknown as Record<
+      string,
+      unknown
+    >;
+    const originalNormalizePromptImages =
+      agentPrototype._normalizePromptImages;
+    if (typeof originalNormalizePromptImages !== "function") {
+      throw new Error("Pi AgentSession lacks prompt image normalization");
+    }
+    const normalizePromptImages = originalNormalizePromptImages as (
+      this: AgentSession,
+      images: unknown
+    ) => Promise<unknown>;
+    const originalAbort = AgentSession.prototype.abort;
+    agentPrototype._normalizePromptImages = async function (
+      this: AgentSession,
+      images: unknown
+    ): Promise<unknown> {
+      if (blockNextPromptPreflight) {
+        blockNextPromptPreflight = false;
+        notifyPromptPreflightPaused();
+        await promptPreflightGate;
+      }
+      return await normalizePromptImages.call(this, images);
+    };
+    AgentSession.prototype.abort = async function (
+      this: AgentSession
+    ): Promise<void> {
+      notifyPromptAbortRequested();
+      await originalAbort.call(this);
+    };
+    restoreAgentSessionHooks = () => {
+      agentPrototype._normalizePromptImages = originalNormalizePromptImages;
+      AgentSession.prototype.abort = originalAbort;
+    };
+
+    const directoriesBeforePreflight = new Set(await temporaryDirectories());
+    blockNextPromptPreflight = true;
+    const preflightCreate = aiApp.handle(
+      new Request("http://test.local/api/admin/ai-authoring/sessions", {
+        body: JSON.stringify({
+          consent: true,
+          prompt: "Create an equipment request form",
+        }),
+        headers: {
+          ...jsonHeaders,
+          Authorization: `Bearer ${adminBearer}`,
+        },
+        method: "POST",
+      })
+    );
+    await promptPreflightPaused;
+    const preflightDirectories = (await temporaryDirectories()).filter(
+      (directory) => !directoriesBeforePreflight.has(directory)
+    );
+    expect(preflightDirectories).toHaveLength(1);
+    const preflightDirectory = preflightDirectories[0];
+    if (!preflightDirectory) {
+      throw new Error("Preflight AI Authoring did not create its temporary directory");
+    }
+    const signOutPreflight = aiApp.handle(
       new Request("http://test.local/api/auth/sign-out", {
         headers: { Authorization: `Bearer ${adminBearer}` },
         method: "POST",
       })
     );
+    await promptAbortRequested;
+    releasePromptPreflight();
+    const [preflightResponse, signOutResponse] = await Promise.all([
+      preflightCreate,
+      signOutPreflight,
+    ]);
     expect(signOutResponse.status).toBe(200);
+    expect(preflightResponse.status).toBe(502);
     signedOut = true;
     activeSessionId = undefined;
     expect(await temporaryDirectories()).not.toContain(third.directory);
+    expect(await temporaryDirectories()).not.toContain(preflightDirectory);
+    expect(upstreamCalls).toBe(6);
+    restoreAgentSessionHooks?.();
+    restoreAgentSessionHooks = undefined;
+
     const directoriesBeforePending = new Set(await temporaryDirectories());
     blockNextProviderRequest = true;
     const pendingCreate = aiApp.handle(
@@ -10708,6 +10826,8 @@ test("Ticket 17 AI Authoring requires Admin consent and uploads a validated DOCX
     expect(upstreamCalls).toBe(7);
 
   } finally {
+    restoreAgentSessionHooks?.();
+    releasePromptPreflight();
     if (formPublicId && adminBearer && !signedOut) {
       await aiApp
         .handle(

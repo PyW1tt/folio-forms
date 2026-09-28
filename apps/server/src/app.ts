@@ -9090,8 +9090,9 @@ export function createApp(options: AppOptions = {}) {
     .post("/api/auth/sign-out", async ({ request }) => {
       const identity = await identityFor(request);
       if (identity) {
-        await aiAuthoring.endForSession(identity.sessionId);
-        await prisma.session.deleteMany({ where: { id: identity.sessionId } });
+        await aiAuthoring.endForSession(identity.sessionId, () =>
+          prisma.session.deleteMany({ where: { id: identity.sessionId } })
+        );
       }
       return { ok: true };
     })
