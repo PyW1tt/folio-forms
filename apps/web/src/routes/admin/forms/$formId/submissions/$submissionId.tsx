@@ -25,33 +25,42 @@ const SubmissionDetailRoute = () => {
   const [documentAvailable, setDocumentAvailable] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [historyError, setHistoryError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
+    const loadHistory = async (responseId: string) => {
+      try {
+        const history = await apiGet<ResponseRevisionsResponse>(
+          `/api/responses/${responseId}/corrections`
+        );
+        if (!cancelled) {
+          const latestRevision = history.revisions.at(-1);
+          setPictures(latestRevision?.pictures ?? null);
+          setDocumentAvailable(Boolean(latestRevision?.document.available));
+        }
+      } catch {
+        if (!cancelled) {
+          setHistoryError("Could not load correction history.");
+        }
+      }
+    };
     const loadSubmission = async () => {
+      setHistoryError(null);
       try {
         const payload = await apiGet<{
           data: Record<string, unknown>;
           fields: ReceiptField[];
           submission: Submission;
         }>(`/api/submissions/${submissionId}/data?revision=latest`);
-        const history = payload.submission.responseId
-          ? await apiGet<ResponseRevisionsResponse>(
-              `/api/responses/${payload.submission.responseId}/corrections`
-            )
-          : null;
-        if (!cancelled) {
-          const latestRevision = history?.revisions.at(-1);
-          setSubmission(payload.submission);
-          setData(payload.data);
-          setFields(payload.fields);
-          setPictures(latestRevision?.pictures ?? null);
-          setDocumentAvailable(
-            Boolean(
-              payload.submission.responseId &&
-                latestRevision?.document.available
-            )
-          );
+        if (cancelled) {
+          return;
+        }
+        setSubmission(payload.submission);
+        setData(payload.data);
+        setFields(payload.fields);
+        if (payload.submission.responseId) {
+          void loadHistory(payload.submission.responseId);
         }
       } catch (caughtError) {
         if (!cancelled) {
@@ -126,6 +135,11 @@ const SubmissionDetailRoute = () => {
   return (
     <div>
       {backLink}
+      {historyError ? (
+        <div className="mb-4">
+          <Notice tone="danger">{historyError}</Notice>
+        </div>
+      ) : null}
       <div className="mb-7 flex flex-wrap items-end justify-between gap-4">
         <div>
           <div className="mb-2 flex items-center gap-2">

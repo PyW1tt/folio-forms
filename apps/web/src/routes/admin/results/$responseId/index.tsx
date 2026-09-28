@@ -196,7 +196,7 @@ const AdminResultDetailRoute = () => {
     setHistoryError(null);
     const loadHistory = async () => {
       try {
-        const [payload, submissionData] = await Promise.all([
+        const [historyResult, submissionDataResult] = await Promise.allSettled([
           apiGet<ResponseRevisionsResponse>(
             `/api/responses/${responseId}/corrections`
           ),
@@ -205,14 +205,15 @@ const AdminResultDetailRoute = () => {
           ),
         ]);
         if (!cancelled) {
-          setHistory(payload.revisions);
-          setFields(submissionData.fields);
-        }
-      } catch {
-        if (!cancelled) {
-          setHistory([]);
-          setFields([]);
-          setHistoryError("โหลดประวัติ Correction ไม่สำเร็จ กรุณาลองใหม่");
+          if (historyResult.status === "fulfilled") {
+            setHistory(historyResult.value.revisions);
+          } else {
+            setHistory([]);
+            setHistoryError("โหลดประวัติ Correction ไม่สำเร็จ กรุณาลองใหม่");
+          }
+          if (submissionDataResult.status === "fulfilled") {
+            setFields(submissionDataResult.value.fields);
+          }
         }
       } finally {
         if (!cancelled) {
