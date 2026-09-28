@@ -75,6 +75,7 @@ interface AuthoringSession {
 interface PendingGeneration {
   cancelled: boolean;
   done: Promise<void>;
+  disposeError?: { cause: unknown };
   finish: () => void;
   piSession?: AgentSession;
   reservation: AuthoringRequestReservation;
@@ -504,7 +505,8 @@ export class AiAuthoringSessions {
       await piSession?.abort().catch(() => undefined);
       try {
         piSession?.dispose();
-      } catch {
+      } catch (disposeError) {
+        pending.disposeError = { cause: disposeError };
         // Preserve generation error while still erasing generated data and files.
       }
       generated?.document.fill(0);
@@ -548,6 +550,7 @@ export class AiAuthoringSessions {
     );
     this.endedOwnerSessions.add(ownerSessionId);
     try {
+      const errors: unknown[] = [];
       const pending = [
         ...(this.pendingGenerations.get(ownerSessionId) ?? []),
       ];
@@ -559,12 +562,16 @@ export class AiAuthoringSessions {
         active.map((generation) => generation.piSession?.abort())
       );
       await Promise.all(active.map((generation) => generation.done));
+      for (const generation of active) {
+        if (generation.disposeError) {
+          errors.push(generation.disposeError.cause);
+        }
+      }
       for (const generation of pending) {
         if (!generation.started) {
           this.finishPending(ownerSessionId, generation);
         }
       }
-      const errors: unknown[] = [];
       for (const [sessionId, session] of this.sessions) {
         if (session.ownerSessionId === ownerSessionId) {
           try {

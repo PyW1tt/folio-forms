@@ -9883,9 +9883,54 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     password,
     `ticket-17-ai-cleanup-${crypto.randomUUID()}`
   );
+  const cleanupAfterAiHandoff = await app.handle(
+    new Request("http://test.local/api/integrations/prefill/handoffs", {
+      body: JSON.stringify({
+        email: otherUserEmail,
+        externalReference: `ticket-17-ai-cleanup-${crypto.randomUUID()}`,
+        publicId: formRecord.publicId,
+        values: handoffCandidateValues,
+      }),
+      headers: {
+        ...jsonHeaders,
+        "X-Prefill-Handoff-Secret": prefillHandoffSecret,
+      },
+      method: "POST",
+    })
+  );
+  expect(cleanupAfterAiHandoff.status).toBe(200);
+  const cleanupAfterAiHandoffBody: unknown =
+    await cleanupAfterAiHandoff.json();
+  if (
+    !cleanupAfterAiHandoffBody ||
+    typeof cleanupAfterAiHandoffBody !== "object" ||
+    !("code" in cleanupAfterAiHandoffBody) ||
+    typeof cleanupAfterAiHandoffBody.code !== "string" ||
+    !cleanupAfterAiHandoffBody.code
+  ) {
+    throw new Error("The AI cleanup handoff was not created");
+  }
+  const cleanupAfterAiHandoffCode = cleanupAfterAiHandoffBody.code;
+  const cleanupAfterAiLaunch = await app.handle(
+    new Request("http://test.local/prefill/handoff", {
+      body: new URLSearchParams({ code: cleanupAfterAiHandoffCode }),
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      method: "POST",
+    })
+  );
+  expect(cleanupAfterAiLaunch.status).toBe(303);
+  const cleanupAfterAiPendingCookie = cleanupAfterAiLaunch.headers
+    .get("set-cookie")
+    ?.split(";", 1)[0];
+  if (!cleanupAfterAiPendingCookie) {
+    throw new Error("The AI cleanup handoff did not set a pending claim cookie");
+  }
   const cleanupAfterAiStart = await app.handle(
     new Request(`http://test.local/api/forms/${formRecord.publicId}/start`, {
-      headers: { Authorization: `Bearer ${cleanupAfterAiBearer}` },
+      headers: {
+        Authorization: `Bearer ${cleanupAfterAiBearer}`,
+        Cookie: cleanupAfterAiPendingCookie,
+      },
       method: "POST",
     })
   );
@@ -10515,6 +10560,21 @@ test("Ticket 17 authoring shutdown cleans every active session after errors", as
       userId: string;
     }
   >;
+  const pendingGenerations = Reflect.get(
+    authoring,
+    "pendingGenerations"
+  ) as Map<
+    string,
+    Set<{
+      cancelled: boolean;
+      disposeError?: { cause: unknown };
+      done: Promise<void>;
+      finish: () => void;
+      piSession?: { abort: () => Promise<void> };
+      reservation: { ownerSessionId: string };
+      started: boolean;
+    }>
+  >;
   const firstDirectory = await mkdtemp(
     join(tmpdir(), "folio-authoring-close-first-")
   );
@@ -10527,6 +10587,7 @@ test("Ticket 17 authoring shutdown cleans every active session after errors", as
   const secondExpiry = vi.fn();
   const secondDispose = vi.fn();
   const disposeError = new Error("Pi disposal failed");
+  const pendingDisposeError = new Error("Pending Pi disposal failed");
   vi.useFakeTimers();
   try {
     sessions.set("close-first", {
@@ -10556,7 +10617,31 @@ test("Ticket 17 authoring shutdown cleans every active session after errors", as
       userId: "second-user",
     });
 
-    await expect(authoring.close()).rejects.toBe(disposeError);
+    const pendingReservation = authoring.reserveRequest("close-owner-pending");
+    const pendingGeneration = [
+      ...(pendingGenerations.get("close-owner-pending") ?? []),
+    ][0];
+    if (!pendingGeneration) {
+      throw new Error("The pending shutdown generation was not reserved");
+    }
+    pendingGeneration.started = true;
+    pendingGeneration.disposeError = { cause: pendingDisposeError };
+    pendingGeneration.piSession = {
+      abort: async () => authoring.releaseRequest(pendingReservation),
+    };
+    let closeError: unknown;
+    try {
+      await authoring.close();
+    } catch (error) {
+      closeError = error;
+    }
+    if (!(closeError instanceof AggregateError)) {
+      throw new Error("AI authoring shutdown did not aggregate cleanup failures");
+    }
+    expect(closeError.errors).toEqual([
+      pendingDisposeError,
+      disposeError,
+    ]);
     expect(firstDocument).toEqual(new Uint8Array([0, 0]));
     expect(secondDocument).toEqual(new Uint8Array([0, 0]));
     expect(secondDispose).toHaveBeenCalledTimes(1);
@@ -11219,6 +11304,8 @@ test("Ticket 17 AI Authoring requires Admin consent and uploads a validated DOCX
     restoreAgentSessionHooks?.();
     restoreAgentSessionHooks = undefined;
 
+    forcedToolCalls = [true, false];
+    const laterSession = await createPreview(otherAdminBearer);
     const directoriesBeforePending = new Set(await temporaryDirectories());
     blockNextProviderRequest = true;
     const pendingCreate = aiApp.handle(
@@ -11243,22 +11330,41 @@ test("Ticket 17 AI Authoring requires Admin consent and uploads a validated DOCX
     if (!pendingDirectory) {
       throw new Error("Pending AI Authoring did not create its temporary directory");
     }
-    const signOutPending = aiApp.handle(
-      new Request("http://test.local/api/auth/sign-out", {
-        headers: { Authorization: `Bearer ${otherAdminBearer}` },
-        method: "POST",
-      })
-    );
-    await providerAborted;
-    releaseProviderResponse();
-    const [pendingResponse, pendingSignOutResponse] = await Promise.all([
-      pendingCreate,
-      signOutPending,
-    ]);
-    expect(pendingSignOutResponse.status).toBe(200);
+    const pendingDisposeError = new Error("Pending AI authoring cleanup failed");
+    const originalDispose = AgentSession.prototype.dispose;
+    let pendingDisposeFailed = false;
+    AgentSession.prototype.dispose = function (this: AgentSession): void {
+      if (!pendingDisposeFailed) {
+        pendingDisposeFailed = true;
+        throw pendingDisposeError;
+      }
+      originalDispose.call(this);
+    };
+    let pendingResponses: [Response, Response];
+    try {
+      const signOutPending = aiApp.handle(
+        new Request("http://test.local/api/auth/sign-out", {
+          headers: { Authorization: `Bearer ${otherAdminBearer}` },
+          method: "POST",
+        })
+      );
+      await providerAborted;
+      releaseProviderResponse();
+      pendingResponses = await Promise.all([pendingCreate, signOutPending]);
+    } finally {
+      AgentSession.prototype.dispose = originalDispose;
+    }
+    const [pendingResponse, pendingSignOutResponse] = pendingResponses;
+    expect(pendingSignOutResponse.status).toBe(500);
+    expect(await pendingSignOutResponse.json()).toMatchObject({
+      error: "sign_out_cleanup_failed",
+      sessionRevoked: true,
+    });
+    expect(pendingDisposeFailed).toBe(true);
     expect(pendingResponse.status).toBe(502);
     expect(await temporaryDirectories()).not.toContain(pendingDirectory);
-    expect(upstreamCalls).toBe(7);
+    expect(await temporaryDirectories()).not.toContain(laterSession.directory);
+    expect(upstreamCalls).toBe(9);
 
     mutationActorBearer = await bearerFor(
       delayedBodyAdmin.email,
