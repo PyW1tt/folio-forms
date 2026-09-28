@@ -160,7 +160,9 @@ Each privileged account attempt appends an immutable Audit Event with its actor,
 6. Select **Save Template** and wait for its Operation. A completed save is the exact Draft reopened later; a failed save leaves the prior Draft available for retry.
 7. Select **Publish** when the template is ready.
 8. Copy the generated share link.
-9. Review submitted responses from the form's **View submissions** page.
+9. Review submitted responses from the form's **View submissions** page or `/admin/results`.
+
+Submitted result details open the latest effective revision in separate read-only **Document** and **Fields** tabs. The Document tab uses ONLYOFFICE view mode; DOCX and PDF downloads remain available. Open **Correction** separately to edit a submitted response. Draft JSON is not shown in Admin result details.
 
 The Admin Form list shows lifecycle state plus active Draft and Submission counts without exposing database IDs or RustFS object keys. Only a never-published Draft with no Response data can be hard-deleted; deletion removes its Template Draft objects. Create, save, and delete outcomes append attributable, secret-free Form Audit Events. Published Forms keep the same opaque share ID, Published Template, Field Manifest, and Prefill Configuration when an Admin changes only the title or description. Structural or policy changes use **Duplicate Form** instead: the source DOCX and rules are copied into a new editable Draft with a new share ID, while Responses, Submissions, Operations, Leases, and source Audit Events remain with the source. The duplicate can be edited or deleted independently; a Published Form cannot be hard-deleted or returned to Draft.
 
@@ -373,7 +375,9 @@ X-Editor-Capability: <signed-action-or-operation-capability>
 | `/admin/forms/new` | Admin | Create from the starter or upload a validated DOCX |
 | `/admin/forms/:formId` | Admin | Edit under an exclusive lease, save, publish, and share a template |
 | `/admin/forms/:formId/submissions` | Admin | Review form submissions |
-| `/admin/forms/:formId/submissions/:submissionId` | Admin | Read a submission and download artifacts |
+| `/admin/forms/:formId/submissions/:submissionId` | Admin | Read the latest submission in read-only Document and Fields tabs; download DOCX or PDF |
+| `/admin/results` | Admin | Review all responses and open latest read-only Document and Fields views |
+| `/admin/results/:responseId` | Admin | Read the latest effective revision; download original or latest DOCX/PDF; open Correction separately |
 | `/forms/:publicId/fill` | Authenticated | Fill, save, or submit a shared form |
 | `/receipt/:submissionId` | Authorized | Read a completed submission receipt |
 

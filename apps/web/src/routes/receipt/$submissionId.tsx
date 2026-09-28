@@ -3,6 +3,7 @@ import { createFileRoute, Link, useParams } from "@tanstack/react-router";
 import { ArrowLeft, CheckCircle2, Download, FileText } from "lucide-react";
 import { useEffect, useState } from "react";
 
+import { SubmissionFields } from "@/components/submission-result-viewer";
 import { Badge, Card, Notice, Spinner } from "@/components/ui";
 import {
   ApiError,
@@ -30,34 +31,6 @@ const receiptErrorMessage = (error: unknown): string => {
     }
   }
   return "โหลดใบรับคำตอบไม่ได้ กรุณาลองใหม่";
-};
-const receiptFieldValue = (
-  field: ReceiptField,
-  value: unknown,
-  picturePresent?: boolean
-): string => {
-  if (field.type === "picture") {
-    if (picturePresent === undefined) {
-      return "รูปภาพตรวจสอบไม่ได้";
-    }
-    return picturePresent ? "มีรูปภาพแนบ" : "ไม่มีรูปภาพ";
-  }
-  if (value === null || value === undefined || value === "") {
-    return "—";
-  }
-  if (field.type === "checkbox" && typeof value === "boolean") {
-    return value ? "ใช่" : "ไม่ใช่";
-  }
-  if (typeof value === "string") {
-    return (
-      field.options.find((option) => option.value === value)?.displayText ??
-      value
-    );
-  }
-  if (typeof value === "number") {
-    return String(value);
-  }
-  return "มีข้อมูลที่บันทึกแล้ว";
 };
 const ReceiptRoute = () => {
   const { submissionId } = useParams({ from: "/receipt/$submissionId" });
@@ -266,24 +239,11 @@ const ReceiptRoute = () => {
             </ol>
           </div>
           <div className="p-5 sm:p-7">
-            <h2 className="mb-4 font-semibold">ข้อมูลคำตอบ</h2>
-            <dl className="space-y-3">
-              {fields.map((field) => (
-                <div
-                  className="rounded-[10px] border border-[var(--line)] p-4"
-                  key={field.tag}
-                >
-                  <dt className="font-semibold">{field.label}</dt>
-                  <dd className="mt-2 whitespace-pre-wrap break-words text-[var(--ink-soft)]">
-                    {receiptFieldValue(
-                      field,
-                      displayedData[field.tag],
-                      selectedPictures?.[field.tag]
-                    )}
-                  </dd>
-                </div>
-              ))}
-            </dl>
+            <SubmissionFields
+              data={displayedData}
+              fields={fields}
+              pictures={selectedPictures}
+            />
           </div>
         </Card>
       </div>

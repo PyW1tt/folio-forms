@@ -42,6 +42,7 @@ import {
   createOnlyOfficeClient,
   editorConfig,
   pluginGuid,
+  readOnlyViewerConfig,
   verifyDocumentAccessToken,
   verifyEditorCapability,
   verifyOnlyOfficeAuthorization,
@@ -10768,6 +10769,86 @@ export function createApp(options: AppOptions = {}) {
         },
       };
     })
+    .get(
+      "/api/admin/results/:id/viewer-config",
+      async ({ request, params, query }) => {
+        const identity = await requireIdentity(request);
+        requireAdmin(identity);
+        validateId(params.id, "Response");
+        if (
+          query.revision !== undefined &&
+          query.revision !== "original" &&
+          query.revision !== "latest"
+        ) {
+          fail(400, "invalid_request", "revision must be original or latest");
+        }
+        const response = await prisma.response.findUnique({
+          include: {
+            corrections: {
+              orderBy: { revision: "desc" },
+              select: {
+                documentKey: true,
+                id: true,
+                objectKey: true,
+                revision: true,
+              },
+              take: 1,
+            },
+            form: { select: { publicId: true } },
+            submission: {
+              select: { documentKey: true, id: true, objectKey: true },
+            },
+          },
+          where: { id: params.id },
+        });
+        if (
+          !response ||
+          (response.status === ResponseStatus.submitted &&
+            !response.submission)
+        ) {
+          fail(404, "not_found", "Response was not found");
+        }
+        const submitted = response.status === ResponseStatus.submitted;
+        const selectedCorrection =
+          submitted && query.revision !== "original"
+            ? response.corrections[0]
+            : undefined;
+        const documentKey = submitted
+          ? (selectedCorrection?.documentKey ?? response.submission?.documentKey)
+          : response.draftDocumentKey;
+        const documentObjectKey = submitted
+          ? (selectedCorrection?.objectKey ?? response.submission?.objectKey)
+          : response.draftObjectKey;
+        if (
+          !documentKey ||
+          !documentObjectKey ||
+          !(await objectExists(documentObjectKey))
+        ) {
+          fail(409, "document_unavailable", "Response document is unavailable");
+        }
+        await createResponseAudit({
+          action: selectedCorrection ? "view_correction" : "view_response",
+          actorId: identity.id,
+          outcome: AuditOutcome.success,
+          safeMetadata: {
+            revision: selectedCorrection?.revision ?? 0,
+            state: submitted ? "submitted" : "draft",
+          },
+          targetId:
+            selectedCorrection?.id ??
+            (submitted ? (response.submission?.id ?? response.id) : response.id),
+          targetType: selectedCorrection
+            ? "correction"
+            : submitted
+              ? "submission"
+              : "response",
+        });
+        return readOnlyViewerConfig(documentKey, response.form.publicId, {
+          id: identity.id,
+          name: identity.name,
+        });
+      }
+    )
     .get(
       "/api/admin/results/:id/correction/editor-config",
       async ({ request, params }) => {

@@ -259,6 +259,7 @@ export const OnlyOfficeEditor = ({
   onBridgeMessage,
   onDirtyChange,
   onStateChange,
+  readOnly = false,
   revision = 0,
   saveAction = "save-draft",
   saveReason = "",
@@ -270,6 +271,7 @@ export const OnlyOfficeEditor = ({
   onBridgeMessage?: (message: EditorBridgeMessage) => void | Promise<void>;
   onDirtyChange?: (dirty: boolean) => void;
   onStateChange?: (state: OnlyOfficeEditorState) => void;
+  readOnly?: boolean;
   revision?: number;
   saveAction?: "save-draft" | "save-correction";
   saveReason?: string;
@@ -497,18 +499,19 @@ export const OnlyOfficeEditor = ({
       return;
     }
 
-    const bridgeId = config.bridge?.id;
-    const pluginOrigin = config.bridge?.pluginOrigin;
+    const bridgeId = isNonEmptyString(config.bridge?.id)
+      ? config.bridge.id
+      : "";
+    const pluginOrigin = isNonEmptyString(config.bridge?.pluginOrigin)
+      ? config.bridge.pluginOrigin
+      : "";
+    const hasBridge = bridgeId.length > 0 && pluginOrigin.length > 0;
     if (
-      typeof bridgeId !== "string" ||
-      !bridgeId ||
-      typeof pluginOrigin !== "string" ||
-      !pluginOrigin
+      (readOnly && config.bridge !== undefined) ||
+      (!readOnly && !hasBridge && !config.editorUrl)
     ) {
-      if (!config.editorUrl) {
-        setError("การตั้งค่าตัวแก้ไขเอกสารไม่ถูกต้อง");
-        reportState("error");
-      }
+      setError("การตั้งค่าตัวแก้ไขเอกสารไม่ถูกต้อง");
+      reportState("error");
       return;
     }
     let cancelled = false;
@@ -655,7 +658,9 @@ export const OnlyOfficeEditor = ({
       onBridgeMessageRef.current?.(message);
     };
 
-    window.addEventListener("message", handleBridgeMessage);
+    if (hasBridge) {
+      window.addEventListener("message", handleBridgeMessage);
+    }
 
     if (config.editorUrl || !hostRef.current) {
       return () => {
@@ -727,7 +732,7 @@ export const OnlyOfficeEditor = ({
         mountedHost?.replaceChildren();
       }
     };
-  }, [config, configUrl, editorId, reportState]);
+  }, [config, configUrl, editorId, readOnly, reportState]);
 
   const retry = () => {
     setError(null);

@@ -1,11 +1,16 @@
 // oxlint-disable unicorn(filename-case) -- TanStack Router requires this dynamic route filename.
 import { createFileRoute, Link, useParams } from "@tanstack/react-router";
-import { ArrowLeft, Download, FileJson, FileText } from "lucide-react";
+import { ArrowLeft, Download, FileText } from "lucide-react";
 import { useEffect, useState } from "react";
 
+import { SubmissionResultViewer } from "@/components/submission-result-viewer";
 import { Badge, Card, Notice, Spinner } from "@/components/ui";
-import { downloadArtifact, apiGet, formatDate } from "@/lib/api";
-import type { Submission } from "@/lib/api";
+import { apiGet, downloadArtifact, formatDate } from "@/lib/api";
+import type {
+  ReceiptField,
+  ResponseRevisionsResponse,
+  Submission,
+} from "@/lib/api";
 
 const SubmissionDetailRoute = () => {
   const { formId, submissionId } = useParams({
@@ -13,6 +18,11 @@ const SubmissionDetailRoute = () => {
   });
   const [submission, setSubmission] = useState<Submission | null>(null);
   const [data, setData] = useState<Record<string, unknown> | null>(null);
+  const [fields, setFields] = useState<ReceiptField[]>([]);
+  const [pictures, setPictures] = useState<Record<string, boolean> | null>(
+    null
+  );
+  const [documentAvailable, setDocumentAvailable] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -21,12 +31,27 @@ const SubmissionDetailRoute = () => {
     const loadSubmission = async () => {
       try {
         const payload = await apiGet<{
-          submission: Submission;
           data: Record<string, unknown>;
-        }>(`/api/submissions/${submissionId}/data`);
+          fields: ReceiptField[];
+          submission: Submission;
+        }>(`/api/submissions/${submissionId}/data?revision=latest`);
+        const history = payload.submission.responseId
+          ? await apiGet<ResponseRevisionsResponse>(
+              `/api/responses/${payload.submission.responseId}/corrections`
+            )
+          : null;
         if (!cancelled) {
+          const latestRevision = history?.revisions.at(-1);
           setSubmission(payload.submission);
           setData(payload.data);
+          setFields(payload.fields);
+          setPictures(latestRevision?.pictures ?? null);
+          setDocumentAvailable(
+            Boolean(
+              payload.submission.responseId &&
+                latestRevision?.document.available
+            )
+          );
         }
       } catch (caughtError) {
         if (!cancelled) {
@@ -86,15 +111,15 @@ const SubmissionDetailRoute = () => {
 
   const downloadDocx = async () => {
     await downloadArtifact(
-      `/api/submissions/${submissionId}/docx`,
-      `${submissionId}.docx`
+      `/api/submissions/${submissionId}/docx?revision=latest`,
+      `${submissionId}-latest.docx`
     );
   };
 
   const downloadPdf = async () => {
     await downloadArtifact(
-      `/api/submissions/${submissionId}/pdf`,
-      `${submissionId}.pdf`
+      `/api/submissions/${submissionId}/pdf?revision=latest`,
+      `${submissionId}-latest.pdf`
     );
   };
 
@@ -133,14 +158,18 @@ const SubmissionDetailRoute = () => {
           </button>
         </div>
       </div>
-      <Card className="overflow-hidden">
-        <div className="flex items-center gap-2 border-b border-[var(--line)] px-5 py-4">
-          <FileJson size={17} />
-          <h2 className="font-semibold">Extracted response data</h2>
-        </div>
-        <pre className="max-h-[560px] overflow-auto p-5 text-sm leading-6 text-[var(--ink-soft)]">
-          {JSON.stringify(data ?? {}, null, 2)}
-        </pre>
+      <Card className="overflow-hidden p-5">
+        <SubmissionResultViewer
+          configUrl={
+            submission.responseId
+              ? `/api/admin/results/${submission.responseId}/viewer-config?revision=latest`
+              : undefined
+          }
+          data={data ?? {}}
+          documentAvailable={documentAvailable}
+          fields={fields}
+          pictures={pictures}
+        />
       </Card>
     </div>
   );

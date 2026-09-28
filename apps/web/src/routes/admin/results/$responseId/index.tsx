@@ -1,9 +1,10 @@
 // oxlint-disable unicorn/filename-case -- TanStack Router requires this dynamic route filename.
 import { createFileRoute, Link, useParams } from "@tanstack/react-router";
-import { FileJson, FileText, LockKeyhole, Trash2 } from "lucide-react";
+import { FileText, LockKeyhole, Trash2 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
 import { PageHeader } from "@/components/app-shell";
+import { SubmissionResultViewer } from "@/components/submission-result-viewer";
 import { Badge, Button, Card, Notice, Spinner } from "@/components/ui";
 import {
   ApiError,
@@ -13,7 +14,11 @@ import {
   formatDate,
   formatDateTime,
 } from "@/lib/api";
-import type { AdminResultDetail, ResponseRevisionsResponse } from "@/lib/api";
+import type {
+  AdminResultDetail,
+  ReceiptField,
+  ResponseRevisionsResponse,
+} from "@/lib/api";
 
 type ResponseRevision = ResponseRevisionsResponse["revisions"][number];
 
@@ -134,6 +139,7 @@ const AdminResultDetailRoute = () => {
   const [history, setHistory] = useState<
     ResponseRevisionsResponse["revisions"]
   >([]);
+  const [fields, setFields] = useState<ReceiptField[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyError, setHistoryError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -177,23 +183,35 @@ const AdminResultDetailRoute = () => {
   }, [responseId]);
 
   useEffect(() => {
-    if (!result || result.state !== "submitted") {
+    if (
+      !result ||
+      result.state !== "submitted" ||
+      !result.submissionId
+    ) {
       return;
     }
+    const submissionId = result.submissionId;
     let cancelled = false;
     setHistoryLoading(true);
     setHistoryError(null);
     const loadHistory = async () => {
       try {
-        const payload = await apiGet<ResponseRevisionsResponse>(
-          `/api/responses/${responseId}/corrections`
-        );
+        const [payload, submissionData] = await Promise.all([
+          apiGet<ResponseRevisionsResponse>(
+            `/api/responses/${responseId}/corrections`
+          ),
+          apiGet<{ fields: ReceiptField[] }>(
+            `/api/submissions/${submissionId}/data?revision=latest`
+          ),
+        ]);
         if (!cancelled) {
           setHistory(payload.revisions);
+          setFields(submissionData.fields);
         }
       } catch {
         if (!cancelled) {
           setHistory([]);
+          setFields([]);
           setHistoryError("โหลดประวัติ Correction ไม่สำเร็จ กรุณาลองใหม่");
         }
       } finally {
@@ -256,7 +274,7 @@ const AdminResultDetailRoute = () => {
   };
 
   const download = async (
-    format: "json" | "docx" | "pdf",
+    format: "docx" | "pdf",
     revision: "original" | "latest"
   ) => {
     if (!result?.submissionId || downloading) {
@@ -314,9 +332,14 @@ const AdminResultDetailRoute = () => {
     (revision) => revision.revision === 0
   );
   const selectedRevision = viewRevision === "latest" ? latestRevision : 0;
-  const displayedData =
-    history.find((revision) => revision.revision === selectedRevision)?.data ??
-    result.data;
+  const selectedRevisionRecord = history.find(
+    (revision) => revision.revision === selectedRevision
+  );
+  const displayedData = selectedRevisionRecord?.data ?? result.data;
+  const selectedPictures = selectedRevisionRecord?.pictures ?? null;
+  const documentAvailable =
+    selectedRevisionRecord?.document.available ??
+    (viewRevision === "latest" && result.document.available);
   let submittedDataLabel = "ข้อมูลต้นฉบับของ Submission";
   if (viewRevision === "latest" && latestRevision > 0) {
     submittedDataLabel = "ข้อมูลล่าสุดของ Correction";
@@ -424,14 +447,6 @@ const AdminResultDetailRoute = () => {
               </Link>
               <Button
                 disabled={downloading !== null}
-                onClick={() => download("json", "original")}
-                variant="secondary"
-              >
-                <FileJson size={16} />
-                JSON เดิม
-              </Button>
-              <Button
-                disabled={downloading !== null}
                 onClick={() => download("docx", "original")}
                 variant="secondary"
               >
@@ -445,14 +460,6 @@ const AdminResultDetailRoute = () => {
               >
                 <FileText size={16} />
                 PDF เดิม
-              </Button>
-              <Button
-                disabled={downloading !== null}
-                onClick={() => download("json", "latest")}
-                variant="secondary"
-              >
-                <FileJson size={16} />
-                JSON ล่าสุด
               </Button>
               <Button
                 disabled={downloading !== null}
@@ -500,15 +507,27 @@ const AdminResultDetailRoute = () => {
             />
           </Card>
         ) : null}
-        <Card>
-          <h2 className="font-semibold">ข้อมูลคำตอบ</h2>
-          <p className="mt-1 text-sm text-[var(--ink-soft)]">
-            {isSubmitted ? submittedDataLabel : "ข้อมูล Draft ปัจจุบัน"}
-          </p>
-          <pre className="mt-4 max-h-[560px] overflow-auto rounded-[10px] bg-[#eef1ed] p-4 text-sm leading-6 text-[var(--ink-soft)]">
-            {JSON.stringify(displayedData, null, 2)}
-          </pre>
-        </Card>
+        {isSubmitted ? (
+          <Card>
+            <p className="mb-4 text-sm text-[var(--ink-soft)]">
+              {submittedDataLabel}
+            </p>
+            <SubmissionResultViewer
+              configUrl={`/api/admin/results/${responseId}/viewer-config?revision=${viewRevision}`}
+              data={displayedData}
+              documentAvailable={documentAvailable}
+              fields={fields}
+              pictures={selectedPictures}
+            />
+          </Card>
+        ) : (
+          <Card>
+            <h2 className="font-semibold">ข้อมูลคำตอบ</h2>
+            <div className="mt-4">
+              <Notice>ข้อมูลฉบับร่างยังไม่แสดงในหน้าตรวจทานนี้</Notice>
+            </div>
+          </Card>
+        )}
       </div>
     </>
   );

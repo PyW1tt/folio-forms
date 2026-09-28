@@ -7367,6 +7367,111 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
       revision: 1,
     },
   });
+  const forbiddenAdminResultResponse = await app.handle(
+    new Request(`http://test.local/api/admin/results/${responseId}`, {
+      headers: { Authorization: `Bearer ${otherUserBearer}` },
+    })
+  );
+  expect(forbiddenAdminResultResponse.status).toBe(403);
+  const forbiddenViewerConfigResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/results/${responseId}/viewer-config`,
+      { headers: { Authorization: `Bearer ${otherUserBearer}` } }
+    )
+  );
+  expect(forbiddenViewerConfigResponse.status).toBe(403);
+  const invalidViewerRevisionResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/results/${responseId}/viewer-config?revision=2`,
+      { headers: { Authorization: `Bearer ${adminBearer}` } }
+    )
+  );
+  expect(invalidViewerRevisionResponse.status).toBe(400);
+  const latestViewerResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/results/${responseId}/viewer-config`,
+      { headers: { Authorization: `Bearer ${adminBearer}` } }
+    )
+  );
+  expect(latestViewerResponse.status).toBe(200);
+  const latestViewerConfig = (await latestViewerResponse.json()) as {
+    bridge?: unknown;
+    config: {
+      document: {
+        fileType: string;
+        key: string;
+        permissions: Record<string, unknown>;
+        url: string;
+      };
+      editorConfig: Record<string, unknown>;
+      token: string;
+    };
+  };
+  expect(latestViewerConfig).not.toHaveProperty("bridge");
+  expect(latestViewerConfig).not.toHaveProperty("capabilities");
+  expect(latestViewerConfig.config.document).toMatchObject({
+    fileType: "docx",
+    key: correction.documentKey,
+    permissions: {
+      comment: false,
+      download: false,
+      edit: false,
+      fillForms: false,
+      review: false,
+    },
+  });
+  expect(latestViewerConfig.config.editorConfig).toMatchObject({
+    mode: "view",
+  });
+  expect(latestViewerConfig.config.editorConfig).not.toHaveProperty("plugins");
+  expect(latestViewerConfig.config.editorConfig).not.toHaveProperty(
+    "callbackUrl"
+  );
+  const viewerTokenPayload = latestViewerConfig.config.token.split(".")[1];
+  if (!viewerTokenPayload) {
+    throw new Error("The signed viewer configuration was not returned");
+  }
+  const signedViewerConfig = JSON.parse(
+    Buffer.from(viewerTokenPayload, "base64url").toString("utf8")
+  ) as Record<string, unknown>;
+  expect(signedViewerConfig).toMatchObject({
+    document: {
+      permissions: { download: false, edit: false, fillForms: false },
+    },
+    editorConfig: { mode: "view" },
+  });
+  const originalViewerResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/results/${responseId}/viewer-config?revision=original`,
+      { headers: { Authorization: `Bearer ${adminBearer}` } }
+    )
+  );
+  expect(originalViewerResponse.status).toBe(200);
+  const originalViewerConfig = (await originalViewerResponse.json()) as
+    typeof latestViewerConfig;
+  expect(originalViewerConfig.config.document.key).toBe(
+    originalSubmissionBeforeCorrection.documentKey
+  );
+  const unauthorizedOfficeDocumentResponse = await app.handle(
+    new Request(
+      `http://test.local/onlyoffice/document/${encodeURIComponent(
+        correction.documentKey
+      )}`
+    )
+  );
+  expect(unauthorizedOfficeDocumentResponse.status).toBe(401);
+  const viewerAudit = await prisma.auditEvent.findFirstOrThrow({
+    orderBy: { createdAt: "desc" },
+    where: {
+      action: "view_correction",
+      actorId: adminId,
+      targetId: correction.id,
+    },
+  });
+  expect(viewerAudit).toMatchObject({
+    outcome: "success",
+    safeMetadata: { revision: 1, state: "submitted" },
+  });
   const correctionAudits = await prisma.auditEvent.findMany({
     orderBy: { createdAt: "asc" },
     where: {

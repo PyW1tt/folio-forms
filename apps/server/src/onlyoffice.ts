@@ -528,6 +528,41 @@ export function editorConfig(
   };
 }
 
+export function readOnlyViewerConfig(
+  documentKey: string,
+  publicId: string,
+  user: { id: string; name: string }
+): Record<string, unknown> {
+  const config = {
+    document: {
+      fileType: "docx",
+      key: documentKey,
+      permissions: {
+        comment: false,
+        download: false,
+        edit: false,
+        fillForms: false,
+        review: false,
+      },
+      title: `submission-${publicId}.docx`,
+      url: documentUrl(documentKey),
+    },
+    documentType: "word",
+    editorConfig: {
+      customization: { compactToolbar: true, hideRightMenu: true },
+      mode: "view",
+      user,
+    },
+    height: "100%",
+    width: "100%",
+  };
+  return {
+    apiUrl: trimOrigin(env.ONLYOFFICE_URL),
+    config: { ...config, token: signToken(config, env.ONLYOFFICE_JWT_SECRET) },
+  };
+}
+
+
 export interface OnlyOfficeClient {
   forceSave: (documentKey: string, userdata: string) => Promise<boolean>;
   convertDocxToPdf: (documentKey: string) => Promise<Uint8Array>;
