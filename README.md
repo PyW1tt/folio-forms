@@ -173,6 +173,14 @@ Publishing:
 - Failed publication leaves the prior Template Draft editable and exposes no shareable Published Form.
 - Structural or policy changes require a new Form and share ID; existing Responses remain reproducible.
 
+### AI Authoring
+
+Admins can open `/admin/ai-authoring` to create a text-only DOCX template. The feature is disabled unless the server has `OMNIROUTE_BASE_URL`, `OMNIROUTE_API_KEY`, and `OMNIROUTE_MODEL` configured. Set these values in the root `.env` for Compose deployments or in the server environment for local runs; blank values keep the feature disabled. Use only a permitted service credential and a server-managed OmniRoute alias; Folio does not select an upstream provider.
+
+Before sending a prompt, the Admin must consent to sending prompt and document content to OmniRoute and its configured provider. Folio keeps the prompt and generated DOCX in a temporary authoring session, then deletes its copies when the Admin ends the session, signs out, or remains inactive for two hours. Upstream retention follows OmniRoute and its provider policies.
+
+The generated DOCX contains static text and tagged text controls. Folio validates it with the existing template rules before preview, download, or upload as a normal Template Draft. AI Authoring does not accept PDF input or execute generated code.
+
 ### User workflow
 
 1. Open the share link.

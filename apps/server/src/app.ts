@@ -27,6 +27,12 @@ import { env } from "@onlyoffice/env/server";
 import { Elysia } from "elysia";
 import { unzipSync } from "fflate";
 import { SaxesParser } from "saxes";
+import {
+  AiAuthoringError,
+  AiAuthoringSessions,
+  authoringDisclosure,
+} from "./ai-authoring";
+import type { OmniRouteConfig } from "./ai-authoring";
 
 import {
   callbackClaim,
@@ -606,6 +612,7 @@ export interface AppOptions {
   clock?: () => Date;
   deleteObject?: (key: string) => Promise<void>;
   legacySso?: LegacySsoConfig | null;
+  omniRoute?: OmniRouteConfig | null;
   onlyOffice?: OnlyOfficeClient;
   onlyOfficeCallbackOrigins?: readonly string[];
   onlyOfficeCallbackMaxBytes?: number;
@@ -8384,8 +8391,23 @@ export function createApp(options: AppOptions = {}) {
       : options.legacySso
         ? validatedLegacySsoConfiguration(options.legacySso)
         : null;
+  let omniRoute = options.omniRoute;
+  if (omniRoute === undefined) {
+    const apiKey = env.OMNIROUTE_API_KEY;
+    const baseUrl = env.OMNIROUTE_BASE_URL;
+    const model = env.OMNIROUTE_MODEL;
+    omniRoute = apiKey && baseUrl && model ? { apiKey, baseUrl, model } : null;
+  }
+  const aiAuthoring = new AiAuthoringSessions(omniRoute, options.clock);
   return new Elysia()
     .onError(({ error, set }) => {
+      if (error instanceof AiAuthoringError) {
+        set.status = error.status;
+        return Response.json({
+          error: error.code,
+          message: error.message,
+        });
+      }
       if (error instanceof HttpError) {
         set.status = error.httpStatus;
         return Response.json({
@@ -9068,6 +9090,7 @@ export function createApp(options: AppOptions = {}) {
     .post("/api/auth/sign-out", async ({ request }) => {
       const identity = await identityFor(request);
       if (identity) {
+        await aiAuthoring.endForSession(identity.sessionId);
         await prisma.session.deleteMany({ where: { id: identity.sessionId } });
       }
       return { ok: true };
@@ -9077,6 +9100,66 @@ export function createApp(options: AppOptions = {}) {
         { error: "not_found", message: "Authentication route was not found" },
         { status: 404 }
       )
+    )
+    .get("/api/admin/ai-authoring", async ({ request }) => {
+      const identity = await requireIdentity(request);
+      requireAdmin(identity);
+      return { disclosure: authoringDisclosure, enabled: aiAuthoring.enabled };
+    })
+    .post(
+      "/api/admin/ai-authoring/sessions",
+      async ({ request }) => {
+        const identity = await requireIdentity(request);
+        requireAdmin(identity);
+        const input = await readJsonRecord(request, accountBodyMaximumBytes);
+        if (
+          Object.keys(input).length !== 2 ||
+          !Object.hasOwn(input, "consent") ||
+          !Object.hasOwn(input, "prompt") ||
+          typeof input.prompt !== "string"
+        ) {
+          fail(400, "invalid_request", "Only consent and prompt are accepted");
+        }
+        const session = await aiAuthoring.create(
+          { authSessionId: identity.sessionId, userId: identity.id },
+          input.prompt,
+          input.consent,
+          (document) => validateTemplateControls(document)
+        );
+        return { session };
+      },
+      { parse: "none" }
+    )
+    .get(
+      "/api/admin/ai-authoring/sessions/:sessionId/docx",
+      async ({ request, params }) => {
+        const identity = await requireIdentity(request);
+        requireAdmin(identity);
+        const { bytes } = await aiAuthoring.download(params.sessionId, {
+          authSessionId: identity.sessionId,
+          userId: identity.id,
+        });
+        return new Response(bytes, {
+          headers: {
+            "Cache-Control": "private, no-store",
+            "Content-Disposition": 'attachment; filename="ai-authored-template.docx"',
+            "Content-Type": DOCX_CONTENT_TYPE,
+            "X-Content-Type-Options": "nosniff",
+          },
+        });
+      }
+    )
+    .delete(
+      "/api/admin/ai-authoring/sessions/:sessionId",
+      async ({ request, params }) => {
+        const identity = await requireIdentity(request);
+        requireAdmin(identity);
+        await aiAuthoring.end(params.sessionId, {
+          authSessionId: identity.sessionId,
+          userId: identity.id,
+        });
+        return { ok: true };
+      }
     )
     .get("/health", () => ({ ok: true }))
     .get("/ready", async ({ set }) => {
@@ -11964,7 +12047,7 @@ export function createApp(options: AppOptions = {}) {
         }
       },
       { parse: "none" }
-    );
+    ).onStop(() => aiAuthoring.close());
 }
 
 async function readTemplateSourceBytes(

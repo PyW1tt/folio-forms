@@ -1,10 +1,12 @@
 import { afterEach, expect, test } from "bun:test";
 // oxlint-disable no-await-in-loop complexity -- The end-to-end journey deliberately keeps sequential transitions in one test.
 import { createHash } from "node:crypto";
+import { readdir } from "node:fs/promises";
+import { tmpdir } from "node:os";
 
 import { auth, ensureBootstrapAdmin } from "@onlyoffice/auth";
 import { prisma } from "@onlyoffice/db";
-import { strToU8, zipSync } from "fflate";
+import { strToU8, unzipSync, zipSync } from "fflate";
 import {
   createInProcessFolioConnector,
   deterministicExternalRecord,
@@ -10201,4 +10203,488 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     tombstoneMutationBlocked = true;
   }
   expect(tombstoneMutationBlocked).toBe(true);
+});
+test("Ticket 17 AI Authoring requires Admin consent and uploads a validated DOCX", async () => {
+  const model = "ticket-17-local-model";
+  const serviceKey = `ticket-17-local-only-${crypto.randomUUID()}`;
+  const generatedTemplate = {
+    description: "Request equipment for work.",
+    fields: [
+      {
+        label: "Employee Name",
+        placeholder: "Enter employee name",
+        tag: "employee_name",
+      },
+    ],
+    paragraphs: ["Complete each field."],
+    title: "Equipment Request",
+  };
+  let upstreamCalls = 0;
+  const upstream = Bun.serve({
+    fetch: async (request) => {
+      upstreamCalls += 1;
+      expect(request.method).toBe("POST");
+      expect(new URL(request.url).pathname).toBe("/v1/chat/completions");
+      expect(request.headers.get("authorization")).toBe(`Bearer ${serviceKey}`);
+      const requestBody = (await request.json()) as {
+        messages?: unknown;
+        model?: unknown;
+        tools?: { function?: { name?: unknown } }[];
+      };
+      expect(requestBody.model).toBe(model);
+      expect(JSON.stringify(requestBody.messages)).toContain(
+        "Create an equipment request form"
+      );
+      expect(
+        requestBody.tools?.some(
+          (tool) => tool.function?.name === "create_template_docx"
+        )
+      ).toBe(true);
+      const toolCall = upstreamCalls % 2 === 1;
+      const completionChunks = toolCall
+        ? [
+            {
+              delta: {
+                role: "assistant",
+                tool_calls: [
+                  {
+                    function: {
+                      arguments: JSON.stringify(generatedTemplate),
+                      name: "create_template_docx",
+                    },
+                    id: `call-${upstreamCalls}`,
+                    index: 0,
+                    type: "function",
+                  },
+                ],
+              },
+              finish_reason: null,
+            },
+            { delta: {}, finish_reason: "tool_calls" },
+          ]
+        : [
+            {
+              delta: {
+                content: "Created Equipment Request with one tagged field.",
+                role: "assistant",
+              },
+              finish_reason: null,
+            },
+            { delta: {}, finish_reason: "stop" },
+          ];
+      const createdAt = Math.floor(Date.now() / 1000);
+      const stream = completionChunks
+        .map((chunk) =>
+          [
+            "data: ",
+            JSON.stringify({
+              choices: [{ index: 0, ...chunk }],
+              created: createdAt,
+              id: `chatcmpl-${upstreamCalls}`,
+              model,
+              object: "chat.completion.chunk",
+            }),
+            "\n\n",
+          ].join("")
+        )
+        .join("");
+      return new Response(`${stream}data: [DONE]\n\n`, {
+        headers: { "Content-Type": "text/event-stream" },
+      });
+    },
+    hostname: "127.0.0.1",
+    port: 0,
+  });
+  let now = new Date();
+  const aiApp = createApp({
+    clock: () => new Date(now),
+    legacySso: null,
+    omniRoute: {
+      apiKey: serviceKey,
+      baseUrl: `http://127.0.0.1:${upstream.port}/v1`,
+      model,
+    },
+    onlyOffice: {
+      convertDocxToPdf: () => Promise.resolve(new Uint8Array()),
+      forceSave: () => Promise.resolve(false),
+    },
+    prefillReturnUrl: "https://source.example.test/forms/return",
+  });
+  const disabledApp = createApp({ legacySso: null, omniRoute: null });
+  const temporaryDirectories = async () =>
+    (await readdir(tmpdir())).filter((entry) =>
+      entry.startsWith("folio-authoring-")
+    );
+  const createPreview = async (authorization: string) => {
+    const directoriesBefore = new Set(await temporaryDirectories());
+    const response = await aiApp.handle(
+      new Request("http://test.local/api/admin/ai-authoring/sessions", {
+        body: JSON.stringify({
+          consent: true,
+          prompt: "Create an equipment request form",
+        }),
+        headers: {
+          ...jsonHeaders,
+          Authorization: `Bearer ${authorization}`,
+        },
+        method: "POST",
+      })
+    );
+    expect(response.status).toBe(200);
+    const result = (await response.json()) as {
+      session: {
+        assistantMessage: string;
+        description: string;
+        downloadUrl: string;
+        fields: { label: string; placeholder: string; tag: string }[];
+        paragraphs: string[];
+        sessionId: string;
+        title: string;
+      };
+    };
+    const directoriesAdded = (await temporaryDirectories()).filter(
+      (directory) => !directoriesBefore.has(directory)
+    );
+    expect(directoriesAdded).toHaveLength(1);
+    const directory = directoriesAdded[0];
+    if (!directory) {
+      throw new Error("AI Authoring did not create its temporary directory");
+    }
+    expect(result.session.sessionId).toMatch(
+      /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/iu
+    );
+    expect(result.session.downloadUrl).toBe(
+      `/api/admin/ai-authoring/sessions/${result.session.sessionId}/docx`
+    );
+    expect(Object.hasOwn(result.session, "prompt")).toBe(false);
+    return { directory, session: result.session };
+  };
+  const adminPassword = "Ticket17-admin-password";
+  const otherAdminPassword = "Ticket17-other-admin-password";
+  const userPassword = "Ticket17-user-password";
+  let adminBearer = "";
+  let otherAdminBearer = "";
+  let userBearer = "";
+  let activeSessionId: string | undefined;
+  let formPublicId: string | undefined;
+  let signedOut = false;
+  try {
+    const admin = await createCredentialFixture({
+      email: `ticket-17-admin-${crypto.randomUUID()}@example.com`,
+      name: "Ticket 17 Admin",
+      password: adminPassword,
+      role: "admin",
+    });
+    const otherAdmin = await createCredentialFixture({
+      email: `ticket-17-other-admin-${crypto.randomUUID()}@example.com`,
+      name: "Ticket 17 Other Admin",
+      password: otherAdminPassword,
+      role: "admin",
+    });
+    const user = await createCredentialFixture({
+      email: `ticket-17-user-${crypto.randomUUID()}@example.com`,
+      name: "Ticket 17 User",
+      password: userPassword,
+    });
+    adminBearer = await bearerFor(admin.email, adminPassword);
+    otherAdminBearer = await bearerFor(otherAdmin.email, otherAdminPassword);
+    userBearer = await bearerFor(user.email, userPassword);
+    const unauthenticatedStatus = await aiApp.handle(
+      new Request("http://test.local/api/admin/ai-authoring")
+    );
+    expect(unauthenticatedStatus.status).toBe(401);
+    const userStatus = await aiApp.handle(
+      new Request("http://test.local/api/admin/ai-authoring", {
+        headers: { Authorization: `Bearer ${userBearer}` },
+      })
+    );
+    expect(userStatus.status).toBe(403);
+    const disabledStatus = await disabledApp.handle(
+      new Request("http://test.local/api/admin/ai-authoring", {
+        headers: { Authorization: `Bearer ${adminBearer}` },
+      })
+    );
+    expect(disabledStatus.status).toBe(200);
+    expect(await disabledStatus.json()).toMatchObject({ enabled: false });
+    const disabledCreate = await disabledApp.handle(
+      new Request("http://test.local/api/admin/ai-authoring/sessions", {
+        body: JSON.stringify({
+          consent: true,
+          prompt: "Create an equipment request form",
+        }),
+        headers: {
+          ...jsonHeaders,
+          Authorization: `Bearer ${adminBearer}`,
+        },
+        method: "POST",
+      })
+    );
+    expect(disabledCreate.status).toBe(503);
+    expect(upstreamCalls).toBe(0);
+    const adminStatus = await aiApp.handle(
+      new Request("http://test.local/api/admin/ai-authoring", {
+        headers: { Authorization: `Bearer ${adminBearer}` },
+      })
+    );
+    expect(adminStatus.status).toBe(200);
+    const statusBody = (await adminStatus.json()) as {
+      disclosure: string;
+      enabled: boolean;
+    };
+    expect(statusBody.enabled).toBe(true);
+    expect(statusBody.disclosure).toContain(
+      "cannot promise deletion by OmniRoute"
+    );
+    expect(JSON.stringify(statusBody)).not.toContain(serviceKey);
+    const userCreate = await aiApp.handle(
+      new Request("http://test.local/api/admin/ai-authoring/sessions", {
+        body: JSON.stringify({
+          consent: true,
+          prompt: "Create an equipment request form",
+        }),
+        headers: {
+          ...jsonHeaders,
+          Authorization: `Bearer ${userBearer}`,
+        },
+        method: "POST",
+      })
+    );
+    expect(userCreate.status).toBe(403);
+    const noConsent = await aiApp.handle(
+      new Request("http://test.local/api/admin/ai-authoring/sessions", {
+        body: JSON.stringify({
+          consent: false,
+          prompt: "Create an equipment request form",
+        }),
+        headers: {
+          ...jsonHeaders,
+          Authorization: `Bearer ${adminBearer}`,
+        },
+        method: "POST",
+      })
+    );
+    expect(noConsent.status).toBe(428);
+    const providerSelection = await aiApp.handle(
+      new Request("http://test.local/api/admin/ai-authoring/sessions", {
+        body: JSON.stringify({
+          consent: true,
+          prompt: "Create an equipment request form",
+          provider: "client-selected-provider",
+        }),
+        headers: {
+          ...jsonHeaders,
+          Authorization: `Bearer ${adminBearer}`,
+        },
+        method: "POST",
+      })
+    );
+    expect(providerSelection.status).toBe(400);
+    expect(upstreamCalls).toBe(0);
+
+    const firstDirectories = new Set(await temporaryDirectories());
+    const first = await createPreview(adminBearer);
+    activeSessionId = first.session.sessionId;
+    expect(first.session.title).toBe(generatedTemplate.title);
+    expect(first.session.description).toBe(generatedTemplate.description);
+    expect(first.session.paragraphs).toEqual(generatedTemplate.paragraphs);
+    expect(first.session.fields).toEqual(generatedTemplate.fields);
+    expect(first.session.assistantMessage).toContain("Created Equipment Request");
+    expect(await temporaryDirectories()).toContain(first.directory);
+    expect(firstDirectories.has(first.directory)).toBe(false);
+    expect(upstreamCalls).toBe(2);
+
+    const unauthenticatedDownload = await aiApp.handle(
+      new Request(`http://test.local${first.session.downloadUrl}`)
+    );
+    expect(unauthenticatedDownload.status).toBe(401);
+    const userDownload = await aiApp.handle(
+      new Request(`http://test.local${first.session.downloadUrl}`, {
+        headers: { Authorization: `Bearer ${userBearer}` },
+      })
+    );
+    expect(userDownload.status).toBe(403);
+    const otherAdminDownload = await aiApp.handle(
+      new Request(`http://test.local${first.session.downloadUrl}`, {
+        headers: { Authorization: `Bearer ${otherAdminBearer}` },
+      })
+    );
+    expect(otherAdminDownload.status).toBe(404);
+    const otherAdminDelete = await aiApp.handle(
+      new Request(
+        `http://test.local/api/admin/ai-authoring/sessions/${first.session.sessionId}`,
+        {
+          headers: { Authorization: `Bearer ${otherAdminBearer}` },
+          method: "DELETE",
+        }
+      )
+    );
+    expect(otherAdminDelete.status).toBe(404);
+    const downloadResponse = await aiApp.handle(
+      new Request(`http://test.local${first.session.downloadUrl}`, {
+        headers: { Authorization: `Bearer ${adminBearer}` },
+      })
+    );
+    expect(downloadResponse.status).toBe(200);
+    expect(downloadResponse.headers.get("content-type")).toBe(DOCX_CONTENT_TYPE);
+    expect(downloadResponse.headers.get("cache-control")).toBe(
+      "private, no-store"
+    );
+    const documentBytes = new Uint8Array(
+      await downloadResponse.arrayBuffer()
+    );
+    const archive = unzipSync(documentBytes);
+    const documentXmlBytes = archive["word/document.xml"];
+    if (!documentXmlBytes) {
+      throw new Error("AI Authoring did not return a DOCX document part");
+    }
+    const documentXml = new TextDecoder().decode(documentXmlBytes);
+    expect(documentXml).toContain("Equipment Request");
+    expect(documentXml).toContain("Request equipment for work.");
+    expect(documentXml).toContain("Complete each field.");
+    expect(documentXml).toContain("<w:sdt>");
+    expect(documentXml).toContain('<w:tag w:val="employee_name"/>');
+    expect(documentXml).toContain("Enter employee name");
+
+    const uploadResponse = await aiApp.handle(
+      formCreationRequest({
+        authorization: adminBearer,
+        description: first.session.description,
+        source: "upload",
+        template: {
+          bytes: documentBytes,
+          name: "equipment-request.docx",
+        },
+        title: first.session.title,
+      })
+    );
+    expect(uploadResponse.status).toBe(200);
+    const uploadBody = (await uploadResponse.json()) as {
+      form: { hasTemplateDraft: boolean; publicId: string; title: string };
+    };
+    formPublicId = uploadBody.form.publicId;
+    expect(uploadBody.form.title).toBe(generatedTemplate.title);
+    expect(uploadBody.form.hasTemplateDraft).toBe(true);
+    const storedForm = await prisma.form.findUnique({
+      include: { templateDraft: true },
+      where: { publicId: uploadBody.form.publicId },
+    });
+    if (!storedForm?.templateDraft) {
+      throw new Error("The upload did not create a normal Template Draft");
+    }
+    expect(await objectExists(storedForm.templateDraft.objectKey)).toBe(true);
+    expect(await readObject(storedForm.templateDraft.objectKey)).toEqual(
+      documentBytes
+    );
+    const deleteForm = await aiApp.handle(
+      new Request(
+        `http://test.local/api/admin/forms/${uploadBody.form.publicId}`,
+        {
+          headers: { Authorization: `Bearer ${adminBearer}` },
+          method: "DELETE",
+        }
+      )
+    );
+    expect(deleteForm.status).toBe(200);
+    formPublicId = undefined;
+    const endFirstSession = await aiApp.handle(
+      new Request(
+        `http://test.local/api/admin/ai-authoring/sessions/${first.session.sessionId}`,
+        {
+          headers: { Authorization: `Bearer ${adminBearer}` },
+          method: "DELETE",
+        }
+      )
+    );
+    expect(endFirstSession.status).toBe(200);
+    activeSessionId = undefined;
+    expect(await temporaryDirectories()).not.toContain(first.directory);
+    const endedDownload = await aiApp.handle(
+      new Request(`http://test.local${first.session.downloadUrl}`, {
+        headers: { Authorization: `Bearer ${adminBearer}` },
+      })
+    );
+    expect(endedDownload.status).toBe(404);
+
+    const second = await createPreview(adminBearer);
+    activeSessionId = second.session.sessionId;
+    now = new Date(now.getTime() + 2 * 60 * 60 * 1000 - 1);
+    const sessionStillActive = await aiApp.handle(
+      new Request(`http://test.local${second.session.downloadUrl}`, {
+        headers: { Authorization: `Bearer ${adminBearer}` },
+      })
+    );
+    expect(sessionStillActive.status).toBe(200);
+    await sessionStillActive.arrayBuffer();
+    now = new Date(now.getTime() + 2 * 60 * 60 * 1000);
+    const expiredSession = await aiApp.handle(
+      new Request(`http://test.local${second.session.downloadUrl}`, {
+        headers: { Authorization: `Bearer ${adminBearer}` },
+      })
+    );
+    expect(expiredSession.status).toBe(404);
+    activeSessionId = undefined;
+    expect(await temporaryDirectories()).not.toContain(second.directory);
+
+    const third = await createPreview(adminBearer);
+    activeSessionId = third.session.sessionId;
+    const signOutResponse = await aiApp.handle(
+      new Request("http://test.local/api/auth/sign-out", {
+        headers: { Authorization: `Bearer ${adminBearer}` },
+        method: "POST",
+      })
+    );
+    expect(signOutResponse.status).toBe(200);
+    signedOut = true;
+    activeSessionId = undefined;
+    expect(await temporaryDirectories()).not.toContain(third.directory);
+    expect(upstreamCalls).toBe(6);
+
+  } finally {
+    if (formPublicId && adminBearer && !signedOut) {
+      await aiApp
+        .handle(
+          new Request(`http://test.local/api/admin/forms/${formPublicId}`, {
+            headers: { Authorization: `Bearer ${adminBearer}` },
+            method: "DELETE",
+          })
+        )
+        .catch(() => undefined);
+    }
+    if (activeSessionId && adminBearer && !signedOut) {
+      await aiApp
+        .handle(
+          new Request(
+            `http://test.local/api/admin/ai-authoring/sessions/${activeSessionId}`,
+            {
+              headers: { Authorization: `Bearer ${adminBearer}` },
+              method: "DELETE",
+            }
+          )
+        )
+        .catch(() => undefined);
+    }
+    if (adminBearer && !signedOut) {
+      await aiApp
+        .handle(
+          new Request("http://test.local/api/auth/sign-out", {
+            headers: { Authorization: `Bearer ${adminBearer}` },
+            method: "POST",
+          })
+        )
+        .catch(() => undefined);
+    }
+    for (const bearer of [otherAdminBearer, userBearer]) {
+      if (bearer) {
+        await aiApp
+          .handle(
+            new Request("http://test.local/api/auth/sign-out", {
+              headers: { Authorization: `Bearer ${bearer}` },
+              method: "POST",
+            })
+          )
+          .catch(() => undefined);
+      }
+    }
+    upstream.stop(true);
+  }
 });

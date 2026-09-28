@@ -359,6 +359,21 @@ const request = async <T>(path: string, init: RequestInit = {}): Promise<T> => {
 };
 
 export const apiGet = <T>(path: string) => request<T>(path);
+export const apiGetBlob = async (path: string): Promise<Blob> => {
+  const token = getToken();
+  const response = await fetch(`${API_ORIGIN}${path}`, {
+    credentials: "include",
+    headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+  });
+  if (!response.ok) {
+    throw new ApiError(
+      response.status,
+      "download_failed",
+      `Download failed (${response.status})`
+    );
+  }
+  return response.blob();
+};
 
 export const apiPost = <T>(
   path: string,
@@ -394,19 +409,7 @@ export const apiDelete = <T>(
     ...options,
   });
 export const downloadArtifact = async (path: string, filename: string) => {
-  const token = getToken();
-  const response = await fetch(`${API_ORIGIN}${path}`, {
-    credentials: "include",
-    headers: token ? { Authorization: `Bearer ${token}` } : undefined,
-  });
-  if (!response.ok) {
-    throw new ApiError(
-      response.status,
-      "download_failed",
-      `Download failed (${response.status})`
-    );
-  }
-  const blob = await response.blob();
+  const blob = await apiGetBlob(path);
   const href = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
   anchor.href = href;

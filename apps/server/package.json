@@ -11,6 +11,7 @@
     "test:storage": "bun test --timeout 120000 test/storage.test.ts"
   },
   "dependencies": {
+    "@earendil-works/pi-coding-agent": "0.87.1",
     "@elysiajs/cors": "^1.4.2",
     "@onlyoffice/auth": "workspace:*",
     "@onlyoffice/db": "workspace:*",
@@ -21,6 +22,7 @@
     "elysia": "^1.4.29",
     "fflate": "^0.8.3",
     "saxes": "^6.0.0",
+    "typebox": "1.3.34",
     "zod": "catalog:"
   },
   "devDependencies": {

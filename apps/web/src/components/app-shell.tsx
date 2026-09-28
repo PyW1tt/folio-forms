@@ -10,6 +10,7 @@ import {
   ShieldCheck,
   UserRound,
   UsersRound,
+  WandSparkles,
   X,
 } from "lucide-react";
 import { useState } from "react";
@@ -30,6 +31,7 @@ export const AppShell = ({ children }: { children: React.ReactNode }) => {
     location.pathname.startsWith("/admin/forms/");
   const auditAreActive = location.pathname.startsWith("/admin/audit");
   const resultsAreActive = location.pathname.startsWith("/admin/results");
+  const authoringIsActive = location.pathname.startsWith("/admin/ai-authoring");
 
   const logout = async () => {
     if (loggingOut) {
@@ -142,6 +144,19 @@ export const AppShell = ({ children }: { children: React.ReactNode }) => {
                 >
                   <FilePlus2 className="mr-1 inline" size={15} />
                   สร้างแบบฟอร์ม
+                </Link>
+                <Link
+                  to="/admin/ai-authoring"
+                  className={`rounded-lg px-3 py-2 text-sm font-semibold text-[var(--ink-soft)] hover:bg-[var(--accent-soft)] ${
+                    authoringIsActive
+                      ? "bg-[var(--accent-soft)] text-[var(--ink)]"
+                      : ""
+                  }`}
+                  aria-current={authoringIsActive ? "page" : undefined}
+                  onClick={() => setOpen(false)}
+                >
+                  <WandSparkles className="mr-1 inline" size={15} />
+                  AI Authoring
                 </Link>
               </>
             ) : (
