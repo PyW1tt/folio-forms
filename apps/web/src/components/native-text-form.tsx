@@ -76,6 +76,7 @@ export const NativeTextForm = ({
               <Textarea
                 aria-describedby={field.placeholder || locked ? helpId : undefined}
                 className={locked ? "bg-[var(--muted)]" : undefined}
+                disabled={operationBusy}
                 id={fieldId}
                 maxLength={10_000}
                 onChange={(event) => onChange(field.tag, event.target.value)}

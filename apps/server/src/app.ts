@@ -539,6 +539,7 @@ type FormAuditErrorCode =
   | "callback_claim_invalid"
   | "callback_document_unavailable"
   | "callback_key_mismatch"
+  | "document_save_failed"
   | "fill_method_changed"
   | "native_fill_unsupported"
   | "callback_processing_failed"
@@ -3243,6 +3244,7 @@ const formAuditErrorCodes: Record<string, true> = {
   callback_document_unavailable: true,
   callback_key_mismatch: true,
   callback_processing_failed: true,
+  document_save_failed: true,
   fill_method_changed: true,
   native_fill_unsupported: true,
   document_unavailable: true,
@@ -3820,28 +3822,116 @@ function supportsNativeTextFill(
   );
 }
 
-async function nativeTextFields(publishedTemplateId: string) {
-  const manifest = await prisma.fieldManifest.findUnique({
-    include: { fields: { orderBy: { position: "asc" } } },
-    where: { publishedTemplateId },
+interface ManifestDisplayField {
+  label: string;
+  placeholder: string | null;
+  position: number;
+  tag: string;
+}
+
+async function manifestFieldsWithDocumentMetadata<
+  T extends ManifestDisplayField,
+>(
+  objectKey: string,
+  displayMetadataVersion: number,
+  fields: T[],
+  documentBytes?: Uint8Array
+): Promise<T[]> {
+  if (displayMetadataVersion !== 0) {
+    return fields;
+  }
+  const documentFields = parseTemplateFields(
+    documentBytes ?? (await readObject(objectKey))
+  );
+  if (documentFields.length !== fields.length) {
+    fail(
+      500,
+      "internal_error",
+      "The published Field Manifest does not match its document"
+    );
+  }
+  const fieldsByTag = new Map(fields.map((field) => [field.tag, field]));
+  return documentFields.map((documentField, position) => {
+    const field = fieldsByTag.get(documentField.tag);
+    if (!field) {
+      fail(
+        500,
+        "internal_error",
+        "The published Field Manifest does not match its document"
+      );
+    }
+    return {
+      ...field,
+      label: documentField.label,
+      placeholder: documentField.placeholder,
+      position,
+    };
   });
-  if (!manifest || !supportsNativeTextFill(manifest.fields)) {
+}
+
+async function supportsNativeTextTemplate(
+  objectKey: string | null | undefined,
+  fields: readonly { type: FieldType }[],
+  documentBytes?: Uint8Array
+): Promise<boolean> {
+  if (!objectKey || !supportsNativeTextFill(fields)) {
+    return false;
+  }
+  const { archive, xmlPaths } = safeTemplateArchive(
+    documentBytes ?? (await readObject(objectKey))
+  );
+  return !templatePartsHaveNestedControls(
+    archive,
+    reachableTemplateControlParts(archive, xmlPaths)
+  );
+}
+
+async function nativeTextFields(publishedTemplateId: string) {
+  const [manifest, publishedTemplate] = await Promise.all([
+    prisma.fieldManifest.findUnique({
+      include: { fields: { orderBy: { position: "asc" } } },
+      where: { publishedTemplateId },
+    }),
+    prisma.publishedTemplate.findUnique({
+      select: { objectKey: true },
+      where: { id: publishedTemplateId },
+    }),
+  ]);
+  if (!manifest || !publishedTemplate?.objectKey) {
     fail(
       409,
       "native_fill_unsupported",
       "Native filling requires a published text-only form"
     );
   }
-  return manifest.fields.map(
-    ({ label, placeholder, position, required, tag }) => ({
-      label,
-      placeholder,
-      position,
-      required,
-      tag,
-      type: FieldType.text,
-    })
+  const documentBytes = await readObject(publishedTemplate.objectKey);
+  if (
+    !(await supportsNativeTextTemplate(
+      publishedTemplate.objectKey,
+      manifest.fields,
+      documentBytes
+    ))
+  ) {
+    fail(
+      409,
+      "native_fill_unsupported",
+      "Native filling requires a published text-only form"
+    );
+  }
+  const fields = await manifestFieldsWithDocumentMetadata(
+    publishedTemplate.objectKey,
+    manifest.displayMetadataVersion,
+    manifest.fields,
+    documentBytes
   );
+  return fields.map(({ label, placeholder, position, required, tag }) => ({
+    label,
+    placeholder,
+    position,
+    required,
+    tag,
+    type: FieldType.text,
+  }));
 }
 
 function responseSummary(
@@ -6606,6 +6696,37 @@ async function validateResponseDocument(
   }
   validateResponsePictureControls(bytes, manifest.fields, enforceRequired);
 }
+function templatePartsHaveNestedControls(
+  archive: Record<string, Uint8Array>,
+  controlParts: ReadonlySet<string>
+): boolean {
+  for (const archivePath of controlParts) {
+    let controlDepth = 0;
+    let nested = false;
+    const parser = new SaxesParser({ xmlns: true });
+    parser.on("opentag", (tag) => {
+      if (tag.local === "sdt" && templateWordNamespaces.has(tag.uri)) {
+        nested ||= controlDepth > 0;
+        controlDepth += 1;
+      }
+    });
+    parser.on("closetag", (tag) => {
+      if (
+        tag.local === "sdt" &&
+        templateWordNamespaces.has(tag.uri) &&
+        controlDepth > 0
+      ) {
+        controlDepth -= 1;
+      }
+    });
+    parser.write(templateArchiveText(archive, archivePath)).close();
+    if (nested) {
+      return true;
+    }
+  }
+  return false;
+}
+
 interface NativeTextControlFrame {
   block: boolean;
   contentEnd: number | null;
@@ -6628,6 +6749,13 @@ function nativeTextControlXml(xml: string, data: JsonRecord): string {
   });
   parser.on("opentag", (tag) => {
     if (tag.local === "sdt" && templateWordNamespaces.has(tag.uri)) {
+      if (controls.length > 0) {
+        fail(
+          422,
+          "invalid_template",
+          "Nested Native text fields are unsupported"
+        );
+      }
       controls.push({
         block: !elements.some(
           (element) =>
@@ -6709,7 +6837,7 @@ function nativeTextControlXml(xml: string, data: JsonRecord): string {
         if (!completed?.tag || !completed.contentName) {
           fail(422, "invalid_template", "A text field is incomplete");
         }
-        const value = data[completed.tag];
+        const value = data[completed.tag.trim()];
         const lines = (typeof value === "string" ? value : "").split(
           /\r\n|\r|\n/u
         );
@@ -6782,6 +6910,9 @@ async function nativeTextResponseDocument(
     await readObject(publishedTemplate.objectKey)
   );
   const controlParts = reachableTemplateControlParts(archive, xmlPaths);
+  if (templatePartsHaveNestedControls(archive, controlParts)) {
+    fail(422, "invalid_template", "Native text fields cannot be nested");
+  }
   if (controlParts.size === 0) {
     fail(422, "invalid_template", "The published document has no text fields");
   }
@@ -8681,41 +8812,14 @@ function findSubmissionWithRevisions(
 async function receiptManifestFields(submission: SubmissionWithManifest) {
   const publishedTemplate = submission.response?.publishedTemplate;
   const manifest = publishedTemplate?.manifest;
-  if (!manifest) {
+  if (!manifest || !publishedTemplate) {
     return [];
   }
-  if (manifest.displayMetadataVersion !== 0) {
-    return manifest.fields;
-  }
-  const documentFields = parseTemplateFields(
-    await readObject(publishedTemplate.objectKey)
+  return manifestFieldsWithDocumentMetadata(
+    publishedTemplate.objectKey,
+    manifest.displayMetadataVersion,
+    manifest.fields
   );
-  if (documentFields.length !== manifest.fields.length) {
-    fail(
-      500,
-      "internal_error",
-      "The published Field Manifest does not match its document"
-    );
-  }
-  const fieldsByTag = new Map(
-    manifest.fields.map((field) => [field.tag, field])
-  );
-  return documentFields.map((documentField, position) => {
-    const field = fieldsByTag.get(documentField.tag);
-    if (!field) {
-      fail(
-        500,
-        "internal_error",
-        "The published Field Manifest does not match its document"
-      );
-    }
-    return {
-      ...field,
-      label: documentField.label,
-      placeholder: documentField.placeholder,
-      position,
-    };
-  });
 }
 
 async function userEditorConfig(
@@ -8823,11 +8927,13 @@ async function userEditorConfig(
       documentKey: response.draftDocumentKey,
       lease: editorLeaseBridge(lease),
       prefill:
-        requestedAction === "fill" && snapshot
-          ? {
-              data: jsonRecord(snapshot.values),
-              editableFields: editableFieldsForSnapshot(snapshot),
-            }
+        snapshot
+          ? requestedAction === "fill"
+            ? {
+                data: jsonRecord(snapshot.values),
+                editableFields: editableFieldsForSnapshot(snapshot),
+              }
+            : lockedPrefillForSnapshot(snapshot)
           : undefined,
       publicId: form.publicId,
       responseId: response.id,
@@ -9811,7 +9917,13 @@ export function createApp(options: AppOptions = {}) {
                   publishedTemplateId: current.publishedTemplate.id,
                 },
               });
-              if (!manifest || !supportsNativeTextFill(manifest.fields)) {
+              if (
+                !manifest ||
+                !(await supportsNativeTextTemplate(
+                  current.publishedTemplate.objectKey,
+                  manifest.fields
+                ))
+              ) {
                 fail(
                   409,
                   "native_fill_unsupported",
@@ -10344,15 +10456,19 @@ export function createApp(options: AppOptions = {}) {
       ]);
       const manifest = form.publishedTemplate
         ? await prisma.fieldManifest.findUnique({
-            select: { fields: { select: { type: true } } },
+            include: { fields: { select: { type: true } } },
             where: {
               publishedTemplateId: form.publishedTemplate.id,
             },
           })
         : null;
-      const nativeFillAvailable = supportsNativeTextFill(
-        manifest?.fields ?? []
-      );
+      const nativeFillAvailable =
+        manifest && form.publishedTemplate
+          ? await supportsNativeTextTemplate(
+              form.publishedTemplate.objectKey,
+              manifest.fields
+            )
+          : false;
       return {
         editorConfigUrl: `/api/admin/forms/${form.publicId}/editor-config`,
         form: {

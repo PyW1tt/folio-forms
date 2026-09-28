@@ -1,5 +1,8 @@
 import { expect, test, vi } from "bun:test";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 
+import { NativeTextForm } from "../src/components/native-text-form";
 import {
   getToken,
   safeReturnPath,
@@ -18,6 +21,35 @@ test("dirty navigation blocks until an explicit bypass", () => {
   expect(shouldBlockDirtyNavigation(false, false)).toBe(false);
   expect(shouldBlockDirtyNavigation(true, false)).toBe(true);
   expect(shouldBlockDirtyNavigation(true, true)).toBe(false);
+});
+test("native fields cannot change while draft save is pending", () => {
+  const renderField = (operationBusy: boolean) => {
+    const markup = renderToStaticMarkup(
+      createElement(NativeTextForm, {
+        fields: [
+          {
+            label: "Full name",
+            placeholder: null,
+            position: 0,
+            required: false,
+            tag: "full_name",
+            type: "text",
+          },
+        ],
+        lockedFields: {},
+        onChange: () => {},
+        onExportDocx: () => {},
+        onExportPdf: () => {},
+        onSave: () => {},
+        onSubmit: () => {},
+        operationBusy,
+        values: { full_name: "" },
+      })
+    );
+    return markup.match(/<textarea\b[^>]*>/u)?.[0] ?? "";
+  };
+  expect(renderField(true)).toContain('disabled=""');
+  expect(renderField(false)).not.toContain('disabled=""');
 });
 
 test("save and export never downloads after a failed save", async () => {

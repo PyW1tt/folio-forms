@@ -1549,7 +1549,7 @@ test("Ticket 06 native text forms preserve drafts, Prefill, and Fill Method", as
         contentControl({
           alias: "Full name",
           placeholderText: "Enter full name",
-          tag: "full_name",
+          tag: " full_name ",
           type: "<w:text/>",
         }) +
         contentControl({
@@ -1656,6 +1656,52 @@ test("Ticket 06 native text forms preserve drafts, Prefill, and Fill Method", as
       })
     ).status
   ).toBe("completed");
+  const publishedTemplate = await prisma.publishedTemplate.findUniqueOrThrow({
+    include: {
+      manifest: {
+        include: { fields: { orderBy: { position: "asc" } } },
+      },
+    },
+    where: { formId: createdForm.id },
+  });
+  const publishedManifest = publishedTemplate.manifest;
+  if (!publishedManifest) {
+    throw new Error("The Ticket 06 manifest was not published");
+  }
+  await prisma.$transaction(async (tx) => {
+    await tx.$executeRaw`ALTER TABLE "field_manifests" DISABLE TRIGGER "field_manifests_immutable"`;
+    await tx.$executeRaw`ALTER TABLE "manifest_fields" DISABLE TRIGGER "manifest_fields_immutable"`;
+    try {
+      await tx.$executeRaw`
+        UPDATE "manifest_fields"
+        SET "position" = "position" + 100000
+        WHERE "manifest_id" = ${publishedManifest.id}::uuid
+      `;
+      await tx.$executeRaw`
+        WITH ranked_fields AS (
+          SELECT
+            "id",
+            (ROW_NUMBER() OVER (ORDER BY "tag") - 1)::integer AS "position"
+          FROM "manifest_fields"
+          WHERE "manifest_id" = ${publishedManifest.id}::uuid
+        )
+        UPDATE "manifest_fields" AS field
+        SET
+          "label" = field."tag",
+          "placeholder" = NULL,
+          "position" = ranked_fields."position"
+        FROM ranked_fields
+        WHERE field."id" = ranked_fields."id"
+      `;
+      await tx.fieldManifest.update({
+        data: { displayMetadataVersion: 0 },
+        where: { id: publishedManifest.id },
+      });
+    } finally {
+      await tx.$executeRaw`ALTER TABLE "manifest_fields" ENABLE TRIGGER "manifest_fields_immutable"`;
+      await tx.$executeRaw`ALTER TABLE "field_manifests" ENABLE TRIGGER "field_manifests_immutable"`;
+    }
+  });
   const nativeMethodResponse = await patchFillMethod("native");
   expect(nativeMethodResponse.status).toBe(200);
   expect(await nativeMethodResponse.json()).toMatchObject({
@@ -1986,13 +2032,35 @@ test("Ticket 06 native text forms preserve drafts, Prefill, and Fill Method", as
     )
   );
   const onlyOfficeConfig = (await onlyOfficeConfigResponse.json()) as {
-    config?: { document?: { key?: string } };
+    config?: {
+      document?: { key?: string };
+      editorConfig?: {
+        plugins?: {
+          options?: Record<
+            string,
+            {
+              prefill?: {
+                data: Record<string, unknown>;
+                editableFields: Record<string, unknown>;
+              };
+            }
+          >;
+        };
+      };
+    };
     fillMethod?: string;
   };
   expect(onlyOfficeConfig.fillMethod).toBe("onlyoffice");
   expect(onlyOfficeConfig.config?.document?.key).toBe(
     savedDraftDocumentKey
   );
+  expect(
+    onlyOfficeConfig.config?.editorConfig?.plugins?.options?.[pluginGuid]
+      ?.prefill
+  ).toMatchObject({
+    data: prefillValues,
+    editableFields: { full_name: false },
+  });
   const nativeAgainResponse = await patchFillMethod("native");
   expect(nativeAgainResponse.status).toBe(200);
   const nativeAgainStartResponse = await app.handle(
@@ -2135,6 +2203,83 @@ test("Ticket 06 native text forms preserve drafts, Prefill, and Fill Method", as
   );
   expect(await checkboxDetailResponse.json()).toMatchObject({
     form: { fillMethod: "onlyoffice", nativeFillAvailable: false },
+  });
+  const nestedTemplate = docxXmlFixture({
+    document: contentControlDocument(
+      `<w:sdt><w:sdtPr><w:alias w:val="Group"/><w:tag w:val="group"/><w:text/></w:sdtPr><w:sdtContent><w:r><w:t>Group</w:t></w:r>` +
+        contentControl({
+          alias: "Nested name",
+          tag: "nested_name",
+          type: "<w:text/>",
+        }) +
+        "</w:sdtContent></w:sdt>"
+    ),
+  });
+  const nestedCreateResponse = await app.handle(
+    formCreationRequest({
+      authorization: adminBearer,
+      source: "upload",
+      template: { bytes: nestedTemplate, name: "nested-text.docx" },
+      title: "Ticket 06 Nested Text Form",
+    })
+  );
+  const nestedCreated = (await nestedCreateResponse.json()) as {
+    form?: { publicId?: string };
+  };
+  const nestedPublicId = nestedCreated.form?.publicId;
+  if (!nestedPublicId) {
+    throw new Error("The Ticket 06 nested text form was not created");
+  }
+  const nestedEditorResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/forms/${nestedPublicId}/editor-config`,
+      { headers: { Authorization: `Bearer ${adminBearer}` } }
+    )
+  );
+  const nestedEditor = (await nestedEditorResponse.json()) as EditorConfigBody;
+  const nestedPublishCapability = nestedEditor.bridge.capabilities.publish;
+  if (!nestedPublishCapability) {
+    throw new Error("The Ticket 06 nested publish capability is missing");
+  }
+  const nestedPublishResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${nestedPublicId}/publish`, {
+      body: JSON.stringify({
+        documentKey: nestedEditor.config.document.key,
+      }),
+      headers: capabilityHeaders(nestedPublishCapability),
+      method: "POST",
+    })
+  );
+  const nestedPublish = (await nestedPublishResponse.json()) as {
+    operationCapability?: string;
+    operationId?: string;
+  };
+  if (!nestedPublish.operationCapability || !nestedPublish.operationId) {
+    throw new Error("The Ticket 06 nested publish operation was not created");
+  }
+  expect(
+    await waitForOperation(nestedPublish.operationId, {
+      "X-Editor-Capability": nestedPublish.operationCapability,
+    })
+  ).toMatchObject({ status: "completed" });
+  const nestedDetailResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${nestedPublicId}`, {
+      headers: { Authorization: `Bearer ${adminBearer}` },
+    })
+  );
+  expect(await nestedDetailResponse.json()).toMatchObject({
+    form: { fillMethod: "onlyoffice", nativeFillAvailable: false },
+  });
+  const nestedNativeResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${nestedPublicId}`, {
+      body: JSON.stringify({ fillMethod: "native" }),
+      headers: { ...jsonHeaders, Authorization: `Bearer ${adminBearer}` },
+      method: "PATCH",
+    })
+  );
+  expect(nestedNativeResponse.status).toBe(409);
+  expect(await nestedNativeResponse.json()).toMatchObject({
+    error: "native_fill_unsupported",
   });
 });
 test("serves authenticated Admin and User workflows through HTTP", async () => {
