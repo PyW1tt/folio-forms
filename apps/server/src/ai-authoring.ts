@@ -445,7 +445,7 @@ export class AiAuthoringSessions {
       this.touch(sessionId, session);
       return this.preview(sessionId, session);
     } catch {
-      await piSession?.abort();
+      await piSession?.abort().catch(() => undefined);
       piSession?.dispose();
       generated?.document.fill(0);
       if (tempDirectory) {
