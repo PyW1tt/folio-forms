@@ -6,12 +6,19 @@ export const SESSION_KEY = "onlyoffice.sessionToken";
 export class ApiError extends Error {
   readonly status: number;
   readonly code: string;
+  readonly sessionRevoked: boolean;
 
-  constructor(status: number, code: string, message: string) {
+  constructor(
+    status: number,
+    code: string,
+    message: string,
+    sessionRevoked = false
+  ) {
     super(message);
     this.name = "ApiError";
     this.status = status;
     this.code = code;
+    this.sessionRevoked = sessionRevoked;
   }
 }
 
@@ -19,8 +26,8 @@ interface ApiErrorBody {
   error?: unknown;
   message?: unknown;
   code?: unknown;
+  sessionRevoked?: unknown;
 }
-
 export type Role = "admin" | "user";
 export interface SessionUser {
   id: string;
@@ -353,7 +360,12 @@ const request = async <T>(path: string, init: RequestInit = {}): Promise<T> => {
     const errorBody =
       body && typeof body === "object" ? (body as ApiErrorBody) : undefined;
     const code = errorCodeFor(errorBody, "request_failed");
-    throw new ApiError(response.status, code, fallbackMessage);
+    throw new ApiError(
+      response.status,
+      code,
+      fallbackMessage,
+      errorBody?.sessionRevoked === true
+    );
   }
   return body as T;
 };
@@ -493,7 +505,14 @@ export const replacePassword = (currentPassword: string, newPassword: string) =>
   });
 
 export const signOut = async () => {
-  await apiPost("/api/auth/sign-out");
+  try {
+    await apiPost("/api/auth/sign-out");
+  } catch (error) {
+    if (error instanceof ApiError && error.sessionRevoked) {
+      clearToken();
+    }
+    throw error;
+  }
   clearToken();
 };
 

@@ -265,7 +265,7 @@ Form creation and hard deletion record Object Cleanup Intents before an object c
 - The browser Session token and editor capabilities are never included in the signed ONLYOFFICE or plugin configuration. Before each action, the browser parent obtains a fresh five-minute capability bound to the actor, role, Form, document target, action, and active lease, then sends only that capability over the source/origin-pinned bridge.
 - ONLYOFFICE Document Server uses `ONLYOFFICE_JWT_SECRET` for signed editor configuration, command/conversion requests, private document downloads, and callbacks. It never accepts a Better Auth Session or editor capability at that boundary.
 - Each session expires one hour after issuance; sessions do not refresh or slide. The client clears the token at expiry and warns during the final five minutes.
-- Logout and password replacement revoke sessions immediately. Password replacement revokes every session, so the Admin must sign in again.
+- Logout and password replacement revoke sessions immediately. If AI Authoring cleanup fails after logout revokes the Session, the API reports the cleanup failure and confirms revocation so the browser clears auth state. Password replacement revokes every session, so the Admin must sign in again.
 - Admin account creation, disablement, email/role changes, and password resets are attributable Audit Events. Account disablement and credential or identity changes revoke all target Sessions immediately.
 - A serialized database invariant prevents concurrent requests from disabling or demoting the final enabled Admin.
 - The server derives identity and role from Better Auth, never from client-supplied role fields.
@@ -298,7 +298,7 @@ X-Editor-Capability: <signed-action-or-operation-capability>
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `POST` | `/api/auth/sign-in/email` | Provisioned email/password sign-in |
-| `POST` | `/api/auth/sign-out` | Revoke the current live Session |
+| `POST` | `/api/auth/sign-out` | Revoke the current live Session. An AI cleanup error after revocation returns `sessionRevoked: true`; a revocation failure does not. |
 | `GET` | `/api/session` | Read the current live Session and absolute expiry |
 | `POST` | `/api/account/password` | Replace the authenticated account password and revoke its Sessions |
 | `POST` | `/api/editor-leases/:id/renew` | Renew the current Session's active editor lease |

@@ -208,7 +208,16 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
   };
 
   const signOut = async () => {
-    await requestSignOut();
+    setError(null);
+    try {
+      await requestSignOut();
+    } catch (caughtError) {
+      if (caughtError instanceof ApiError && caughtError.sessionRevoked) {
+        setError(caughtError.code);
+        clearSession();
+      }
+      throw caughtError;
+    }
     clearSession();
   };
 

@@ -16,11 +16,14 @@ import {
 import { useState } from "react";
 
 import { Button, Notice, Spinner } from "@/components/ui";
+import { ApiError } from "@/lib/api";
 import { roleFor, useAuth } from "@/lib/auth";
 
 export const AppShell = ({ children }: { children: React.ReactNode }) => {
   const { user, signOut } = useAuth();
-  const [logoutError, setLogoutError] = useState(false);
+  const [logoutError, setLogoutError] = useState<"cleanup" | "sign-out" | null>(
+    null
+  );
   const [loggingOut, setLoggingOut] = useState(false);
   const [open, setOpen] = useState(false);
   const navigate = useNavigate();
@@ -38,7 +41,7 @@ export const AppShell = ({ children }: { children: React.ReactNode }) => {
       return;
     }
     setLoggingOut(true);
-    setLogoutError(false);
+    setLogoutError(null);
     try {
       await signOut();
       await navigate({
@@ -46,8 +49,12 @@ export const AppShell = ({ children }: { children: React.ReactNode }) => {
         search: { returnTo: undefined },
         to: "/login",
       });
-    } catch {
-      setLogoutError(true);
+    } catch (error) {
+      setLogoutError(
+        error instanceof ApiError && error.sessionRevoked
+          ? "cleanup"
+          : "sign-out"
+      );
     } finally {
       setLoggingOut(false);
     }
@@ -210,7 +217,11 @@ export const AppShell = ({ children }: { children: React.ReactNode }) => {
       </header>
       {logoutError ? (
         <div className="mx-auto max-w-[1240px] px-5 pt-4 lg:px-8">
-          <Notice tone="danger">ไม่สามารถออกจากระบบได้ กรุณาลองใหม่อีกครั้ง</Notice>
+          <Notice tone="danger">
+            {logoutError === "cleanup"
+              ? "ออกจากระบบแล้ว แต่การล้างข้อมูล AI ไม่สำเร็จ"
+              : "ไม่สามารถออกจากระบบได้ กรุณาลองใหม่อีกครั้ง"}
+          </Notice>
         </div>
       ) : null}
       <main className="mx-auto max-w-[1240px] px-5 py-8 lg:px-8 lg:py-12">

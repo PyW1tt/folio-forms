@@ -597,11 +597,26 @@ export class AiAuthoringSessions {
     }
   }
   async close(): Promise<void> {
+    const errors: unknown[] = [];
     for (const ownerSessionId of [...this.pendingGenerations.keys()]) {
-      await this.endForSession(ownerSessionId);
+      try {
+        await this.endForSession(ownerSessionId);
+      } catch (error) {
+        errors.push(error);
+      }
     }
     for (const [sessionId, session] of this.sessions) {
-      await this.dispose(sessionId, session);
+      try {
+        await this.dispose(sessionId, session);
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    if (errors.length === 1) {
+      throw errors[0];
+    }
+    if (errors.length > 1) {
+      throw new AggregateError(errors, "AI authoring shutdown failed");
     }
   }
 

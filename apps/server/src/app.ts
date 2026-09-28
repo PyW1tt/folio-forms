@@ -3714,22 +3714,33 @@ async function deleteResponseData({
     },
     { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
   );
-  if (result.deleted) {
-    await endAiAuthoringSessions(aiAuthoring, result.ownerSessionIds);
-  }
   if (!result.deleted) {
     return result;
   }
-  await drainObjectCleanupIntents(
-    undefined,
-    responseLookupDigest,
-    removeObject
+  const cleanupResults = await Promise.allSettled([
+    endAiAuthoringSessions(aiAuthoring, result.ownerSessionIds),
+    (async () => {
+      await drainObjectCleanupIntents(
+        undefined,
+        responseLookupDigest,
+        removeObject
+      );
+      const remaining = await prisma.objectCleanupIntent.count({
+        where: { deletionResponseLookupDigest: responseLookupDigest },
+      });
+      if (remaining > 0) {
+        fail(503, "deletion_cleanup_failed", "Response objects remain");
+      }
+    })(),
+  ]);
+  const cleanupErrors = cleanupResults.flatMap((cleanup) =>
+    cleanup.status === "rejected" ? [cleanup.reason] : []
   );
-  const remaining = await prisma.objectCleanupIntent.count({
-    where: { deletionResponseLookupDigest: responseLookupDigest },
-  });
-  if (remaining > 0) {
-    fail(503, "deletion_cleanup_failed", "Response objects remain");
+  if (cleanupErrors.length === 1) {
+    throw cleanupErrors[0];
+  }
+  if (cleanupErrors.length > 1) {
+    throw new AggregateError(cleanupErrors, "Response deletion cleanup failed");
   }
   await createResponseDeletionAudit({
     actorId: actor.id,
@@ -9192,9 +9203,28 @@ export function createApp(options: AppOptions = {}) {
     .post("/api/auth/sign-out", async ({ request }) => {
       const identity = await identityFor(request);
       if (identity) {
-        await aiAuthoring.endForSession(identity.sessionId, () =>
-          prisma.session.deleteMany({ where: { id: identity.sessionId } })
-        );
+        let sessionRevoked = false;
+        try {
+          await aiAuthoring.endForSession(identity.sessionId, async () => {
+            await prisma.session.deleteMany({
+              where: { id: identity.sessionId },
+            });
+            sessionRevoked = true;
+          });
+        } catch (error) {
+          if (!sessionRevoked) {
+            throw error;
+          }
+          console.error(error);
+          return Response.json(
+            {
+              error: "sign_out_cleanup_failed",
+              message: "Session was revoked, but AI authoring cleanup failed",
+              sessionRevoked: true,
+            },
+            { status: 500 }
+          );
+        }
       }
       return { ok: true };
     })
