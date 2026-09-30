@@ -246,7 +246,7 @@ const preserveUnchangedContent = (
   const instructionText = instruction.toLowerCase();
   const changesParagraphs =
     change &&
-    /\b(?:remove|delete|replace|change|rewrite|edit|update|drop|omit)\s+(?:the\s+)?(?:(?:first|second|third|last|all|existing|current)\s+)?(?:static\s+)?paragraphs?\b/iu.test(
+    /\b(?:remove|delete|replace|change|rewrite|edit|update|drop|omit)\s+(?:the\s+)?(?:(?:first|second|third|last|all|existing|current)\s+)?(?:static\s+)?(?:paragraphs?|text|wording|instructions?)\b/iu.test(
       instruction
     );
   for (const paragraph of current.paragraphs) {

@@ -12500,9 +12500,11 @@ test("Ticket 19 PDF authoring re-inspects original bytes when revising a retaine
   ]);
   const firstPrompt = "Create an equipment intake form from the attached PDF";
   const revisionPrompt = "Add a serial number field from the same PDF";
+  const instructionsRevisionPrompt = "Rewrite the instructions to match the attached PDF";
   const observations = [
     "PDF observation: the intake requires an employee name.",
     "PDF observation: the intake also requires an equipment serial number.",
+    "PDF observation: enter the employee name and equipment serial number.",
   ];
   const receivedPdfs: Uint8Array[] = [];
   const piMessages: string[] = [];
@@ -12559,7 +12561,8 @@ test("Ticket 19 PDF authoring re-inspects original bytes when revising a retaine
       const text = JSON.stringify(messages);
       piMessages.push(text);
       piCalls += 1;
-      const revising = text.includes(revisionPrompt);
+      const revisingInstructions = text.includes(instructionsRevisionPrompt);
+      const revising = text.includes(revisionPrompt) || revisingInstructions;
       const toolCall = piCalls % 2 === 1;
       const generated = {
         description: "Request equipment for work.",
@@ -12573,7 +12576,11 @@ test("Ticket 19 PDF authoring re-inspects original bytes when revising a retaine
             ? [{ label: "Serial Number", placeholder: "Enter serial number", tag: "serial_number" }]
             : []),
         ],
-        paragraphs: ["Complete each field."],
+        paragraphs: [
+          revisingInstructions
+            ? "Enter the employee name and equipment serial number from the PDF."
+            : "Complete each field.",
+        ],
         title: "Equipment Intake",
       };
       const chunks = toolCall
@@ -12598,7 +12605,7 @@ test("Ticket 19 PDF authoring re-inspects original bytes when revising a retaine
         : [
             {
               delta: {
-                content: revising ? "Added the serial number field." : "Created the intake form.",
+                content: revising ? "Revised the intake form." : "Created the intake form.",
                 role: "assistant",
               },
               finish_reason: null,
@@ -12731,9 +12738,13 @@ test("Ticket 19 PDF authoring re-inspects original bytes when revising a retaine
     expect(await refreshed.json()).toEqual({ session: created });
     expect(await (await getCurrent(otherAdminBearer)).json()).toEqual({ session: null });
     const revisionUrl = `${sessionUrl}/${created.sessionId}/revisions`;
-    const revisionRequest = (authorization: string, consent = true) =>
+    const revisionRequest = (
+      authorization: string,
+      consent = true,
+      prompt = revisionPrompt
+    ) =>
       new Request(revisionUrl, {
-        body: JSON.stringify({ consent, prompt: revisionPrompt }),
+        body: JSON.stringify({ consent, prompt }),
         headers: { ...jsonHeaders, Authorization: `Bearer ${authorization}` },
         method: "POST",
       });
@@ -12756,6 +12767,31 @@ test("Ticket 19 PDF authoring re-inspects original bytes when revising a retaine
     const revisedXml = unzipSync(new Uint8Array(await revisedDownload.arrayBuffer()))["word/document.xml"];
     expect(new TextDecoder().decode(revisedXml)).toContain('<w:tag w:val="serial_number"/>');
     expect(await (await getCurrent(adminBearer)).json()).toEqual({ session: revised });
+
+    const instructionsResponse = await pdfApp.handle(
+      revisionRequest(adminBearer, true, instructionsRevisionPrompt)
+    );
+    expect(instructionsResponse.status).toBe(200);
+    const { session: instructionsRevised } = (await instructionsResponse.json()) as {
+      session: typeof created;
+    };
+    expect(instructionsRevised.hasSourcePdf).toBe(true);
+    expect(receivedPdfs).toEqual([originalPdf, originalPdf, originalPdf]);
+    expect(piMessages[4]).toContain(observations[2]);
+    const instructionsDownload = await pdfApp.handle(new Request(
+      `http://test.local${instructionsRevised.downloadUrl}`,
+      { headers: { Authorization: `Bearer ${adminBearer}` } }
+    ));
+    expect(instructionsDownload.status).toBe(200);
+    const instructionsXml = unzipSync(new Uint8Array(await instructionsDownload.arrayBuffer()))["word/document.xml"];
+    const instructionsText = new TextDecoder().decode(instructionsXml);
+    expect(instructionsText).toContain("Enter the employee name and equipment serial number from the PDF.");
+    expect(instructionsText).not.toContain("Complete each field.");
+    expect(instructionsText).toContain('<w:tag w:val="employee_name"/>');
+    expect(instructionsText).toContain('<w:tag w:val="serial_number"/>');
+    expect(await (await getCurrent(adminBearer)).json()).toEqual({
+      session: instructionsRevised,
+    });
     expect((await pdfApp.handle(new Request(
       `${sessionUrl}/${created.sessionId}`,
       { headers: { Authorization: `Bearer ${adminBearer}` }, method: "DELETE" }
@@ -12798,6 +12834,7 @@ test("Ticket 19 PDF authoring re-inspects original bytes when revising a retaine
     activeSessionId = undefined;
     expect((await pdfApp.handle(revisionRequest(adminBearer))).status).toBe(404);
     expect(receivedPdfs).toEqual([
+      originalPdf,
       originalPdf,
       originalPdf,
       originalPdf,
