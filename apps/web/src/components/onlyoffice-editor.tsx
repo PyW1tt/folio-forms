@@ -289,12 +289,14 @@ export const OnlyOfficeEditor = ({
   const lastSaveRequestRef = useRef(0);
   const terminalOperationIdsRef = useRef(new Set<string>());
   const editorId = useId().replaceAll(":", "");
+  const surfaceId = `${editorId}-surface`;
   const leaseRef = useRef<EditorLease | null>(null);
   const loadedConfigUrlRef = useRef<string | null>(null);
   const [config, setConfig] = useState<EditorConfig | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [editorState, setEditorState] =
     useState<OnlyOfficeEditorState>("loading");
+  const [expanded, setExpanded] = useState(false);
   const [retryToken, setRetryToken] = useState(0);
   const [bridgeReadyVersion, setBridgeReadyVersion] = useState(0);
 
@@ -336,6 +338,21 @@ export const OnlyOfficeEditor = ({
       feedbackRef.current?.focus();
     }
   }, [editorState]);
+  useEffect(() => {
+    if (!expanded) {
+      return;
+    }
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setExpanded(false);
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [expanded]);
 
   useEffect(() => {
     const lease =
@@ -741,71 +758,118 @@ export const OnlyOfficeEditor = ({
     setRetryToken((value) => value + 1);
   };
 
-  if (editorState === "blocked") {
+  const renderEditorContent = () => {
+    if (editorState === "blocked") {
+      return (
+        <div
+          ref={feedbackRef}
+          className={`grid ${
+            expanded ? "h-full min-h-0" : "min-h-[520px]"
+          } place-items-center p-8`}
+          tabIndex={-1}
+        >
+          <Notice tone="danger">
+            <div className="space-y-3">
+              <p className="font-semibold">เอกสารนี้กำลังถูกแก้ไขโดยผู้ใช้รายอื่น</p>
+              <p>ยังไม่เปิดตัวแก้ไขจนกว่าจะเชื่อมต่อใหม่ได้</p>
+              <Button type="button" variant="secondary" onClick={retry}>
+                ลองเชื่อมต่อใหม่
+              </Button>
+            </div>
+          </Notice>
+        </div>
+      );
+    }
+
+    if (editorState === "error" || error) {
+      return (
+        <div
+          ref={feedbackRef}
+          className={`grid ${
+            expanded ? "h-full min-h-0" : "min-h-[520px]"
+          } place-items-center p-8`}
+          tabIndex={-1}
+        >
+          <Notice tone="danger">
+            <div className="space-y-3">
+              <p>{error ?? "ไม่สามารถเปิดตัวแก้ไขเอกสารได้"}</p>
+              <Button type="button" variant="secondary" onClick={retry}>
+                ลองใหม่
+              </Button>
+            </div>
+          </Notice>
+        </div>
+      );
+    }
+
+    if (!config) {
+      return (
+        <div
+          className={`grid ${
+            expanded ? "h-full min-h-0" : "min-h-[520px]"
+          } place-items-center gap-3 p-8 text-center`}
+          aria-busy="true"
+          role="status"
+        >
+          <Spinner />
+          <p className="text-sm text-[var(--ink-soft)]">
+            กำลังเตรียมตัวแก้ไขเอกสาร…
+          </p>
+        </div>
+      );
+    }
+
+    if (config.editorUrl) {
+      return (
+        <iframe
+          title={title}
+          src={config.editorUrl}
+          className={
+            expanded
+              ? "h-full min-h-0 w-full border-0"
+              : "h-[min(72vh,760px)] min-h-[520px] w-full border-0"
+          }
+        />
+      );
+    }
+
     return (
       <div
-        ref={feedbackRef}
-        className="grid min-h-[520px] place-items-center p-8"
-        tabIndex={-1}
+        className={
+          expanded
+            ? "h-full min-h-0 w-full"
+            : "h-[min(72vh,760px)] min-h-[520px] w-full"
+        }
       >
-        <Notice tone="danger">
-          <div className="space-y-3">
-            <p className="font-semibold">เอกสารนี้กำลังถูกแก้ไขโดยผู้ใช้รายอื่น</p>
-            <p>ยังไม่เปิดตัวแก้ไขจนกว่าจะเชื่อมต่อใหม่ได้</p>
-            <Button type="button" variant="secondary" onClick={retry}>
-              ลองเชื่อมต่อใหม่
-            </Button>
-          </div>
-        </Notice>
+        <div ref={hostRef} className="h-full w-full" aria-label={title} />
       </div>
     );
-  }
-
-  if (editorState === "error" || error) {
-    return (
-      <div
-        ref={feedbackRef}
-        className="grid min-h-[520px] place-items-center p-8"
-        tabIndex={-1}
-      >
-        <Notice tone="danger">
-          <div className="space-y-3">
-            <p>{error ?? "ไม่สามารถเปิดตัวแก้ไขเอกสารได้"}</p>
-            <Button type="button" variant="secondary" onClick={retry}>
-              ลองใหม่
-            </Button>
-          </div>
-        </Notice>
-      </div>
-    );
-  }
-
-  if (!config) {
-    return (
-      <div
-        className="grid min-h-[520px] place-items-center gap-3 p-8 text-center"
-        aria-busy="true"
-        role="status"
-      >
-        <Spinner />
-        <p className="text-sm text-[var(--ink-soft)]">กำลังเตรียมตัวแก้ไขเอกสาร…</p>
-      </div>
-    );
-  }
-
-  if (config.editorUrl) {
-    return (
-      <iframe
-        title={title}
-        src={config.editorUrl}
-        className="h-[min(72vh,760px)] min-h-[520px] w-full border-0"
-      />
-    );
-  }
+  };
 
   return (
-    <div className="h-[min(72vh,760px)] min-h-[520px] w-full">
-      <div ref={hostRef} className="h-full w-full" aria-label={title} />
+    <div
+      className={
+        expanded
+          ? "fixed inset-0 z-[100] flex min-h-0 flex-col overflow-hidden overscroll-none bg-[var(--canvas)] p-3 sm:p-4"
+          : "relative"
+      }
+    >
+      <div className="flex shrink-0 justify-end pb-2">
+        <Button
+          aria-controls={surfaceId}
+          aria-expanded={expanded}
+          className="focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--ink)]"
+          onClick={() => setExpanded((value) => !value)}
+          size="sm"
+          type="button"
+          variant="secondary"
+        >
+          {expanded ? "คืนค่าขนาดปกติ" : "ขยายพื้นที่เอกสาร"}
+        </Button>
+      </div>
+      <div className={expanded ? "min-h-0 flex-1" : undefined} id={surfaceId}>
+        {renderEditorContent()}
+      </div>
     </div>
   );
 };
