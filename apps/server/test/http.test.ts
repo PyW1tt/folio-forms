@@ -12938,9 +12938,9 @@ test("Ticket 20 Python document worker generates a Template Draft and contains h
   const serviceKey = `ticket-20-${crypto.randomUUID()}`;
   const marker = `Python-generated-${crypto.randomUUID()}`;
   const template = {
-    title: "Python Equipment Request",
+    title: `Python Equipment Request ${marker}`,
     description: "Request equipment with a generated document.",
-    paragraphs: ["Complete the equipment request."],
+    paragraphs: ["Complete the equipment request.", "Use R&D <equipment>."],
     fields: [
       {
         label: "Employee Name",
@@ -12953,14 +12953,18 @@ test("Ticket 20 Python document worker generates a Template Draft and contains h
 from zipfile import ZipFile, ZIP_DEFLATED
 from xml.sax.saxutils import escape
 
-marker = ${JSON.stringify(marker)}
+title = ${JSON.stringify(template.title)}
+description = ${JSON.stringify(template.description)}
 document = (
     '<?xml version="1.0" encoding="UTF-8"?>'
     '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
-    '<w:body><w:p><w:r><w:t>' + escape(marker) + '</w:t></w:r></w:p>'
+    '<w:body><w:p><w:r><w:t>' + escape(title) + '</w:t></w:r></w:p>'
+    '<w:p><w:r><w:t>' + escape(description) + '</w:t></w:r></w:p>'
     '<w:p><w:r><w:t>Complete the equipment request.</w:t></w:r></w:p>'
+    '<w:p><w:r><w:t>' + escape('Use R&') + '</w:t></w:r>'
+    '<w:r><w:t>' + escape('D <equipment>.') + '</w:t></w:r></w:p>'
     '<w:p><w:sdt><w:sdtPr><w:alias w:val="Employee Name"/>'
-    '<w:tag w:val="employee_name"/><w:text/></w:sdtPr>'
+    '<w:tag w:val="employee_name"/><w:text/><w:showingPlcHdr/></w:sdtPr>'
     '<w:sdtContent><w:r><w:t>Enter employee name</w:t></w:r></w:sdtContent>'
     '</w:sdt></w:p><w:sectPr/></w:body></w:document>'
 )
@@ -12979,7 +12983,7 @@ with ZipFile('output.docx', 'w', ZIP_DEFLATED) as archive:
   const revisionPrompt = "A warmer welcome and a requester identity suit this form better.";
   const paragraphRevision = {
     ...template,
-    paragraphs: ["Welcome! Tell us which equipment you need."],
+    paragraphs: ["Welcome! Tell us which equipment you need.", "Use R&D <equipment>."],
     source: benignSource.replace(
       "Complete the equipment request.",
       "Welcome! Tell us which equipment you need."
@@ -13002,12 +13006,44 @@ with ZipFile('output.docx', 'w', ZIP_DEFLATED) as archive:
     fields: fieldRevision.fields,
     editedParagraphs: ["Complete the equipment request."],
     removedFieldTags: ["employee_name"],
-    source: fieldRevision.source.replace(
-      "Complete the equipment request.",
-      "Welcome! Tell us which equipment you need."
-    ),
+    source: fieldRevision.source
+      .replace(
+        "Complete the equipment request.",
+        "Welcome! Tell us which equipment you need."
+      )
+      .replace("<w:showingPlcHdr/>", ""),
   };
   const rejectedOutputs = {
+    "source-only paragraph removal": {
+      ...template,
+      source: benignSource.replace(
+        "'<w:p><w:r><w:t>Complete the equipment request.</w:t></w:r></w:p>'",
+        "''"
+      ),
+    },
+    "source-only paragraph change": {
+      ...template,
+      source: benignSource.replace(
+        "Complete the equipment request.",
+        "Original instructions were silently replaced."
+      ),
+    },
+    "source-only title change": {
+      ...template,
+      source: benignSource.replace("escape(title)", "escape('Incorrect title')"),
+    },
+    "source-only description change": {
+      ...template,
+      source: benignSource.replace("escape(description)", "escape('Incorrect description')"),
+    },
+    "source-only field label change": {
+      ...template,
+      source: benignSource.replace('w:alias w:val="Employee Name"', 'w:alias w:val="Incorrect label"'),
+    },
+    "source-only field placeholder change": {
+      ...template,
+      source: benignSource.replace("Enter employee name", "Incorrect placeholder"),
+    },
     "paragraph revision without declaration": paragraphRevision,
     "paragraph revision with stale declaration": {
       ...paragraphRevision,
@@ -13047,7 +13083,6 @@ with ZipFile('output.docx', 'w', ZIP_DEFLATED) as archive:
         messages?: { content?: unknown; role?: string }[];
         tools?: { function?: { name?: string } }[];
       };
-      expect(body.tools?.some((tool) => tool.function?.name === "create_template_docx_python")).toBe(true);
       const messages = body.messages ?? [];
       const latestUserContent = [...messages].reverse().find((message) =>
         message.role === "user"
@@ -13063,8 +13098,9 @@ with ZipFile('output.docx', 'w', ZIP_DEFLATED) as archive:
       const generated = attemptedAttack
         ? { ...template, source: `${attemptedAttack[1]}\n${benignSource}` }
         : requestedOutput ?? { ...template, source: benignSource };
-      const isToolResult = messages.at(-1)?.role === "tool";
-      const chunks = isToolResult
+      // Pi also sends tool-free requests when compacting the long attack history.
+      const shouldSummarize = messages.at(-1)?.role === "tool" || !body.tools;
+      const chunks = shouldSummarize
         ? [
             {
               delta: { role: "assistant", content: "Document prepared." },
@@ -13193,6 +13229,8 @@ with ZipFile('output.docx', 'w', ZIP_DEFLATED) as archive:
       };
     };
     sessionId = session.sessionId;
+    expect(session.title).toBe(template.title);
+    expect(session.description).toBe(template.description);
     expect(session.fields).toEqual(template.fields);
     const download = (bearer: string, url: string) =>
       workerApp.handle(new Request(`http://test.local${url}`, {

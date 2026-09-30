@@ -75,7 +75,10 @@ interface AuthoringToolState {
   current?: GeneratedTemplate;
   generated?: GeneratedTemplate;
   pending: PendingGeneration;
-  validateDocument: (document: Uint8Array) => string[];
+  validateDocument: (
+    document: Uint8Array,
+    expected?: Omit<GeneratedTemplate, "document">
+  ) => string[];
 }
 
 interface AuthoringSession {
@@ -446,7 +449,7 @@ export class AiAuthoringSessions {
     owner: AuthoringOwner,
     prompt: string,
     consent: unknown,
-    validateDocument: (document: Uint8Array) => string[],
+    validateDocument: AuthoringToolState["validateDocument"],
     reservation: AuthoringRequestReservation,
     isOwnerSessionCurrent: () => Promise<boolean>,
     sourcePdf?: Uint8Array
@@ -594,7 +597,8 @@ export class AiAuthoringSessions {
       });
       const acceptCandidate = (
         candidate: GeneratedTemplate,
-        edits: RevisionEdits
+        edits: RevisionEdits,
+        validateMetadata = false
       ) => {
         try {
           if (toolState.pending.cancelled) {
@@ -604,7 +608,10 @@ export class AiAuthoringSessions {
             throw new Error("Only one DOCX can be created in this turn");
           }
           preserveUnchangedContent(toolState.current, candidate, edits);
-          const tags = toolState.validateDocument(candidate.document);
+          const tags = toolState.validateDocument(
+            candidate.document,
+            validateMetadata ? candidate : undefined
+          );
           if (
             tags.length !== candidate.fields.length ||
             candidate.fields.some((field) => !tags.includes(field.tag))
@@ -665,7 +672,7 @@ export class AiAuthoringSessions {
             parameters.source,
             toolState.pending.inspectionAbort.signal
           );
-          return acceptCandidate({ ...content, document }, parameters);
+          return acceptCandidate({ ...content, document }, parameters, true);
         },
         label: "Create DOCX with Python",
         name: "create_template_docx_python",
@@ -764,7 +771,7 @@ export class AiAuthoringSessions {
     owner: AuthoringOwner,
     prompt: string,
     consent: unknown,
-    validateDocument: (document: Uint8Array) => string[],
+    validateDocument: AuthoringToolState["validateDocument"],
     reservation: AuthoringRequestReservation,
     isOwnerSessionCurrent: () => Promise<boolean>
   ): Promise<AuthoringPreview> {

@@ -33,7 +33,7 @@ import {
   AiAuthoringSessions,
   authoringDisclosure,
 } from "./ai-authoring";
-import type { OmniRouteConfig } from "./ai-authoring";
+import type { GeneratedTemplate, OmniRouteConfig } from "./ai-authoring";
 
 import {
   callbackClaim,
@@ -5010,7 +5010,10 @@ function templateGlossaryPlaceholders(
   return placeholders;
 }
 
-function parseTemplateFields(bytes: Uint8Array): ParsedTemplateField[] {
+function parseTemplateFields(
+  bytes: Uint8Array,
+  content?: { paragraphs: string[]; fieldText: Map<string, string> }
+): ParsedTemplateField[] {
   const { archive, xmlPaths } = safeTemplateArchive(bytes);
   const controlPaths = reachableTemplateControlParts(archive, xmlPaths);
   const fields: { documentOrder: number; field: ParsedTemplateField }[] = [];
@@ -5021,6 +5024,9 @@ function parseTemplateFields(bytes: Uint8Array): ParsedTemplateField[] {
     let documentOrder = 0;
     let alternateFallbackDepth = 0;
     const controls: TemplateControlFrame[] = [];
+    const paragraphs: { text: string }[] = [];
+    let textDepth = 0;
+    let propertyDepth = 0;
     parseTemplateXml(templateArchiveText(archive, archivePath), {
       close: (element) => {
         if (
@@ -5061,6 +5067,9 @@ function parseTemplateFields(bytes: Uint8Array): ParsedTemplateField[] {
           templateWordNamespaces.has(element.uri)
         ) {
           controls.pop();
+          if (content && frame.tag) {
+            content.fieldText.set(frame.tag.trim(), frame.placeholderText.trim());
+          }
           fields.push({
             documentOrder: documentOrderBase + frame.documentOrder,
             field: parsedTemplateField(frame, glossaryPlaceholders),
@@ -5250,7 +5259,19 @@ function parseTemplateFields(bytes: Uint8Array): ParsedTemplateField[] {
       },
       text: (value) => {
         const frame = controls.at(-1);
-        if (frame?.showingPlaceholder && frame.inContentDepth > 0) {
+        if (content) {
+          if (alternateFallbackDepth > 0 || textDepth === 0 || propertyDepth > 0) {
+            return;
+          }
+          if (frame && frame.inContentDepth > 0 && frame.inPropertiesDepth === 0) {
+            frame.placeholderText += value;
+          } else if (controls.length === 0) {
+            const paragraph = paragraphs.at(-1);
+            if (paragraph) {
+              paragraph.text += value;
+            }
+          }
+        } else if (frame?.showingPlaceholder && frame.inContentDepth > 0) {
           frame.placeholderText += value;
         }
       },
@@ -5283,8 +5304,43 @@ function parseTemplateFields(bytes: Uint8Array): ParsedTemplateField[] {
   return orderedFields;
 }
 
-function validateTemplateControls(bytes: Uint8Array): string[] {
-  return parseTemplateFields(bytes).map((field) => field.tag);
+function validateTemplateControls(
+  bytes: Uint8Array,
+  expected?: Omit<GeneratedTemplate, "document">
+): string[] {
+  const content = expected
+    ? { paragraphs: [] as string[], fieldText: new Map<string, string>() }
+    : undefined;
+  const fields = parseTemplateFields(bytes, content);
+  if (expected && content) {
+    const remaining = new Map<string, number>();
+    for (const text of [expected.title, expected.description, ...expected.paragraphs]) {
+      if (text) {
+        remaining.set(text, (remaining.get(text) ?? 0) + 1);
+      }
+    }
+    for (const text of content.paragraphs) {
+      const count = remaining.get(text) ?? 0;
+      if (count > 0) {
+        remaining.set(text, count - 1);
+      } else if (!expected.fields.some((field) => text === field.label || text === `${field.label}:`)) {
+        throw new Error("Generated DOCX static text does not match its metadata");
+      }
+    }
+    if ([...remaining.values()].some((count) => count > 0)) {
+      throw new Error("Generated DOCX static text does not match its metadata");
+    }
+    if (fields.some((field) => {
+      const declared = expected.fields.find((candidate) => candidate.tag === field.tag);
+      return !declared ||
+        field.type !== FieldType.text ||
+        field.label !== declared.label ||
+        content.fieldText.get(field.tag) !== declared.placeholder;
+    })) {
+      throw new Error("Generated DOCX controls do not match its metadata");
+    }
+  }
+  return fields.map((field) => field.tag);
 }
 interface ResponsePictureManifestField {
   pictureMaxBytes: number | null;
@@ -5523,6 +5579,20 @@ function validateResponsePictureControls(
         if (alternateFallbackDepth > 0) {
           return;
         }
+        if (content && templateWordNamespaces.has(element.uri)) {
+          if (element.local === "t") {
+            textDepth -= 1;
+          }
+          if (element.local.endsWith("Pr")) {
+            propertyDepth -= 1;
+          }
+          if (element.local === "p") {
+            const text = paragraphs.pop()?.text.trim();
+            if (text) {
+              content.paragraphs.push(text);
+            }
+          }
+        }
         const frame = controls.at(-1);
         if (!frame) {
           return;
@@ -5564,6 +5634,17 @@ function validateResponsePictureControls(
         }
         if (alternateFallbackDepth > 0) {
           return;
+        }
+        if (content && templateWordNamespaces.has(element.uri)) {
+          if (element.local === "t") {
+            textDepth += 1;
+          }
+          if (element.local.endsWith("Pr")) {
+            propertyDepth += 1;
+          }
+          if (element.local === "p") {
+            paragraphs.push({ text: "" });
+          }
         }
         if (
           element.local === "sdt" &&
@@ -9817,7 +9898,7 @@ export function createApp(options: AppOptions = {}) {
             { authSessionId: identity.sessionId, userId: identity.id },
             input.prompt,
             input.consent,
-            (document) => validateTemplateControls(document),
+            (document, expected) => validateTemplateControls(document, expected),
             reservation,
             async () => {
               const currentIdentity = await identityFor(request);
@@ -9879,7 +9960,7 @@ export function createApp(options: AppOptions = {}) {
             { authSessionId: identity.sessionId, userId: identity.id },
             input.prompt,
             input.consent,
-            (document) => validateTemplateControls(document),
+            (document, expected) => validateTemplateControls(document, expected),
             reservation,
             async () => {
               const currentIdentity = await identityFor(request);
