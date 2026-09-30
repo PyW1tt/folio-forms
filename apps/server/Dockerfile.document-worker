@@ -1,0 +1,6 @@
+FROM oven/bun:1-alpine
+USER root
+RUN apk add --no-cache docker-cli
+COPY apps/server/src/document-worker-server.ts /app/document-worker-server.ts
+COPY apps/server/worker-image /app/worker-image
+CMD ["bun", "/app/document-worker-server.ts"]

@@ -11,6 +11,10 @@ services:
     ports:
       - "127.0.0.1:8081:80"
 
+  document-worker:
+    ports:
+      - "127.0.0.1:3020:3010"
+
   dev-gateway:
     image: vicanso/pingap:0.14.2@sha256:961e589cbeb64a3f4b11eba40e147dab9467bb8f5a29d2ecc62dba4ac839a440
     restart: unless-stopped
