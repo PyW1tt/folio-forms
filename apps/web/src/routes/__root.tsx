@@ -8,35 +8,17 @@ import {
 import { useEffect, useState } from "react";
 
 import { Button, Notice, Spinner } from "@/components/ui";
-import { safeReturnPath } from "@/lib/api";
-import { AuthProvider, useAuth } from "@/lib/auth";
+import { legacySsoReturnPath, safeReturnPath, startLegacySso } from "@/lib/api";
+import { AuthProvider, roleFor, useAuth } from "@/lib/auth";
 import {
+  afterEditorSave,
   SESSION_WARNING_WINDOW_MS,
-  createDeferred,
   shouldWarnBeforeSessionExpiry,
 } from "@/lib/form-lifecycle";
 
 import "@/index.css";
 
 const MAX_TIMEOUT_MS = 2_147_483_647;
-interface ReauthenticationRequestDetail {
-  handled: boolean;
-  resolve: (allowed: boolean) => void;
-}
-
-const requestEditorSave = (): Promise<boolean> => {
-  const result = createDeferred<boolean>();
-  const detail: ReauthenticationRequestDetail = {
-    handled: false,
-    resolve: result.resolve,
-  };
-  window.dispatchEvent(
-    new CustomEvent("folio:before-reauth", {
-      detail,
-    })
-  );
-  return detail.handled ? result.promise : Promise.resolve(true);
-};
 
 const currentReturnPath = () => {
   if (typeof window === "undefined") {
@@ -54,6 +36,7 @@ const AuthGate = () => {
   const [reauthenticating, setReauthenticating] = useState(false);
   const [reauthenticationFailed, setReauthenticationFailed] = useState(false);
   const { pathname } = location;
+  const usesLegacySso = Boolean(user && roleFor(user) === "user");
 
   useEffect(() => {
     const expiresAtMs = expiresAt ? Date.parse(expiresAt) : Number.NaN;
@@ -91,15 +74,24 @@ const AuthGate = () => {
     setReauthenticating(true);
     setReauthenticationFailed(false);
     try {
-      if (!(await requestEditorSave())) {
-        return;
-      }
-      const returnTo = currentReturnPath() ?? undefined;
-      await signOut();
-      await navigate({
-        replace: true,
-        search: { returnTo },
-        to: "/login",
+      await afterEditorSave(async () => {
+        if (usesLegacySso) {
+          const { authorizationUrl } = await startLegacySso(
+            legacySsoReturnPath(
+              window.location.pathname,
+              window.location.search
+            )
+          );
+          window.location.assign(authorizationUrl);
+          return;
+        }
+        const returnTo = currentReturnPath() ?? undefined;
+        await signOut();
+        await navigate({
+          replace: true,
+          search: { returnTo },
+          to: "/login",
+        });
       });
     } catch {
       setReauthenticationFailed(true);
@@ -149,7 +141,15 @@ const AuthGate = () => {
     );
   }
 
-  let reauthenticationLabel = "เข้าสู่ระบบใหม่";
+  let reauthenticationLabel = usesLegacySso ? "เข้าสู่ระบบระบบเดิม" : "เข้าสู่ระบบใหม่";
+  let reauthenticationMessage = usesLegacySso
+    ? "เซสชันจะหมดอายุภายใน 5 นาที กรุณาบันทึกงานก่อน แล้วเข้าสู่ระบบระบบเดิม"
+    : "เซสชันจะหมดอายุภายใน 5 นาที กรุณาบันทึกงานก่อน แล้วเข้าสู่ระบบใหม่";
+  if (reauthenticationFailed) {
+    reauthenticationMessage = usesLegacySso
+      ? "ไม่สามารถเชื่อมต่อบัญชีระบบเดิมได้ กรุณาลองอีกครั้ง"
+      : "ไม่สามารถยกเลิกเซสชันเดิมได้ กรุณาลองอีกครั้ง";
+  }
   if (reauthenticating) {
     reauthenticationLabel = "กำลังเตรียมเซสชันใหม่…";
   } else if (reauthenticationFailed) {
@@ -162,16 +162,12 @@ const AuthGate = () => {
     pathname !== "/login" &&
     pathname !== "/change-password";
   const showSignOutCleanupFailure =
-    !user &&
-    pathname === "/login" &&
-    authError === "sign_out_cleanup_failed";
+    !user && pathname === "/login" && authError === "sign_out_cleanup_failed";
   return (
     <>
       {showSignOutCleanupFailure ? (
         <div className="mx-auto max-w-[1240px] px-5 pt-4 lg:px-8">
-          <Notice tone="danger">
-            ออกจากระบบแล้ว แต่การล้างข้อมูล AI ไม่สำเร็จ
-          </Notice>
+          <Notice tone="danger">ออกจากระบบแล้ว แต่การล้างข้อมูล AI ไม่สำเร็จ</Notice>
         </div>
       ) : null}
 
@@ -179,11 +175,7 @@ const AuthGate = () => {
         <div className="mx-auto max-w-[1240px] px-5 pt-4 lg:px-8">
           <Notice tone="danger">
             <div className="flex flex-wrap items-center justify-between gap-3">
-              <span>
-                {reauthenticationFailed
-                  ? "ไม่สามารถยกเลิกเซสชันเดิมได้ กรุณาลองอีกครั้ง"
-                  : "เซสชันจะหมดอายุภายใน 5 นาที กรุณาบันทึกงานก่อน แล้วเข้าสู่ระบบใหม่"}
-              </span>
+              <span>{reauthenticationMessage}</span>
               <Button
                 variant="secondary"
                 size="sm"

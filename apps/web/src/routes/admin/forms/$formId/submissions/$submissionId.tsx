@@ -12,34 +12,34 @@ import type {
   Submission,
 } from "@/lib/api";
 
+// oxlint-disable-next-line complexity -- The detail route owns read, history, revision, and export state.
 const SubmissionDetailRoute = () => {
   const { formId, submissionId } = useParams({
     from: "/admin/forms/$formId/submissions/$submissionId",
   });
   const [submission, setSubmission] = useState<Submission | null>(null);
   const [data, setData] = useState<Record<string, unknown> | null>(null);
+  const [dataRevision, setDataRevision] = useState<number | null>(null);
   const [fields, setFields] = useState<ReceiptField[]>([]);
-  const [pictures, setPictures] = useState<Record<string, boolean> | null>(
-    null
-  );
-  const [documentAvailable, setDocumentAvailable] = useState<boolean | null>(
-    null
-  );
+  const [revisionError, setRevisionError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [historyError, setHistoryError] = useState<string | null>(null);
+  const [history, setHistory] = useState<
+    ResponseRevisionsResponse["revisions"]
+  >([]);
+  const [viewRevision, setViewRevision] = useState<number | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     const loadHistory = async (responseId: string) => {
       try {
-        const history = await apiGet<ResponseRevisionsResponse>(
+        const payload = await apiGet<ResponseRevisionsResponse>(
           `/api/responses/${responseId}/corrections`
         );
         if (!cancelled) {
-          const latestRevision = history.revisions.at(-1);
-          setPictures(latestRevision?.pictures ?? null);
-          setDocumentAvailable(Boolean(latestRevision?.document.available));
+          setHistory(payload.revisions);
+          setViewRevision(payload.latestRevision);
         }
       } catch {
         if (!cancelled) {
@@ -49,7 +49,6 @@ const SubmissionDetailRoute = () => {
     };
     const loadSubmission = async () => {
       setHistoryError(null);
-      setDocumentAvailable(null);
       try {
         const payload = await apiGet<{
           data: Record<string, unknown>;
@@ -60,8 +59,6 @@ const SubmissionDetailRoute = () => {
           return;
         }
         setSubmission(payload.submission);
-        setData(payload.data);
-        setFields(payload.fields);
         if (payload.submission.responseId) {
           void loadHistory(payload.submission.responseId);
         }
@@ -85,6 +82,39 @@ const SubmissionDetailRoute = () => {
       cancelled = true;
     };
   }, [submissionId]);
+  useEffect(() => {
+    if (!submission || viewRevision === null) {
+      return;
+    }
+    let cancelled = false;
+    setData(null);
+    setDataRevision(null);
+    setFields([]);
+    setRevisionError(null);
+    const loadRevision = async () => {
+      try {
+        const payload = await apiGet<{
+          data: Record<string, unknown>;
+          fields: ReceiptField[];
+        }>(`/api/submissions/${submissionId}/data?revision=${viewRevision}`);
+        if (!cancelled) {
+          setData(payload.data);
+          setDataRevision(viewRevision);
+          setFields(payload.fields);
+        }
+      } catch {
+        if (!cancelled) {
+          setData(null);
+          setFields([]);
+          setRevisionError("Could not load selected revision.");
+        }
+      }
+    };
+    void loadRevision();
+    return () => {
+      cancelled = true;
+    };
+  }, [submission, submissionId, viewRevision]);
   if (loading) {
     return (
       <div className="grid min-h-56 place-items-center">
@@ -121,17 +151,21 @@ const SubmissionDetailRoute = () => {
     );
   }
 
+  const selectedRevision = viewRevision ?? history.at(-1)?.revision ?? 0;
+  const selectedRevisionRecord = history.find(
+    (revision) => revision.revision === selectedRevision
+  );
   const downloadDocx = async () => {
     await downloadArtifact(
-      `/api/submissions/${submissionId}/docx?revision=latest`,
-      `${submissionId}-latest.docx`
+      `/api/submissions/${submissionId}/docx?revision=${selectedRevision}`,
+      `${submissionId}-${selectedRevision}.docx`
     );
   };
 
   const downloadPdf = async () => {
     await downloadArtifact(
-      `/api/submissions/${submissionId}/pdf?revision=latest`,
-      `${submissionId}-latest.pdf`
+      `/api/submissions/${submissionId}/pdf?revision=${selectedRevision}`,
+      `${submissionId}-${selectedRevision}.pdf`
     );
   };
 
@@ -158,8 +192,29 @@ const SubmissionDetailRoute = () => {
             {submission.userEmail ?? "Respondent"}
           </p>
         </div>
+        <label className="flex items-center gap-2 text-sm font-semibold">
+          <span>Revision</span>
+          <select
+            aria-label="Select revision"
+            className="min-h-10 rounded-[10px] border border-[var(--line-strong)] bg-[var(--paper)] px-3"
+            disabled={historyError !== null || history.length === 0}
+            onChange={(event) =>
+              setViewRevision(Number(event.currentTarget.value))
+            }
+            value={selectedRevision}
+          >
+            {history.map((revision) => (
+              <option key={revision.revision} value={revision.revision}>
+                {revision.revision === 0
+                  ? "Original submission"
+                  : `Correction ${revision.revision}`}
+              </option>
+            ))}
+          </select>
+        </label>
         <div className="flex gap-2">
           <button
+            disabled={!selectedRevisionRecord}
             onClick={downloadDocx}
             className="inline-flex min-h-10 items-center gap-2 rounded-[10px] border border-[var(--line-strong)] bg-[var(--paper)] px-3 text-sm font-semibold hover:border-[var(--ink)]"
           >
@@ -167,6 +222,7 @@ const SubmissionDetailRoute = () => {
             DOCX
           </button>
           <button
+            disabled={!selectedRevisionRecord}
             onClick={downloadPdf}
             className="inline-flex min-h-10 items-center gap-2 rounded-[10px] border border-[var(--line-strong)] bg-[var(--paper)] px-3 text-sm font-semibold hover:border-[var(--ink)]"
           >
@@ -178,14 +234,17 @@ const SubmissionDetailRoute = () => {
       <Card className="overflow-hidden p-5">
         <SubmissionResultViewer
           configUrl={
-            submission.responseId
-              ? `/api/admin/results/${submission.responseId}/viewer-config?revision=latest`
+            submission.responseId && selectedRevisionRecord
+              ? `/api/admin/results/${submission.responseId}/viewer-config?revision=${selectedRevision}`
               : undefined
           }
-          data={data ?? {}}
-          documentAvailable={documentAvailable}
-          fields={fields}
-          pictures={pictures}
+          data={dataRevision === selectedRevision ? (data ?? {}) : {}}
+          documentAvailable={
+            selectedRevisionRecord?.document.available ?? false
+          }
+          fields={dataRevision === selectedRevision ? fields : []}
+          fieldsError={historyError ?? revisionError}
+          pictures={selectedRevisionRecord?.pictures ?? null}
         />
       </Card>
     </div>

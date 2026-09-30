@@ -7,7 +7,7 @@ import { basename, join } from "node:path";
 
 import { AgentSession } from "@earendil-works/pi-coding-agent";
 import { auth, ensureBootstrapAdmin } from "@onlyoffice/auth";
-import { prisma } from "@onlyoffice/db";
+import { Prisma, prisma } from "@onlyoffice/db";
 import { strToU8, unzipSync, zipSync } from "fflate";
 import {
   createInProcessFolioConnector,
@@ -20,10 +20,10 @@ import type { LegacySsoMockServer, PrefillMockServer } from "prefill-mock/mock";
 import { AiAuthoringSessions } from "../src/ai-authoring";
 import {
   createApp,
-  type LegacySsoConfig,
   reconcileRecoverableState,
   resolveCallbackDocumentUrl,
 } from "../src/app";
+import type { LegacySsoConfig } from "../src/app";
 import type { EditorCapabilityAction } from "../src/onlyoffice";
 import {
   callbackClaim,
@@ -52,11 +52,14 @@ if (!databaseUrl) {
   );
 }
 
+const convertedDocumentKeys: string[] = [];
 const app = createApp({
   legacySso: null,
   onlyOffice: {
-    convertDocxToPdf: () =>
-      Promise.resolve(new TextEncoder().encode("%PDF-test")),
+    convertDocxToPdf: (documentKey) => {
+      convertedDocumentKeys.push(documentKey);
+      return Promise.resolve(new TextEncoder().encode("%PDF-test"));
+    },
     forceSave: () => Promise.resolve(false),
   },
   prefillReturnUrl: "https://source.example.test/forms/return",
@@ -73,6 +76,9 @@ afterEach(() => {
   legacySsoMock = undefined;
 });
 const jsonHeaders = { "Content-Type": "application/json" };
+const editorCapabilityHeaders = (capability: string) => ({
+  "X-Editor-Capability": capability,
+});
 const trimTrailingSlashes = (value: string): string =>
   value.replace(/\/+$/u, "");
 const onlyOfficeBaseUrl = trimTrailingSlashes(
@@ -119,7 +125,7 @@ const docxFixture = (label: string, paddingBytes = 0): Uint8Array =>
     paddingBytes,
   });
 const contentControlDocument = (controls: string): string =>
-  `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml" xmlns:word="http://purl.oclc.org/ooxml/wordprocessingml/main"><w:body>${controls}<w:sectPr/></w:body></w:document>`;
+  `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml" xmlns:word="http://purl.oclc.org/ooxml/wordprocessingml/main" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"><w:body>${controls}<w:sectPr/></w:body></w:document>`;
 
 const contentControl = ({
   alias,
@@ -387,6 +393,7 @@ interface EditorConfigBody {
             bridgeId: string;
             parentOrigin: string;
             publicId?: string;
+            tagAliases?: Record<string, string>;
           }
         >;
         pluginsData: string[];
@@ -462,9 +469,7 @@ const bearerFor = async (
   }
   return token;
 };
-type LegacySsoHttpHandler = (
-  request: Request
-) => Response | Promise<Response>;
+type LegacySsoHttpHandler = (request: Request) => Response | Promise<Response>;
 
 interface LegacySsoBrowserTransaction {
   authorizationUrl: string;
@@ -508,22 +513,32 @@ const cookiePairFrom = (response: Response, name: string): string => {
 
 const startLegacySsoBrowser = async (
   handle: LegacySsoHttpHandler,
-  returnTo?: string
+  returnTo?: string,
+  bearer?: string
 ): Promise<LegacySsoBrowserTransaction> => {
   const startUrl = new URL(
     "/api/legacy-sso/start",
     "https://folio.example.test"
   );
-  if (returnTo !== undefined) {
-    startUrl.searchParams.set("returnTo", returnTo);
+  const headers = new Headers(jsonHeaders);
+  if (bearer) {
+    headers.set("Authorization", `Bearer ${bearer}`);
   }
-  const startResponse = await handle(new Request(startUrl.href));
-  const authorizationUrl = startResponse.headers.get("location");
-  if (!authorizationUrl) {
-    throw new Error("The legacy SSO start did not redirect to the old backend");
+  const startResponse = await handle(
+    new Request(startUrl.href, {
+      body: JSON.stringify(returnTo === undefined ? {} : { returnTo }),
+      headers,
+      method: "POST",
+    })
+  );
+  const startBody = (await startResponse.json()) as {
+    authorizationUrl?: string;
+  };
+  if (!startBody.authorizationUrl) {
+    throw new Error("The legacy SSO start did not return an authorization URL");
   }
   return {
-    authorizationUrl,
+    authorizationUrl: startBody.authorizationUrl,
     preLoginCookie: cookiePairFrom(startResponse, "__Host-folio-sso"),
     startResponse,
   };
@@ -608,7 +623,6 @@ test("rewrites public ONLYOFFICE callback paths to the internal base", () => {
   ).toBe("http://localhost:8081/cache/files/data/example/output.docx?md5=x");
 });
 
-
 const legacySsoCallbackUrl =
   "https://folio.example.test/api/legacy-sso/callback";
 const legacySsoWebOrigin = new URL(
@@ -618,6 +632,1162 @@ const legacySsoFailedLocation = new URL(
   "/login?legacySso=failed",
   legacySsoWebOrigin
 ).href;
+const legacySsoPendingLocation = new URL(
+  "/login?legacySso=pending",
+  legacySsoWebOrigin
+).href;
+const completeLegacySsoCallback = async (
+  handle: LegacySsoHttpHandler
+): Promise<Response> => {
+  const browserStart = await startLegacySsoBrowser(handle);
+  const oldBackendResponse = await fetch(browserStart.authorizationUrl, {
+    redirect: "manual",
+  });
+  expect(oldBackendResponse.status).toBe(303);
+  const callbackLocation = oldBackendResponse.headers.get("location");
+  if (!callbackLocation) {
+    throw new Error("The test old backend did not return a callback");
+  }
+  return handle(
+    new Request(callbackLocation, {
+      headers: { Cookie: browserStart.preLoginCookie },
+    })
+  );
+};
+const completeAuthenticatedLegacySsoCallback = async (
+  handle: LegacySsoHttpHandler,
+  bearer: string,
+  returnTo: string
+): Promise<{
+  browserStart: LegacySsoBrowserTransaction;
+  callback: Response;
+}> => {
+  const browserStart = await startLegacySsoBrowser(handle, returnTo, bearer);
+  const oldBackendResponse = await fetch(browserStart.authorizationUrl, {
+    redirect: "manual",
+  });
+  const callbackLocation = oldBackendResponse.headers.get("location");
+  if (!callbackLocation) {
+    throw new Error("The test old backend did not return a callback");
+  }
+  const callback = await handle(
+    new Request(callbackLocation, {
+      headers: { Cookie: browserStart.preLoginCookie },
+    })
+  );
+  return { browserStart, callback };
+};
+
+const claimLegacySsoBearer = async (
+  handle: LegacySsoHttpHandler,
+  callbackResponse: Response
+): Promise<string> => {
+  const claimResponse = await handle(
+    new Request("https://folio.example.test/api/legacy-sso/session", {
+      headers: {
+        Cookie: cookiePairFrom(callbackResponse, "__Host-folio-sso-session"),
+        Origin: "https://folio.example.test",
+      },
+      method: "POST",
+    })
+  );
+  expect(claimResponse.status).toBe(200);
+  const claimBody = await claimResponse.json();
+  if (
+    !claimBody ||
+    typeof claimBody !== "object" ||
+    Array.isArray(claimBody) ||
+    !("token" in claimBody) ||
+    typeof claimBody.token !== "string"
+  ) {
+    throw new Error("The SSO session handoff did not return a bearer");
+  }
+  return claimBody.token;
+};
+
+test("expired SSO re-entry restores the owned draft", async () => {
+  const email = `Ticket-13-${crypto.randomUUID()}@EXAMPLE.COM`;
+  const normalizedEmail = email.toLowerCase();
+  const identity = {
+    email,
+    email_verified: true,
+    sub: `legacy-${crypto.randomUUID()}`,
+  };
+  const clientId = `folio-${crypto.randomUUID()}`;
+  const clientSecret = `ticket-13-secret-${crypto.randomUUID()}`;
+  const providerId = `legacy-${crypto.randomUUID()}`;
+  legacySsoMock = startLegacySsoMock({
+    callbackUrl: legacySsoCallbackUrl,
+    clientId,
+    clientSecret,
+    identity,
+  });
+  const ssoApp = createLegacySsoTestApp({
+    authorizeUrl: legacySsoMock.authorizeUrl,
+    callbackUrl: legacySsoCallbackUrl,
+    clientId,
+    clientSecret,
+    exchangeUrl: legacySsoMock.exchangeUrl,
+    providerId,
+  });
+  const handle: LegacySsoHttpHandler = (request) => ssoApp.handle(request);
+  const userCountBefore = await prisma.user.count();
+  const accountCountBefore = await prisma.account.count();
+  const firstCallback = await completeLegacySsoCallback(handle);
+  expect(firstCallback.status).toBe(303);
+  expect(firstCallback.headers.get("location")).toBe(
+    new URL("/dashboard", legacySsoWebOrigin).href
+  );
+  const firstBearer = await claimLegacySsoBearer(handle, firstCallback);
+  const user = await prisma.user.findUnique({
+    where: { email: normalizedEmail },
+  });
+  if (!user) {
+    throw new Error("First Legacy SSO login did not create a User");
+  }
+  expect(user).toMatchObject({
+    email: normalizedEmail,
+    emailVerified: true,
+    enabled: true,
+    mustChangePassword: false,
+    name: normalizedEmail,
+    role: "user",
+  });
+  expect(await prisma.user.count()).toBe(userCountBefore + 1);
+  expect(await prisma.account.count()).toBe(accountCountBefore + 1);
+  const account = await prisma.account.findUnique({
+    where: {
+      providerId_accountId: {
+        accountId: identity.sub,
+        providerId,
+      },
+    },
+  });
+  expect(account).toMatchObject({
+    issuer: providerId,
+    password: null,
+    userId: user.id,
+  });
+  const firstSessionResponse = await handle(
+    new Request("https://folio.example.test/api/session", {
+      headers: { Authorization: `Bearer ${firstBearer}` },
+    })
+  );
+  expect(firstSessionResponse.status).toBe(200);
+  expect(await firstSessionResponse.json()).toMatchObject({
+    user: {
+      email: normalizedEmail,
+      id: user.id,
+      mustChangePassword: false,
+      name: normalizedEmail,
+      role: "user",
+    },
+  });
+
+  const formId = crypto.randomUUID();
+  const publicId = crypto.randomUUID().replaceAll("-", "");
+  const templateBytes = docxFixture(`ticket-13-${crypto.randomUUID()}`);
+  const templateObjectKey = objectKey(
+    "forms",
+    formId,
+    "published",
+    crypto.randomUUID(),
+    "ticket-13.docx"
+  );
+  await putObject(templateObjectKey, templateBytes, DOCX_CONTENT_TYPE);
+  await prisma.form.create({
+    data: {
+      createdBy: user.id,
+      id: formId,
+      publicId,
+      publishedTemplate: {
+        create: {
+          contentHash: createHash("sha256").update(templateBytes).digest("hex"),
+          documentKey: `ticket-13-template-${crypto.randomUUID()}`,
+          id: crypto.randomUUID(),
+          objectKey: templateObjectKey,
+          version: 1,
+        },
+      },
+      status: "published",
+      title: "Ticket 13 Response owner continuity",
+      version: 1,
+    },
+  });
+  const firstStartResponse = await handle(
+    new Request(`https://folio.example.test/api/forms/${publicId}/start`, {
+      headers: { Authorization: `Bearer ${firstBearer}` },
+      method: "POST",
+    })
+  );
+  expect(firstStartResponse.status).toBe(200);
+  const firstStartBody = (await firstStartResponse.json()) as {
+    response?: { id?: string };
+  };
+  const responseId = firstStartBody.response?.id;
+  if (!responseId) {
+    throw new Error("First SSO User could not start a Response");
+  }
+  expect(
+    await prisma.response.findUnique({ where: { id: responseId } })
+  ).toMatchObject({ formId, userId: user.id });
+
+  const retainedEmail = `ticket-13-profile-${crypto.randomUUID()}@example.com`;
+  await prisma.user.update({
+    data: { email: retainedEmail, name: "Retained local profile" },
+    where: { id: user.id },
+  });
+  identity.email = `changed-${crypto.randomUUID()}@example.com`;
+  const returnTo = `/forms/${publicId}/fill?responseId=${responseId}`;
+  const repeatedStart = await startLegacySsoBrowser(
+    handle,
+    returnTo,
+    firstBearer
+  );
+  expect(repeatedStart.startResponse.status).toBe(200);
+  const repeatedAuthorization = await fetch(repeatedStart.authorizationUrl, {
+    redirect: "manual",
+  });
+  expect(repeatedAuthorization.status).toBe(303);
+  const repeatedCallbackUrl = repeatedAuthorization.headers.get("location");
+  if (!repeatedCallbackUrl) {
+    throw new Error("The repeated SSO login did not return a callback");
+  }
+  const initiatingSession = await prisma.session.findFirst({
+    orderBy: { createdAt: "desc" },
+    where: { isSso: true, userId: user.id },
+  });
+  if (!initiatingSession) {
+    throw new Error("The initiating Folio Session was unavailable");
+  }
+  await prisma.session.update({
+    data: { expiresAt: new Date(0) },
+    where: { id: initiatingSession.id },
+  });
+  const repeatedCallback = await handle(
+    new Request(repeatedCallbackUrl, {
+      headers: { Cookie: repeatedStart.preLoginCookie },
+    })
+  );
+  expect(repeatedCallback.status).toBe(303);
+  expect(repeatedCallback.headers.get("location")).toBe(
+    new URL(returnTo, legacySsoWebOrigin).href
+  );
+  const repeatedBearer = await claimLegacySsoBearer(handle, repeatedCallback);
+  const repeatedSessionResponse = await handle(
+    new Request("https://folio.example.test/api/session", {
+      headers: { Authorization: `Bearer ${repeatedBearer}` },
+    })
+  );
+  expect(repeatedSessionResponse.status).toBe(200);
+  expect(await repeatedSessionResponse.json()).toMatchObject({
+    user: {
+      email: retainedEmail,
+      id: user.id,
+      name: "Retained local profile",
+      role: "user",
+    },
+  });
+  const repeatedStartResponse = await handle(
+    new Request(`https://folio.example.test/api/forms/${publicId}/start`, {
+      headers: { Authorization: `Bearer ${repeatedBearer}` },
+      method: "POST",
+    })
+  );
+  expect(repeatedStartResponse.status).toBe(200);
+  const repeatedStartBody = (await repeatedStartResponse.json()) as {
+    response?: { id?: string };
+  };
+  expect(repeatedStartBody.response?.id).toBe(responseId);
+  expect(
+    await prisma.response.findUnique({ where: { id: responseId } })
+  ).toMatchObject({ formId, userId: user.id });
+  const target = await createCredentialFixture({
+    email: `ticket-16-target-${crypto.randomUUID()}@example.com`,
+    name: "Ticket 16 different User",
+    password: "Ticket16-different-user-password",
+  });
+  const targetSubject = `legacy-${crypto.randomUUID()}`;
+  await prisma.account.create({
+    data: {
+      accountId: targetSubject,
+      id: crypto.randomUUID(),
+      providerId,
+      userId: target.id,
+    },
+  });
+  const crossAccountStart = await startLegacySsoBrowser(
+    handle,
+    returnTo,
+    repeatedBearer
+  );
+  identity.email = target.email;
+  identity.sub = targetSubject;
+  const crossAccountAuthorization = await fetch(
+    crossAccountStart.authorizationUrl,
+    { redirect: "manual" }
+  );
+  const crossAccountCallbackUrl =
+    crossAccountAuthorization.headers.get("location");
+  if (!crossAccountCallbackUrl) {
+    throw new Error(
+      "The different-account SSO login did not return a callback"
+    );
+  }
+  const crossAccountSession = await auth.api.getSession({
+    headers: new Headers({ Authorization: `Bearer ${repeatedBearer}` }),
+  });
+  if (!crossAccountSession?.session) {
+    throw new Error("The re-entered Folio Session was unavailable");
+  }
+  await prisma.session.update({
+    data: { expiresAt: new Date(0) },
+    where: { id: crossAccountSession.session.id },
+  });
+  const targetSessionCount = await prisma.session.count({
+    where: { userId: target.id },
+  });
+  const crossAccountCallback = await handle(
+    new Request(crossAccountCallbackUrl, {
+      headers: { Cookie: crossAccountStart.preLoginCookie },
+    })
+  );
+  const crossAccountLocation = new URL(
+    crossAccountCallback.headers.get("location") ?? ""
+  );
+  expect(crossAccountLocation.pathname).toBe("/login");
+  expect(crossAccountLocation.searchParams.get("legacySso")).toBe("failed");
+  expect(crossAccountLocation.searchParams.get("returnTo")).toBe(returnTo);
+  expect(
+    await prisma.session.count({ where: { userId: target.id } })
+  ).toBe(targetSessionCount);
+});
+
+test("first Legacy SSO rejects invalid claims and queues email collisions for review", async () => {
+  const email = `ticket-13-rejected-${crypto.randomUUID()}@example.com`;
+  const subject = `legacy-${crypto.randomUUID()}`;
+  const identity = { email, email_verified: true, sub: subject };
+  const clientId = `folio-${crypto.randomUUID()}`;
+  const clientSecret = `ticket-13-secret-${crypto.randomUUID()}`;
+  const providerId = `legacy-${crypto.randomUUID()}`;
+  legacySsoMock = startLegacySsoMock({
+    callbackUrl: legacySsoCallbackUrl,
+    clientId,
+    clientSecret,
+    identity,
+  });
+  const ssoApp = createLegacySsoTestApp({
+    authorizeUrl: legacySsoMock.authorizeUrl,
+    callbackUrl: legacySsoCallbackUrl,
+    clientId,
+    clientSecret,
+    exchangeUrl: legacySsoMock.exchangeUrl,
+    providerId,
+  });
+  const handle: LegacySsoHttpHandler = (request) => ssoApp.handle(request);
+  const expectRejectedLogin = async (): Promise<void> => {
+    const callback = await completeLegacySsoCallback(handle);
+    expect(callback.status).toBe(303);
+    expect(callback.headers.get("location")).toBe(legacySsoFailedLocation);
+  };
+  const initialCounts = {
+    accounts: await prisma.account.count(),
+    sessions: await prisma.session.count(),
+    users: await prisma.user.count(),
+  };
+  Reflect.deleteProperty(identity, "sub");
+  await expectRejectedLogin();
+  identity.sub = subject;
+  Reflect.deleteProperty(identity, "email");
+  await expectRejectedLogin();
+  identity.email = email;
+  identity.email_verified = false;
+  await expectRejectedLogin();
+  expect(await prisma.account.count()).toBe(initialCounts.accounts);
+  expect(await prisma.session.count()).toBe(initialCounts.sessions);
+  expect(await prisma.user.count()).toBe(initialCounts.users);
+
+  const duplicateEmail = `Ticket-13-DUPLICATE-${crypto.randomUUID()}@EXAMPLE.COM`;
+  const normalizedDuplicateEmail = duplicateEmail.toLowerCase();
+  const localUser = await createCredentialFixture({
+    email: normalizedDuplicateEmail,
+    name: "Existing local User",
+    password: "Ticket13-existing-local-password",
+  });
+  const countsBeforeCollision = {
+    accounts: await prisma.account.count(),
+    sessions: await prisma.session.count(),
+    users: await prisma.user.count(),
+  };
+  identity.email = duplicateEmail;
+  identity.email_verified = true;
+  const collision = await completeLegacySsoCallback(handle);
+  expect(collision.status).toBe(303);
+  expect(collision.headers.get("location")).toBe(legacySsoPendingLocation);
+  expect(await prisma.account.count()).toBe(countsBeforeCollision.accounts);
+  expect(await prisma.session.count()).toBe(countsBeforeCollision.sessions);
+  expect(await prisma.user.count()).toBe(countsBeforeCollision.users);
+  expect(
+    await prisma.account.findUnique({
+      where: {
+        providerId_accountId: {
+          accountId: subject,
+          providerId,
+        },
+      },
+    })
+  ).toBeNull();
+  expect(
+    await prisma.legacyAccountLinkRequest.findUnique({
+      where: { providerId_subject: { providerId, subject } },
+    })
+  ).toMatchObject({
+    email: normalizedDuplicateEmail,
+    status: "pending",
+    userId: localUser.id,
+  });
+  expect(await prisma.session.count({ where: { userId: localUser.id } })).toBe(
+    0
+  );
+});
+
+test("racing first Legacy SSO logins create one User and identity binding", async () => {
+  const identity = {
+    email: `ticket-13-race-${crypto.randomUUID()}@example.com`,
+    email_verified: true,
+    sub: `legacy-${crypto.randomUUID()}`,
+  };
+  const clientId = `folio-${crypto.randomUUID()}`;
+  const clientSecret = `ticket-13-secret-${crypto.randomUUID()}`;
+  const providerId = `legacy-${crypto.randomUUID()}`;
+  legacySsoMock = startLegacySsoMock({
+    callbackUrl: legacySsoCallbackUrl,
+    clientId,
+    clientSecret,
+    identity,
+  });
+  const ssoApp = createLegacySsoTestApp({
+    authorizeUrl: legacySsoMock.authorizeUrl,
+    callbackUrl: legacySsoCallbackUrl,
+    clientId,
+    clientSecret,
+    exchangeUrl: legacySsoMock.exchangeUrl,
+    providerId,
+  });
+  const handle: LegacySsoHttpHandler = (request) => ssoApp.handle(request);
+  const userCountBefore = await prisma.user.count();
+  const accountCountBefore = await prisma.account.count();
+  const [firstCallback, secondCallback] = await Promise.all([
+    completeLegacySsoCallback(handle),
+    completeLegacySsoCallback(handle),
+  ]);
+  expect(firstCallback.headers.get("location")).toBe(
+    new URL("/dashboard", legacySsoWebOrigin).href
+  );
+  expect(secondCallback.headers.get("location")).toBe(
+    new URL("/dashboard", legacySsoWebOrigin).href
+  );
+  const [firstBearer, secondBearer] = await Promise.all([
+    claimLegacySsoBearer(handle, firstCallback),
+    claimLegacySsoBearer(handle, secondCallback),
+  ]);
+  const user = await prisma.user.findUnique({
+    where: { email: identity.email },
+  });
+  if (!user) {
+    throw new Error("Racing Legacy SSO logins did not create a User");
+  }
+  expect(await prisma.user.count()).toBe(userCountBefore + 1);
+  expect(await prisma.account.count()).toBe(accountCountBefore + 1);
+  for (const bearer of [firstBearer, secondBearer]) {
+    const sessionResponse = await handle(
+      new Request("https://folio.example.test/api/session", {
+        headers: { Authorization: `Bearer ${bearer}` },
+      })
+    );
+    expect(sessionResponse.status).toBe(200);
+    expect(await sessionResponse.json()).toMatchObject({
+      user: { id: user.id, role: "user" },
+    });
+  }
+  expect(
+    await prisma.session.count({ where: { isSso: true, userId: user.id } })
+  ).toBe(2);
+});
+test("failed first Legacy SSO persistence leaves no partial User or identity binding", async () => {
+  const identity = {
+    email: `ticket-13-persistence-${crypto.randomUUID()}@example.com`,
+    email_verified: true,
+    sub: `legacy-${crypto.randomUUID()}`,
+  };
+  const clientId = `folio-${crypto.randomUUID()}`;
+  const clientSecret = `ticket-13-secret-${crypto.randomUUID()}`;
+  const providerId = `legacy-${crypto.randomUUID()}`;
+  const constraintName = `ticket13_reject_${crypto.randomUUID().replaceAll("-", "")}`;
+  legacySsoMock = startLegacySsoMock({
+    callbackUrl: legacySsoCallbackUrl,
+    clientId,
+    clientSecret,
+    identity,
+  });
+  const ssoApp = createLegacySsoTestApp({
+    authorizeUrl: legacySsoMock.authorizeUrl,
+    callbackUrl: legacySsoCallbackUrl,
+    clientId,
+    clientSecret,
+    exchangeUrl: legacySsoMock.exchangeUrl,
+    providerId,
+  });
+  const handle: LegacySsoHttpHandler = (request) => ssoApp.handle(request);
+  const sessionCountBefore = await prisma.session.count();
+  await prisma.$executeRawUnsafe(
+    `ALTER TABLE "account" ADD CONSTRAINT "${constraintName}" CHECK ("provider_id" <> '${providerId}') NOT VALID`
+  );
+  try {
+    await expect(completeLegacySsoCallback(handle)).rejects.toBeInstanceOf(
+      Error
+    );
+    expect(
+      await prisma.user.findUnique({ where: { email: identity.email } })
+    ).toBeNull();
+    expect(
+      await prisma.account.findUnique({
+        where: {
+          providerId_accountId: {
+            accountId: identity.sub,
+            providerId,
+          },
+        },
+      })
+    ).toBeNull();
+    expect(
+      await prisma.legacyAccountLinkRequest.findUnique({
+        where: {
+          providerId_subject: {
+            providerId,
+            subject: identity.sub,
+          },
+        },
+      })
+    ).toBeNull();
+    expect(await prisma.session.count()).toBe(sessionCountBefore);
+  } finally {
+    await prisma.$executeRawUnsafe(
+      `ALTER TABLE "account" DROP CONSTRAINT IF EXISTS "${constraintName}"`
+    );
+  }
+});
+
+test("Ticket 14 Legacy SSO collision requires fresh Admin-approved identity link", async () => {
+  const email = `ticket-14-${crypto.randomUUID()}@example.com`;
+  const password = "Ticket14-local-password";
+  const candidate = await createCredentialFixture({
+    email,
+    name: "Ticket 14 Local User",
+    password,
+  });
+  const localBearer = await bearerFor(email, password);
+  const formId = crypto.randomUUID();
+  const publicId = crypto.randomUUID().replaceAll("-", "");
+  const templateBytes = docxFixture(`ticket-14-${crypto.randomUUID()}`);
+  const templateObjectKey = objectKey(
+    "forms",
+    formId,
+    "published",
+    crypto.randomUUID(),
+    "ticket-14.docx"
+  );
+  await putObject(templateObjectKey, templateBytes, DOCX_CONTENT_TYPE);
+  await prisma.form.create({
+    data: {
+      createdBy: candidate.id,
+      id: formId,
+      publicId,
+      publishedTemplate: {
+        create: {
+          contentHash: createHash("sha256").update(templateBytes).digest("hex"),
+          documentKey: `ticket-14-template-${crypto.randomUUID()}`,
+          id: crypto.randomUUID(),
+          objectKey: templateObjectKey,
+          version: 1,
+        },
+      },
+      status: "published",
+      title: "Ticket 14 Response ownership",
+      version: 1,
+    },
+  });
+  const startResponse = await app.handle(
+    new Request(`http://test.local/api/forms/${publicId}/start`, {
+      headers: { Authorization: `Bearer ${localBearer}` },
+      method: "POST",
+    })
+  );
+  expect(startResponse.status).toBe(200);
+  const startBody = (await startResponse.json()) as {
+    response?: { id?: string };
+  };
+  const responseId = startBody.response?.id;
+  if (!responseId) {
+    throw new Error("Local User could not start a Response");
+  }
+
+  const identity = {
+    email: email.toUpperCase(),
+    email_verified: true,
+    sub: `legacy-${crypto.randomUUID()}`,
+  };
+  const subject = identity.sub;
+  const providerId = `legacy-${crypto.randomUUID()}`;
+  const clientId = `folio-${crypto.randomUUID()}`;
+  const clientSecret = `ticket-14-secret-${crypto.randomUUID()}`;
+  legacySsoMock = startLegacySsoMock({
+    callbackUrl: legacySsoCallbackUrl,
+    clientId,
+    clientSecret,
+    identity,
+  });
+  const ssoApp = createLegacySsoTestApp(
+    {
+      authorizeUrl: legacySsoMock.authorizeUrl,
+      callbackUrl: legacySsoCallbackUrl,
+      clientId,
+      clientSecret,
+      exchangeUrl: legacySsoMock.exchangeUrl,
+      providerId,
+    },
+    () => new Date("2026-01-01T00:00:00.000Z")
+  );
+  const handle: LegacySsoHttpHandler = (request) => ssoApp.handle(request);
+  const ssoSessionsBefore = await prisma.session.count({
+    where: { isSso: true, userId: candidate.id },
+  });
+  const [firstPending, racedPending] = await Promise.all([
+    completeLegacySsoCallback(handle),
+    completeLegacySsoCallback(handle),
+  ]);
+  for (const callback of [firstPending, racedPending]) {
+    expect(callback.status).toBe(303);
+    expect(callback.headers.get("location")).toBe(legacySsoPendingLocation);
+    expect(cookiePairFrom(callback, "__Host-folio-sso-session")).toBe(
+      "__Host-folio-sso-session="
+    );
+  }
+  const linkRequest = await prisma.legacyAccountLinkRequest.findUniqueOrThrow({
+    where: { providerId_subject: { providerId, subject } },
+  });
+  expect(linkRequest).toMatchObject({
+    email,
+    status: "pending",
+    userId: candidate.id,
+  });
+  expect(
+    await prisma.legacyAccountLinkRequest.count({
+      where: { providerId, subject },
+    })
+  ).toBe(1);
+  expect(
+    await prisma.account.findUnique({
+      where: { providerId_accountId: { accountId: subject, providerId } },
+    })
+  ).toBeNull();
+  expect(
+    await prisma.session.count({
+      where: { isSso: true, userId: candidate.id },
+    })
+  ).toBe(ssoSessionsBefore);
+
+  const adminEmail = `ticket-14-admin-${crypto.randomUUID()}@example.com`;
+  const adminPassword = "Ticket14-admin-password";
+  await createCredentialFixture({
+    email: adminEmail,
+    name: "Ticket 14 Admin",
+    password: adminPassword,
+    role: "admin",
+  });
+  const adminBearer = await bearerFor(adminEmail, adminPassword);
+  const requestPath = `/api/admin/account-links/${linkRequest.id}/approve`;
+  const forbiddenApproval = await handle(
+    new Request(`https://folio.example.test${requestPath}`, {
+      headers: { Authorization: `Bearer ${localBearer}` },
+      method: "POST",
+    })
+  );
+  expect(forbiddenApproval.status).toBe(403);
+  const accountLinksResponse = await handle(
+    new Request("https://folio.example.test/api/admin/account-links", {
+      headers: { Authorization: `Bearer ${adminBearer}` },
+    })
+  );
+  expect(accountLinksResponse.status).toBe(200);
+  const accountLinksBody = (await accountLinksResponse.json()) as {
+    requests: {
+      email: string;
+      id: string;
+      providerId: string;
+      subject: string;
+      user: { email: string; id: string; name: string; role: string };
+    }[];
+  };
+  expect(accountLinksBody.requests).toContainEqual(
+    expect.objectContaining({
+      email,
+      id: linkRequest.id,
+      providerId,
+      subject,
+      user: expect.objectContaining({
+        email,
+        id: candidate.id,
+        name: "Ticket 14 Local User",
+        role: "user",
+      }),
+    })
+  );
+
+  const staleBrowser = await startLegacySsoBrowser(handle);
+  const staleBackendResponse = await fetch(staleBrowser.authorizationUrl, {
+    redirect: "manual",
+  });
+  const staleCallbackLocation = staleBackendResponse.headers.get("location");
+  if (!staleCallbackLocation) {
+    throw new Error("The stale SSO transaction did not return a callback");
+  }
+  const staleTransaction = await prisma.$transaction(async (tx) => {
+    await tx.$queryRaw(
+      Prisma.sql`SELECT "id" FROM "user" WHERE "id" = ${candidate.id} FOR UPDATE`
+    );
+    const approvalPromise = Promise.resolve(
+      handle(
+        new Request(`https://folio.example.test${requestPath}`, {
+          headers: { Authorization: `Bearer ${adminBearer}` },
+          method: "POST",
+        })
+      )
+    );
+    const browser = await startLegacySsoBrowser(handle);
+    const backendResponse = await fetch(browser.authorizationUrl, {
+      redirect: "manual",
+    });
+    const callbackLocation = backendResponse.headers.get("location");
+    if (!callbackLocation) {
+      throw new Error("The stale SSO transaction did not return a callback");
+    }
+    return { approvalPromise, browser, callbackLocation };
+  });
+  const approved = await staleTransaction.approvalPromise;
+  expect(approved.status).toBe(200);
+  expect(await approved.json()).toEqual({ ok: true });
+  const approvedRequest =
+    await prisma.legacyAccountLinkRequest.findUniqueOrThrow({
+      where: { id: linkRequest.id },
+    });
+  expect(approvedRequest.status).toBe("approved");
+  expect(approvedRequest.reviewedAt).not.toBeNull();
+  expect(
+    await prisma.account.findUnique({
+      where: { providerId_accountId: { accountId: subject, providerId } },
+    })
+  ).toBeNull();
+
+  const staleCallback = await handle(
+    new Request(staleCallbackLocation, {
+      headers: { Cookie: staleBrowser.preLoginCookie },
+    })
+  );
+  expect(staleCallback.headers.get("location")).toBe(legacySsoFailedLocation);
+  expect(
+    await prisma.session.count({
+      where: { isSso: true, userId: candidate.id },
+    })
+  ).toBe(ssoSessionsBefore);
+
+  identity.sub = `legacy-${crypto.randomUUID()}`;
+  const wrongSubjectCallback = await completeLegacySsoCallback(handle);
+  expect(wrongSubjectCallback.headers.get("location")).toBe(
+    legacySsoPendingLocation
+  );
+  expect(
+    await prisma.account.findUnique({
+      where: { providerId_accountId: { accountId: subject, providerId } },
+    })
+  ).toBeNull();
+  identity.sub = subject;
+  const { reviewedAt } = approvedRequest;
+  if (!reviewedAt) {
+    throw new Error("Admin approval did not record review time");
+  }
+  const freshCallbacks = await Promise.all(
+    Array.from({ length: 2 }, async () => {
+      const browser = await startLegacySsoBrowser(handle);
+      const oldBackendResponse = await fetch(browser.authorizationUrl, {
+        redirect: "manual",
+      });
+      const callbackLocation = oldBackendResponse.headers.get("location");
+      const transactionId = browser.preLoginCookie.split("=", 2)[1];
+      if (!callbackLocation || !transactionId) {
+        throw new Error("Fresh SSO transaction did not return a callback");
+      }
+      await prisma.verification.update({
+        data: { createdAt: reviewedAt },
+        where: { id: transactionId },
+      });
+      return handle(
+        new Request(callbackLocation, {
+          headers: { Cookie: browser.preLoginCookie },
+        })
+      );
+    })
+  );
+  expect(freshCallbacks).toHaveLength(2);
+  expect(
+    freshCallbacks.map((callback) => callback.headers.get("location"))
+  ).toEqual([
+    new URL("/dashboard", legacySsoWebOrigin).href,
+    new URL("/dashboard", legacySsoWebOrigin).href,
+  ]);
+  const linkedBearer = await claimLegacySsoBearer(handle, freshCallbacks[0]!);
+  expect(
+    await prisma.legacyAccountLinkRequest.findUniqueOrThrow({
+      where: { id: linkRequest.id },
+    })
+  ).toMatchObject({ status: "linked", userId: candidate.id });
+  expect(
+    await prisma.account.findUnique({
+      where: { providerId_accountId: { accountId: subject, providerId } },
+    })
+  ).toMatchObject({ password: null, userId: candidate.id });
+  const staleAfterLinkCallback = await handle(
+    new Request(staleTransaction.callbackLocation, {
+      headers: { Cookie: staleTransaction.browser.preLoginCookie },
+    })
+  );
+  expect(staleAfterLinkCallback.headers.get("location")).toBe(
+    legacySsoFailedLocation
+  );
+  expect(
+    await prisma.user.findUniqueOrThrow({ where: { id: candidate.id } })
+  ).toMatchObject({
+    email,
+    name: "Ticket 14 Local User",
+    role: "user",
+  });
+  const linkedSessionResponse = await handle(
+    new Request("https://folio.example.test/api/session", {
+      headers: { Authorization: `Bearer ${linkedBearer}` },
+    })
+  );
+  expect(linkedSessionResponse.status).toBe(200);
+  const repeatedStart = await handle(
+    new Request(`https://folio.example.test/api/forms/${publicId}/start`, {
+      headers: { Authorization: `Bearer ${linkedBearer}` },
+      method: "POST",
+    })
+  );
+  expect(repeatedStart.status).toBe(200);
+  const repeatedStartBody = (await repeatedStart.json()) as {
+    response?: { id?: string };
+  };
+  expect(repeatedStartBody.response?.id).toBe(responseId);
+  expect(
+    await prisma.response.findUniqueOrThrow({ where: { id: responseId } })
+  ).toMatchObject({ formId, userId: candidate.id });
+  const localLoginAfterLink = await bearerFor(email, password);
+  expect(
+    await handle(
+      new Request("https://folio.example.test/api/session", {
+        headers: { Authorization: `Bearer ${localLoginAfterLink}` },
+      })
+    )
+  ).toHaveProperty("status", 200);
+});
+
+test("Ticket 14 Legacy SSO approval rejects Admin and disabled candidates", async () => {
+  const disabledEmail = `ticket-14-disabled-${crypto.randomUUID()}@example.com`;
+  const disabledPassword = "Ticket14-disabled-password";
+  const disabledUser = await createCredentialFixture({
+    email: disabledEmail,
+    name: "Ticket 14 Disabled User",
+    password: disabledPassword,
+  });
+  await prisma.user.update({
+    data: { enabled: false },
+    where: { id: disabledUser.id },
+  });
+  const adminCandidateEmail = `ticket-14-admin-candidate-${crypto.randomUUID()}@example.com`;
+  const adminCandidate = await createCredentialFixture({
+    email: adminCandidateEmail,
+    name: "Ticket 14 Admin Candidate",
+    password: "Ticket14-admin-candidate-password",
+    role: "admin",
+  });
+  const reviewerEmail = `ticket-14-reviewer-${crypto.randomUUID()}@example.com`;
+  const reviewerPassword = "Ticket14-reviewer-password";
+  await createCredentialFixture({
+    email: reviewerEmail,
+    name: "Ticket 14 Reviewer",
+    password: reviewerPassword,
+    role: "admin",
+  });
+  const reviewerBearer = await bearerFor(reviewerEmail, reviewerPassword);
+  const identity = {
+    email: disabledEmail,
+    email_verified: true,
+    sub: `legacy-${crypto.randomUUID()}`,
+  };
+  const providerId = `legacy-${crypto.randomUUID()}`;
+  const clientId = `folio-${crypto.randomUUID()}`;
+  const clientSecret = `ticket-14-secret-${crypto.randomUUID()}`;
+  legacySsoMock = startLegacySsoMock({
+    callbackUrl: legacySsoCallbackUrl,
+    clientId,
+    clientSecret,
+    identity,
+  });
+  const ssoApp = createLegacySsoTestApp({
+    authorizeUrl: legacySsoMock.authorizeUrl,
+    callbackUrl: legacySsoCallbackUrl,
+    clientId,
+    clientSecret,
+    exchangeUrl: legacySsoMock.exchangeUrl,
+    providerId,
+  });
+  const handle: LegacySsoHttpHandler = (request) => ssoApp.handle(request);
+  const disabledSubject = identity.sub;
+  const disabledPending = await completeLegacySsoCallback(handle);
+  expect(disabledPending.headers.get("location")).toBe(
+    legacySsoPendingLocation
+  );
+  const disabledRequest =
+    await prisma.legacyAccountLinkRequest.findUniqueOrThrow({
+      where: {
+        providerId_subject: { providerId, subject: disabledSubject },
+      },
+    });
+  identity.email = adminCandidateEmail;
+  identity.sub = `legacy-${crypto.randomUUID()}`;
+  const adminSubject = identity.sub;
+  const adminPending = await completeLegacySsoCallback(handle);
+  expect(adminPending.headers.get("location")).toBe(legacySsoPendingLocation);
+  const adminRequest = await prisma.legacyAccountLinkRequest.findUniqueOrThrow({
+    where: { providerId_subject: { providerId, subject: adminSubject } },
+  });
+  for (const request of [disabledRequest, adminRequest]) {
+    const response = await handle(
+      new Request(
+        `https://folio.example.test/api/admin/account-links/${request.id}/approve`,
+        {
+          headers: { Authorization: `Bearer ${reviewerBearer}` },
+          method: "POST",
+        }
+      )
+    );
+    expect(response.status).toBe(409);
+  }
+  expect(
+    await prisma.legacyAccountLinkRequest.findMany({
+      orderBy: { id: "asc" },
+      select: { id: true, status: true },
+      where: { id: { in: [disabledRequest.id, adminRequest.id] } },
+    })
+  ).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ id: disabledRequest.id, status: "pending" }),
+      expect.objectContaining({ id: adminRequest.id, status: "pending" }),
+    ])
+  );
+  const rejection = await handle(
+    new Request(
+      `https://folio.example.test/api/admin/account-links/${disabledRequest.id}/reject`,
+      {
+        headers: { Authorization: `Bearer ${reviewerBearer}` },
+        method: "POST",
+      }
+    )
+  );
+  expect(rejection.status).toBe(200);
+  expect(
+    await prisma.legacyAccountLinkRequest.findUniqueOrThrow({
+      where: { id: disabledRequest.id },
+    })
+  ).toMatchObject({ status: "rejected", userId: disabledUser.id });
+  identity.email = disabledEmail;
+  identity.sub = disabledSubject;
+  const rejectedRetry = await completeLegacySsoCallback(handle);
+  expect(rejectedRetry.headers.get("location")).toBe(legacySsoFailedLocation);
+  expect(
+    await prisma.account.findUnique({
+      where: {
+        providerId_accountId: { accountId: disabledSubject, providerId },
+      },
+    })
+  ).toBeNull();
+  expect(
+    await prisma.account.findUnique({
+      where: {
+        providerId_accountId: { accountId: adminSubject, providerId },
+      },
+    })
+  ).toBeNull();
+  expect(
+    await prisma.session.count({
+      where: {
+        isSso: true,
+        userId: { in: [disabledUser.id, adminCandidate.id] },
+      },
+    })
+  ).toBe(0);
+});
+
+test("Ticket 14 stale SSO callback cannot bypass an account link created concurrently", async () => {
+  const email = `ticket-14-race-${crypto.randomUUID()}@example.com`;
+  const candidate = await createCredentialFixture({
+    email,
+    name: "Ticket 14 Race Candidate",
+    password: "Ticket14-race-password",
+  });
+  const identity = {
+    email,
+    email_verified: true,
+    sub: `legacy-${crypto.randomUUID()}`,
+  };
+  const subject = identity.sub;
+  const providerId = `legacy-${crypto.randomUUID()}`;
+  const clientId = `folio-${crypto.randomUUID()}`;
+  const clientSecret = `ticket-14-secret-${crypto.randomUUID()}`;
+  const legacyMock = startLegacySsoMock({
+    callbackUrl: legacySsoCallbackUrl,
+    clientId,
+    clientSecret,
+    identity,
+  });
+  legacySsoMock = legacyMock;
+  const ssoApp = createLegacySsoTestApp({
+    authorizeUrl: legacyMock.authorizeUrl,
+    callbackUrl: legacySsoCallbackUrl,
+    clientId,
+    clientSecret,
+    exchangeUrl: legacyMock.exchangeUrl,
+    providerId,
+  });
+  const handle: LegacySsoHttpHandler = (request) => ssoApp.handle(request);
+  const staleBrowser = await startLegacySsoBrowser(handle);
+  const staleBackendResponse = await fetch(staleBrowser.authorizationUrl, {
+    redirect: "manual",
+  });
+  const staleCallbackLocation = staleBackendResponse.headers.get("location");
+  if (!staleCallbackLocation) {
+    throw new Error("Stale SSO transaction did not return a callback");
+  }
+  const staleCallbackRequest = new Request(staleCallbackLocation, {
+    headers: { Cookie: staleBrowser.preLoginCookie },
+  });
+  const gateSuffix = crypto.randomUUID().replaceAll("-", "");
+  const gateSequence = `ticket14_insert_gate_${gateSuffix}`;
+  const gateFunction = `ticket14_insert_gate_fn_${gateSuffix}`;
+  const gateTrigger = `ticket14_insert_gate_trigger_${gateSuffix}`;
+  const gateLockKey = BigInt(
+    `0x${crypto.randomUUID().replaceAll("-", "").slice(0, 15)}`
+  );
+  const staleCallbackState: { callback: Promise<Response> | null } = {
+    callback: null,
+  };
+  try {
+    await prisma.$executeRawUnsafe(`CREATE SEQUENCE public."${gateSequence}"`);
+    await prisma.$executeRawUnsafe(`
+      CREATE FUNCTION public."${gateFunction}"()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      AS $function$
+      BEGIN
+        PERFORM nextval('"public"."${gateSequence}"');
+        PERFORM pg_advisory_xact_lock(${gateLockKey}::bigint);
+        RETURN NEW;
+      END;
+      $function$;
+    `);
+    await prisma.$executeRawUnsafe(`
+      CREATE TRIGGER "${gateTrigger}"
+      BEFORE INSERT ON "user"
+      FOR EACH ROW
+      WHEN (NEW.email = '${email}')
+      EXECUTE FUNCTION public."${gateFunction}"()
+    `);
+    const sessionCountBefore = await prisma.session.count({
+      where: { isSso: true, userId: candidate.id },
+    });
+    await prisma.$transaction(async (tx) => {
+      await tx.$executeRawUnsafe(
+        `SELECT pg_advisory_xact_lock(${gateLockKey}::bigint)`
+      );
+      staleCallbackState.callback = Promise.resolve(
+        handle(staleCallbackRequest)
+      );
+      let callbackReachedUserInsert = false;
+      const gateDeadline = Date.now() + 10_000;
+      while (!callbackReachedUserInsert && Date.now() < gateDeadline) {
+        const [gate] = await tx.$queryRawUnsafe<{ is_called: boolean }[]>(
+          `SELECT is_called FROM public."${gateSequence}"`
+        );
+        callbackReachedUserInsert = gate?.is_called === true;
+        if (!callbackReachedUserInsert) {
+          await Bun.sleep(10);
+        }
+      }
+      expect(callbackReachedUserInsert).toBe(true);
+      const [generationRow] = await tx.$queryRaw<{ generation: bigint }[]>`
+        SELECT nextval('"legacy_sso_generation_seq"') AS generation
+      `;
+      if (!generationRow) {
+        throw new Error("Database did not return SSO generation");
+      }
+      await tx.legacyAccountLinkRequest.create({
+        data: {
+          email,
+          providerId,
+          reviewedAt: new Date(),
+          reviewedGeneration: generationRow.generation,
+          status: "linked",
+          subject,
+          userId: candidate.id,
+        },
+      });
+      await tx.account.create({
+        data: {
+          accountId: subject,
+          id: crypto.randomUUID(),
+          issuer: providerId,
+          providerId,
+          userId: candidate.id,
+        },
+      });
+    });
+    const startedCallback = staleCallbackState.callback;
+    if (!startedCallback) {
+      throw new Error("Stale SSO callback did not start");
+    }
+    const staleResponse = await startedCallback;
+    expect(staleResponse.headers.get("location")).toBe(legacySsoFailedLocation);
+    expect(
+      await prisma.session.count({
+        where: { isSso: true, userId: candidate.id },
+      })
+    ).toBe(sessionCountBefore);
+  } finally {
+    const callbackToSettle = staleCallbackState.callback;
+    if (callbackToSettle) {
+      await callbackToSettle.catch(() => undefined);
+    }
+    await prisma.$executeRawUnsafe(
+      `DROP TRIGGER IF EXISTS "${gateTrigger}" ON "user"`
+    );
+    await prisma.$executeRawUnsafe(
+      `DROP FUNCTION IF EXISTS public."${gateFunction}"()`
+    );
+    await prisma.$executeRawUnsafe(
+      `DROP SEQUENCE IF EXISTS public."${gateSequence}"`
+    );
+  }
+});
 
 test("linked role=user completes browser-bound SSO and receives a normal session", async () => {
   const email = `ticket-12-linked-${crypto.randomUUID()}@example.com`;
@@ -646,11 +1816,11 @@ test("linked role=user completes browser-bound SSO and receives a normal session
     },
   });
   legacySsoMock = startLegacySsoMock({
+    authorizationCode,
     callbackUrl: legacySsoCallbackUrl,
     clientId,
     clientSecret,
     identity,
-    authorizationCode,
   });
   const ssoApp = createLegacySsoTestApp({
     authorizeUrl: legacySsoMock.authorizeUrl,
@@ -663,14 +1833,14 @@ test("linked role=user completes browser-bound SSO and receives a normal session
   const handle: LegacySsoHttpHandler = (request) => ssoApp.handle(request);
   const returnTo = `/forms/${"a".repeat(32)}/fill?responseId=${crypto.randomUUID()}`;
   const browserStart = await startLegacySsoBrowser(handle, returnTo);
-  expect(browserStart.startResponse.status).toBe(303);
+  expect(browserStart.startResponse.status).toBe(200);
   const startCookieHeader = cookieHeaderFrom(
     browserStart.startResponse,
     "__Host-folio-sso"
   );
   expect(startCookieHeader).toContain("HttpOnly");
   expect(startCookieHeader).toContain("Secure");
-  expect(startCookieHeader).toContain("SameSite=Lax");
+  expect(startCookieHeader).toContain("SameSite=None");
   expect(startCookieHeader).toContain("Path=/");
 
   const authorizeUrl = new URL(browserStart.authorizationUrl);
@@ -679,7 +1849,9 @@ test("linked role=user completes browser-bound SSO and receives a normal session
     legacySsoCallbackUrl
   );
   expect(authorizeUrl.searchParams.get("code_challenge_method")).toBe("S256");
-  expect(authorizeUrl.searchParams.get("state")).toMatch(/^[A-Za-z0-9_-]{43}$/u);
+  expect(authorizeUrl.searchParams.get("state")).toMatch(
+    /^[A-Za-z0-9_-]{43}$/u
+  );
   expect(authorizeUrl.searchParams.get("code_challenge")).toMatch(
     /^[A-Za-z0-9_-]{43}$/u
   );
@@ -695,7 +1867,10 @@ test("linked role=user completes browser-bound SSO and receives a normal session
     throw new Error("The test old backend did not return a callback");
   }
   const callbackUrl = new URL(callbackLocation);
-  expect([...callbackUrl.searchParams.keys()].sort()).toEqual(["code", "state"]);
+  expect([...callbackUrl.searchParams.keys()].sort()).toEqual([
+    "code",
+    "state",
+  ]);
   expect(callbackUrl.searchParams.get("code")).toBe(authorizationCode);
   const callbackResponse = await handle(
     new Request(callbackUrl.href, {
@@ -743,16 +1918,13 @@ test("linked role=user completes browser-bound SSO and receives a normal session
   expect(wrongOriginClaim.status).toBe(403);
   expect(wrongOriginClaim.headers.has("set-cookie")).toBe(false);
   const claimResponse = await handle(
-    new Request(
-      "https://folio.example.test/api/legacy-sso/session",
-      {
-        headers: {
-          Cookie: sessionCookie,
-          Origin: "https://folio.example.test",
-        },
-        method: "POST",
-      }
-    )
+    new Request("https://folio.example.test/api/legacy-sso/session", {
+      headers: {
+        Cookie: sessionCookie,
+        Origin: "https://folio.example.test",
+      },
+      method: "POST",
+    })
   );
   expect(claimResponse.status).toBe(200);
   const claimCookieHeader = cookieHeaderFrom(
@@ -842,13 +2014,10 @@ test("linked role=user completes browser-bound SSO and receives a normal session
     },
   });
   const startResponse = await handle(
-    new Request(
-      `https://folio.example.test/api/forms/${formPublicId}/start`,
-      {
-        headers: { Authorization: `Bearer ${bearer}` },
-        method: "POST",
-      }
-    )
+    new Request(`https://folio.example.test/api/forms/${formPublicId}/start`, {
+      headers: { Authorization: `Bearer ${bearer}` },
+      method: "POST",
+    })
   );
   expect(startResponse.status).toBe(200);
   const startBody = (await startResponse.json()) as {
@@ -866,8 +2035,7 @@ test("linked role=user completes browser-bound SSO and receives a normal session
   );
   expect(editorResponse.status).toBe(200);
   const editorConfig = (await editorResponse.json()) as EditorConfigBody;
-  const ssoCapability =
-    editorConfig.bridge.capabilities["save-draft"];
+  const ssoCapability = editorConfig.bridge.capabilities["save-draft"];
   if (!ssoCapability) {
     throw new Error("The linked User editor capability was not returned");
   }
@@ -978,9 +2146,9 @@ test("linked role=user completes browser-bound SSO and receives a normal session
     targetType: ssoCapabilityClaims.targetType,
   });
   expect(verifyEditorCapability(missingSsoExpiryCapability)).toBeNull();
-  expect(
-    (await capabilityRequest(missingSsoExpiryCapability)).status
-  ).toBe(401);
+  expect((await capabilityRequest(missingSsoExpiryCapability)).status).toBe(
+    401
+  );
   const admin = await createCredentialFixture({
     email: `ticket-12-admin-${crypto.randomUUID()}@example.com`,
     name: "Ticket 12 Admin",
@@ -994,10 +2162,10 @@ test("linked role=user completes browser-bound SSO and receives a normal session
     expiresAt: ssoCapabilityClaims.expiresAt,
     formId: ssoCapabilityClaims.formId,
     isSso: true,
-    sessionExpiresAt: ssoCapabilityClaims.sessionExpiresAt,
     leaseId: ssoCapabilityClaims.leaseId,
     leaseProof: ssoCapabilityClaims.leaseProof,
     role: "admin",
+    sessionExpiresAt: ssoCapabilityClaims.sessionExpiresAt,
     targetId: ssoCapabilityClaims.targetId,
     targetType: ssoCapabilityClaims.targetType,
   });
@@ -1045,9 +2213,7 @@ test("linked role=user completes browser-bound SSO and receives a normal session
     })
   );
   expect(callbackReplay.status).toBe(303);
-  expect(callbackReplay.headers.get("location")).toBe(
-    legacySsoFailedLocation
-  );
+  expect(callbackReplay.headers.get("location")).toBe(legacySsoFailedLocation);
   const callbackReplaySessionCookieHeader = cookieHeaderFrom(
     callbackReplay,
     "__Host-folio-sso-session"
@@ -1078,6 +2244,591 @@ test("linked role=user completes browser-bound SSO and receives a normal session
   expect(sessionReplayCookieHeader).toContain("SameSite=None");
 });
 
+test("Legacy SSO switch requires owner confirmation and preserves current session on cancel", async () => {
+  const owner = await createCredentialFixture({
+    email: `ticket-15-owner-${crypto.randomUUID()}@example.com`,
+    name: "Ticket 15 current User",
+    password: "Ticket15-owner-password",
+  });
+  const target = await createCredentialFixture({
+    email: `ticket-15-target-${crypto.randomUUID()}@example.com`,
+    name: "Ticket 15 Legacy User",
+    password: "Ticket15-target-password",
+  });
+  const other = await createCredentialFixture({
+    email: `ticket-15-other-${crypto.randomUUID()}@example.com`,
+    name: "Ticket 15 Other User",
+    password: "Ticket15-other-password",
+  });
+  const admin = await createCredentialFixture({
+    email: `ticket-15-admin-${crypto.randomUUID()}@example.com`,
+    name: "Ticket 15 Admin",
+    password: "Ticket15-admin-password",
+    role: "admin",
+  });
+  const identity = {
+    email: target.email,
+    email_verified: true,
+    sub: `legacy-${crypto.randomUUID()}`,
+  };
+  const targetSubject = identity.sub;
+  const clientId = `folio-${crypto.randomUUID()}`;
+  const clientSecret = `ticket-15-secret-${crypto.randomUUID()}`;
+  const providerId = `legacy-${crypto.randomUUID()}`;
+  await prisma.account.create({
+    data: {
+      accountId: identity.sub,
+      id: crypto.randomUUID(),
+      providerId,
+      userId: target.id,
+    },
+  });
+  const otherSubject = `legacy-${crypto.randomUUID()}`;
+  await prisma.account.create({
+    data: {
+      accountId: otherSubject,
+      id: crypto.randomUUID(),
+      providerId,
+      userId: other.id,
+    },
+  });
+  legacySsoMock = startLegacySsoMock({
+    callbackUrl: legacySsoCallbackUrl,
+    clientId,
+    clientSecret,
+    identity,
+  });
+  const ssoApp = createLegacySsoTestApp({
+    authorizeUrl: legacySsoMock.authorizeUrl,
+    callbackUrl: legacySsoCallbackUrl,
+    clientId,
+    clientSecret,
+    exchangeUrl: legacySsoMock.exchangeUrl,
+    providerId,
+  });
+  const handle: LegacySsoHttpHandler = (request) => ssoApp.handle(request);
+  const invalidBearerStart = await handle(
+    new Request("https://folio.example.test/api/legacy-sso/start", {
+      body: JSON.stringify({}),
+      headers: {
+        ...jsonHeaders,
+        Authorization: "Bearer invalid-ticket-15-token",
+      },
+      method: "POST",
+    })
+  );
+  expect(invalidBearerStart.status).toBe(401);
+  expect(invalidBearerStart.headers.has("set-cookie")).toBe(false);
+  const ownerBearer = await bearerFor(owner.email, "Ticket15-owner-password");
+  const otherBearer = await bearerFor(other.email, "Ticket15-other-password");
+  const returnTo = `/forms/${"f".repeat(32)}/fill?responseId=${crypto.randomUUID()}`;
+  const adminBearer = await bearerFor(admin.email, "Ticket15-admin-password");
+  const adminStart = await handle(
+    new Request("https://folio.example.test/api/legacy-sso/start", {
+      body: JSON.stringify({ returnTo }),
+      headers: {
+        ...jsonHeaders,
+        Authorization: `Bearer ${adminBearer}`,
+      },
+      method: "POST",
+    })
+  );
+  expect(adminStart.status).toBe(403);
+  expect(adminStart.headers.has("set-cookie")).toBe(false);
+  const baselineResponses = await handle(
+    new Request("https://folio.example.test/api/responses/me", {
+      headers: { Authorization: `Bearer ${ownerBearer}` },
+    })
+  );
+  const beforeResponses = await baselineResponses.json();
+  const ownerSessionsBefore = await prisma.session.count({
+    where: { userId: owner.id },
+  });
+  const targetSessionsBefore = await prisma.session.count({
+    where: { userId: target.id },
+  });
+
+  const { browserStart, callback } =
+    await completeAuthenticatedLegacySsoCallback(handle, ownerBearer, returnTo);
+  expect(browserStart.startResponse.status).toBe(200);
+  expect(callback.status).toBe(303);
+  expect(callback.headers.get("location")).toBe(
+    new URL("/legacy-sso/confirm", legacySsoWebOrigin).href
+  );
+  expect(callback.headers.get("location")).not.toContain(owner.id);
+  expect(callback.headers.get("location")).not.toContain(target.id);
+  expect(callback.headers.get("location")).not.toContain("code");
+  expect(await prisma.session.count({ where: { userId: owner.id } })).toBe(
+    ownerSessionsBefore
+  );
+  expect(await prisma.session.count({ where: { userId: target.id } })).toBe(
+    targetSessionsBefore
+  );
+  const switchCookie = cookiePairFrom(callback, "__Host-folio-sso-switch");
+  const switchCookieHeader = cookieHeaderFrom(
+    callback,
+    "__Host-folio-sso-switch"
+  );
+  expect(switchCookieHeader).toContain("HttpOnly");
+  expect(switchCookieHeader).toContain("Secure");
+  expect(switchCookieHeader).toContain("SameSite=None");
+  expect(switchCookie).not.toContain(owner.id);
+  expect(switchCookie).not.toContain(target.id);
+
+  const switchRequest = async (
+    bearer: string,
+    path: string,
+    method = "GET",
+    cookie = switchCookie,
+    confirmationFingerprint?: string
+  ): Promise<Response> => {
+    const headers = new Headers({
+      Authorization: `Bearer ${bearer}`,
+      Cookie: cookie,
+      Origin: "https://folio.example.test",
+    });
+    const body =
+      method === "POST" && confirmationFingerprint
+        ? JSON.stringify({ confirmationFingerprint })
+        : undefined;
+    if (body) {
+      headers.set("Content-Type", "application/json");
+    }
+    return handle(
+      new Request(`https://folio.example.test${path}`, {
+        body,
+        headers,
+        method,
+      })
+    );
+  };
+  const wrongOwnerRead = await switchRequest(
+    otherBearer,
+    "/api/legacy-sso/switch"
+  );
+  expect(wrongOwnerRead.status).toBe(401);
+  expect(
+    (await switchRequest(otherBearer, "/api/legacy-sso/switch/confirm", "POST"))
+      .status
+  ).toBe(401);
+  expect(
+    (await switchRequest(otherBearer, "/api/legacy-sso/switch/cancel", "POST"))
+      .status
+  ).toBe(401);
+
+  const switchDetails = await switchRequest(
+    ownerBearer,
+    "/api/legacy-sso/switch"
+  );
+  expect(switchDetails.status).toBe(200);
+  expect(switchDetails.headers.get("cache-control")).toBe("no-store");
+  const switchDetailsBody = (await switchDetails.json()) as {
+    confirmationFingerprint: string;
+    current: { email: string; name: string };
+    legacy: { email: string; name: string };
+    returnTo: string;
+    sameUser: boolean;
+  };
+  expect(switchDetailsBody).toEqual({
+    confirmationFingerprint: expect.any(String),
+    current: { email: owner.email, name: "Ticket 15 current User" },
+    legacy: { email: target.email, name: "Ticket 15 Legacy User" },
+    returnTo,
+    sameUser: false,
+  });
+  const cancelResponse = await switchRequest(
+    ownerBearer,
+    "/api/legacy-sso/switch/cancel",
+    "POST",
+    switchCookie,
+    switchDetailsBody.confirmationFingerprint
+  );
+  expect(cancelResponse.status).toBe(200);
+  expect(cancelResponse.headers.get("set-cookie")).toContain(
+    "__Host-folio-sso-switch="
+  );
+  expect(cancelResponse.headers.get("set-cookie")).toContain("Max-Age=0");
+  expect(cancelResponse.headers.has("location")).toBe(false);
+  expect(await prisma.session.count({ where: { userId: target.id } })).toBe(
+    targetSessionsBefore
+  );
+  expect(
+    await (
+      await handle(
+        new Request("https://folio.example.test/api/session", {
+          headers: { Authorization: `Bearer ${ownerBearer}` },
+        })
+      )
+    ).json()
+  ).toMatchObject({ user: { id: owner.id } });
+  expect(
+    await (
+      await handle(
+        new Request("https://folio.example.test/api/responses/me", {
+          headers: { Authorization: `Bearer ${ownerBearer}` },
+        })
+      )
+    ).json()
+  ).toEqual(beforeResponses);
+  expect(
+    (await switchRequest(ownerBearer, "/api/legacy-sso/switch", "GET")).status
+  ).toBe(401);
+
+  const otherSessionsBeforeOverlap = await prisma.session.count({
+    where: { userId: other.id },
+  });
+  const staleFlow = await completeAuthenticatedLegacySsoCallback(
+    handle,
+    ownerBearer,
+    returnTo
+  );
+  const staleCookie = cookiePairFrom(
+    staleFlow.callback,
+    "__Host-folio-sso-switch"
+  );
+  const staleDetailsResponse = await switchRequest(
+    ownerBearer,
+    "/api/legacy-sso/switch",
+    "GET",
+    staleCookie
+  );
+  const staleDetails = (await staleDetailsResponse.json()) as {
+    confirmationFingerprint: string;
+  };
+  identity.email = other.email;
+  identity.sub = otherSubject;
+  const replacementFlow = await completeAuthenticatedLegacySsoCallback(
+    handle,
+    ownerBearer,
+    returnTo
+  );
+  const replacementCookie = cookiePairFrom(
+    replacementFlow.callback,
+    "__Host-folio-sso-switch"
+  );
+  const staleConfirm = await switchRequest(
+    ownerBearer,
+    "/api/legacy-sso/switch/confirm",
+    "POST",
+    replacementCookie,
+    staleDetails.confirmationFingerprint
+  );
+  expect(staleConfirm.status).toBe(401);
+  expect(await prisma.session.count({ where: { userId: other.id } })).toBe(
+    otherSessionsBeforeOverlap
+  );
+  const replacementDetailsResponse = await switchRequest(
+    ownerBearer,
+    "/api/legacy-sso/switch",
+    "GET",
+    replacementCookie
+  );
+  const replacementDetails = (await replacementDetailsResponse.json()) as {
+    confirmationFingerprint: string;
+    legacy: { email: string; name: string };
+  };
+  expect(replacementDetails.legacy).toEqual({
+    email: other.email,
+    name: "Ticket 15 Other User",
+  });
+  expect(replacementDetails.confirmationFingerprint).not.toBe(
+    staleDetails.confirmationFingerprint
+  );
+  const replacementCancel = await switchRequest(
+    ownerBearer,
+    "/api/legacy-sso/switch/cancel",
+    "POST",
+    replacementCookie,
+    replacementDetails.confirmationFingerprint
+  );
+  expect(replacementCancel.status).toBe(200);
+  const staleChallengeId = staleCookie.split("=", 2)[1];
+  await prisma.verification.deleteMany({ where: { id: staleChallengeId } });
+  identity.email = target.email;
+  identity.sub = targetSubject;
+  const pendingSubject = `legacy-${crypto.randomUUID()}`;
+  identity.email = owner.email;
+  identity.sub = pendingSubject;
+  const pendingFlow = await completeAuthenticatedLegacySsoCallback(
+    handle,
+    ownerBearer,
+    returnTo
+  );
+  const pendingLocation = new URL(
+    pendingFlow.callback.headers.get("location") ?? ""
+  );
+  expect(pendingLocation.pathname).toBe("/login");
+  expect(pendingLocation.searchParams.get("legacySso")).toBe("pending");
+  expect(pendingLocation.searchParams.get("returnTo")).toBe(returnTo);
+  expect(await prisma.session.count({ where: { userId: owner.id } })).toBe(
+    ownerSessionsBefore
+  );
+  const ownerAfterPending = await handle(
+    new Request("https://folio.example.test/api/session", {
+      headers: { Authorization: `Bearer ${ownerBearer}` },
+    })
+  );
+  expect(await ownerAfterPending.json()).toMatchObject({
+    user: { id: owner.id },
+  });
+  identity.email = target.email;
+  identity.sub = targetSubject;
+  const confirmedFlow = await completeAuthenticatedLegacySsoCallback(
+    handle,
+    ownerBearer,
+    returnTo
+  );
+  const confirmCookie = cookiePairFrom(
+    confirmedFlow.callback,
+    "__Host-folio-sso-switch"
+  );
+  const confirmDetailsResponse = await switchRequest(
+    ownerBearer,
+    "/api/legacy-sso/switch",
+    "GET",
+    confirmCookie
+  );
+  const confirmDetails = (await confirmDetailsResponse.json()) as {
+    confirmationFingerprint: string;
+  };
+  const confirmed = await switchRequest(
+    ownerBearer,
+    "/api/legacy-sso/switch/confirm",
+    "POST",
+    confirmCookie,
+    confirmDetails.confirmationFingerprint
+  );
+  expect(confirmed.status).toBe(200);
+  expect(await confirmed.json()).toEqual({ returnTo });
+  expect(confirmed.headers.get("set-cookie")).toContain(
+    "__Host-folio-sso-session="
+  );
+  expect(confirmed.headers.get("set-cookie")).not.toContain(ownerBearer);
+  expect(await prisma.session.count({ where: { userId: target.id } })).toBe(
+    targetSessionsBefore + 1
+  );
+  const claimedBearer = await claimLegacySsoBearer(handle, confirmed);
+  const targetSession = await handle(
+    new Request("https://folio.example.test/api/session", {
+      headers: { Authorization: `Bearer ${claimedBearer}` },
+    })
+  );
+  expect(await targetSession.json()).toMatchObject({
+    user: { id: target.id, role: "user" },
+  });
+  const sameUserSubject = `legacy-${crypto.randomUUID()}`;
+  identity.email = owner.email;
+  identity.sub = sameUserSubject;
+  await prisma.account.create({
+    data: {
+      accountId: sameUserSubject,
+      id: crypto.randomUUID(),
+      providerId,
+      userId: owner.id,
+    },
+  });
+  const sameUserFlow = await completeAuthenticatedLegacySsoCallback(
+    handle,
+    ownerBearer,
+    returnTo
+  );
+  const sameUserCookie = cookiePairFrom(
+    sameUserFlow.callback,
+    "__Host-folio-sso-switch"
+  );
+  const sameUserDetails = await handle(
+    new Request("https://folio.example.test/api/legacy-sso/switch", {
+      headers: {
+        Authorization: `Bearer ${ownerBearer}`,
+        Cookie: sameUserCookie,
+      },
+    })
+  );
+  const sameUserConfirmWithoutOrigin = await handle(
+    new Request("https://folio.example.test/api/legacy-sso/switch/confirm", {
+      headers: {
+        Authorization: `Bearer ${ownerBearer}`,
+        Cookie: sameUserCookie,
+      },
+      method: "POST",
+    })
+  );
+  expect(sameUserConfirmWithoutOrigin.status).toBe(401);
+  expect(sameUserDetails.status).toBe(200);
+  const sameUserDetailsBody = (await sameUserDetails.json()) as {
+    confirmationFingerprint: string;
+    legacy: { email: string; name: string };
+    returnTo: string;
+    sameUser: boolean;
+  };
+  const sameUserFingerprint = sameUserDetailsBody.confirmationFingerprint;
+  expect(sameUserDetailsBody).toMatchObject({
+    confirmationFingerprint: expect.any(String),
+    legacy: { email: owner.email, name: "Ticket 15 current User" },
+    returnTo,
+    sameUser: true,
+  });
+  const sameUserConfirm = await switchRequest(
+    ownerBearer,
+    "/api/legacy-sso/switch/confirm",
+    "POST",
+    sameUserCookie,
+    sameUserFingerprint
+  );
+  expect(await sameUserConfirm.json()).toEqual({ returnTo });
+  const sameUserBearer = await claimLegacySsoBearer(handle, sameUserConfirm);
+  expect(
+    await (
+      await handle(
+        new Request("https://folio.example.test/api/session", {
+          headers: { Authorization: `Bearer ${sameUserBearer}` },
+        })
+      )
+    ).json()
+  ).toMatchObject({ user: { id: owner.id } });
+});
+test("Legacy SSO exchange failure and expired switch challenge preserve current bearer", async () => {
+  const now = new Date();
+  const owner = await createCredentialFixture({
+    email: `ticket-15-safe-${crypto.randomUUID()}@example.com`,
+    name: "Ticket 15 Safe User",
+    password: "Ticket15-safe-password",
+  });
+  const target = await createCredentialFixture({
+    email: `ticket-15-safe-target-${crypto.randomUUID()}@example.com`,
+    name: "Ticket 15 Safe Target",
+    password: "Ticket15-safe-target-password",
+  });
+  const identity = {
+    email: target.email,
+    email_verified: true,
+    sub: `legacy-${crypto.randomUUID()}`,
+  };
+  const clientId = `folio-${crypto.randomUUID()}`;
+  const clientSecret = `ticket-15-safe-secret-${crypto.randomUUID()}`;
+  const providerId = `legacy-${crypto.randomUUID()}`;
+  await prisma.account.create({
+    data: {
+      accountId: identity.sub,
+      id: crypto.randomUUID(),
+      providerId,
+      userId: target.id,
+    },
+  });
+  legacySsoMock = startLegacySsoMock({
+    callbackUrl: legacySsoCallbackUrl,
+    clientId,
+    clientSecret,
+    clock: () => new Date(now),
+    identity,
+  });
+  const failedExchangeApp = createLegacySsoTestApp({
+    authorizeUrl: legacySsoMock.authorizeUrl,
+    callbackUrl: legacySsoCallbackUrl,
+    clientId,
+    clientSecret,
+    exchangeUrl: new URL("/exchange-failed", legacySsoMock.exchangeUrl).href,
+    providerId,
+  });
+  const failedExchangeHandle: LegacySsoHttpHandler = (request) =>
+    failedExchangeApp.handle(request);
+  const ownerBearer = await bearerFor(owner.email, "Ticket15-safe-password");
+  const targetSessionsBefore = await prisma.session.count({
+    where: { userId: target.id },
+  });
+  const failedFlow = await completeAuthenticatedLegacySsoCallback(
+    failedExchangeHandle,
+    ownerBearer,
+    `/forms/${"b".repeat(32)}/fill`
+  );
+  const failedLocation = new URL(
+    failedFlow.callback.headers.get("location") ?? ""
+  );
+  expect(failedLocation.pathname).toBe("/login");
+  expect(failedLocation.searchParams.get("legacySso")).toBe("failed");
+  expect(failedLocation.searchParams.get("returnTo")).toBe(
+    `/forms/${"b".repeat(32)}/fill`
+  );
+  expect(await prisma.session.count({ where: { userId: target.id } })).toBe(
+    targetSessionsBefore
+  );
+  expect(
+    await (
+      await failedExchangeHandle(
+        new Request("https://folio.example.test/api/session", {
+          headers: { Authorization: `Bearer ${ownerBearer}` },
+        })
+      )
+    ).json()
+  ).toMatchObject({ user: { id: owner.id } });
+
+  const appNow = () => new Date(now);
+  const ssoApp = createLegacySsoTestApp(
+    {
+      authorizeUrl: legacySsoMock.authorizeUrl,
+      callbackUrl: legacySsoCallbackUrl,
+      clientId,
+      clientSecret,
+      exchangeUrl: legacySsoMock.exchangeUrl,
+      providerId,
+    },
+    appNow
+  );
+  const handle: LegacySsoHttpHandler = (request) => ssoApp.handle(request);
+  const expiredFlow = await completeAuthenticatedLegacySsoCallback(
+    handle,
+    ownerBearer,
+    `/forms/${"b".repeat(32)}/fill`
+  );
+  expect(expiredFlow.callback.headers.get("location")).toBe(
+    new URL("/legacy-sso/confirm", legacySsoWebOrigin).href
+  );
+  const switchCookie = cookiePairFrom(
+    expiredFlow.callback,
+    "__Host-folio-sso-switch"
+  );
+  const challengeId = switchCookie.split("=", 2)[1];
+  if (!challengeId) {
+    throw new Error("The switch challenge cookie was empty");
+  }
+  await prisma.verification.update({
+    data: { expiresAt: new Date(now.getTime() - 1) },
+    where: { id: challengeId },
+  });
+  const expiredRead = await handle(
+    new Request("https://folio.example.test/api/legacy-sso/switch", {
+      headers: {
+        Authorization: `Bearer ${ownerBearer}`,
+        Cookie: switchCookie,
+        Origin: "https://folio.example.test",
+      },
+    })
+  );
+  expect(expiredRead.status).toBe(401);
+  const expiredConfirm = await handle(
+    new Request("https://folio.example.test/api/legacy-sso/switch/confirm", {
+      headers: {
+        Authorization: `Bearer ${ownerBearer}`,
+        Cookie: switchCookie,
+        Origin: "https://folio.example.test",
+      },
+      method: "POST",
+    })
+  );
+  expect(expiredConfirm.status).toBe(401);
+  expect(await prisma.session.count({ where: { userId: target.id } })).toBe(
+    targetSessionsBefore
+  );
+  expect(
+    await (
+      await handle(
+        new Request("https://folio.example.test/api/session", {
+          headers: { Authorization: `Bearer ${ownerBearer}` },
+        })
+      )
+    ).json()
+  ).toMatchObject({ user: { id: owner.id } });
+});
 test("rejects unsafe returns and mismatched callback state or cookie", async () => {
   const email = `ticket-12-binding-${crypto.randomUUID()}@example.com`;
   const password = "Ticket12-binding-test-password";
@@ -1123,12 +2874,13 @@ test("rejects unsafe returns and mismatched callback state or cookie", async () 
     "/admin",
     `/forms/${"a".repeat(32)}/fill?access_token=secret`,
   ]) {
-    const unsafeStartUrl = new URL(
-      "/api/legacy-sso/start",
-      "https://folio.example.test"
+    const unsafeStart = await handle(
+      new Request("https://folio.example.test/api/legacy-sso/start", {
+        body: JSON.stringify({ returnTo: unsafeReturn }),
+        headers: jsonHeaders,
+        method: "POST",
+      })
     );
-    unsafeStartUrl.searchParams.set("returnTo", unsafeReturn);
-    const unsafeStart = await handle(new Request(unsafeStartUrl.href));
     expect(unsafeStart.status).toBe(400);
     expect(unsafeStart.headers.has("set-cookie")).toBe(false);
   }
@@ -1212,7 +2964,7 @@ test("rejects unsafe returns and mismatched callback state or cookie", async () 
   ).toEqual({ enabled: false });
 });
 
-test("rejects unlinked, unverified, disabled, email-mismatched, and Admin identities", async () => {
+test("rejects unverified, disabled, and Admin identities but queues email collisions", async () => {
   const email = `ticket-12-eligibility-${crypto.randomUUID()}@example.com`;
   const password = "Ticket12-eligibility-test-password";
   const user = await createCredentialFixture({
@@ -1252,7 +3004,9 @@ test("rejects unlinked, unverified, disabled, email-mismatched, and Admin identi
     providerId,
   });
   const handle: LegacySsoHttpHandler = (request) => ssoApp.handle(request);
-  const rejectCurrentIdentity = async () => {
+  const expectIdentityLocation = async (
+    expectedLocation: string
+  ): Promise<void> => {
     const browserStart = await startLegacySsoBrowser(
       handle,
       `/forms/${"d".repeat(32)}/fill`
@@ -1271,29 +3025,24 @@ test("rejects unlinked, unverified, disabled, email-mismatched, and Admin identi
       })
     );
     expect(callbackResponse.status).toBe(303);
-    expect(callbackResponse.headers.get("location")).toBe(
-      legacySsoFailedLocation
-    );
+    expect(callbackResponse.headers.get("location")).toBe(expectedLocation);
   };
   const userCountBefore = await prisma.user.count();
-  await rejectCurrentIdentity();
+  await expectIdentityLocation(legacySsoFailedLocation);
   identity.email_verified = true;
-  identity.email = `different-${crypto.randomUUID()}@example.com`;
-  await rejectCurrentIdentity();
-  identity.email = email;
   identity.sub = `unlinked-${crypto.randomUUID()}`;
-  await rejectCurrentIdentity();
+  await expectIdentityLocation(legacySsoPendingLocation);
   identity.sub = linkedSubject;
   await prisma.user.update({
     data: { enabled: false },
     where: { id: user.id },
   });
-  await rejectCurrentIdentity();
+  await expectIdentityLocation(legacySsoFailedLocation);
   await prisma.user.update({
     data: { enabled: true, role: "admin" },
     where: { id: user.id },
   });
-  await rejectCurrentIdentity();
+  await expectIdentityLocation(legacySsoFailedLocation);
   await prisma.user.update({
     data: { role: "user" },
     where: { id: user.id },
@@ -1362,9 +3111,7 @@ test("expires browser-bound SSO transactions and session handoffs", async () => 
       headers: { Cookie: expiredStart.preLoginCookie },
     })
   );
-  expect(expiredCallback.headers.get("location")).toBe(
-    legacySsoFailedLocation
-  );
+  expect(expiredCallback.headers.get("location")).toBe(legacySsoFailedLocation);
 
   const validStart = await startLegacySsoBrowser(handle, returnTo);
   const validAuthorization = await fetch(validStart.authorizationUrl, {
@@ -1413,15 +3160,13 @@ test("old-backend codes bind client, callback, verifier, expiry, and single use"
     callbackUrl,
     clientId,
     clientSecret,
-    codeLifetimeMs: 1000,
     clock: () => new Date(now),
+    codeLifetimeMs: 1000,
     identity,
   });
   legacySsoMock = legacySsoServer;
   const verifier = "v".repeat(43);
-  const challenge = createHash("sha256")
-    .update(verifier)
-    .digest("base64url");
+  const challenge = createHash("sha256").update(verifier).digest("base64url");
   const state = "s".repeat(43);
   const authorize = new URL(legacySsoServer.authorizeUrl);
   authorize.searchParams.set("client_id", clientId);
@@ -1519,7 +3264,7 @@ test("old-backend codes bind client, callback, verifier, expiry, and single use"
   });
   expect(expiredResponse.status).toBe(400);
 });
-test("Ticket 06 native text forms preserve drafts, Prefill, and Fill Method", async () => {
+test("Ticket 07 native scalar forms preserve values, validation, and Fill Method", async () => {
   const adminPassword = "Ticket06-admin-password";
   const userPassword = "Ticket06-user-password";
   const adminEmail = `ticket-06-admin-${crypto.randomUUID()}@example.com`;
@@ -1537,27 +3282,95 @@ test("Ticket 06 native text forms preserve drafts, Prefill, and Fill Method", as
   });
   const adminBearer = await bearerFor(adminEmail, adminPassword);
   const userBearer = await bearerFor(userEmail, userPassword);
-  const capabilityHeaders = (
-    capability: string
-  ): Record<string, string> => ({
+  const capabilityHeaders = (capability: string): Record<string, string> => ({
     ...jsonHeaders,
     "X-Editor-Capability": capability,
+  });
+  const fullNameControl = contentControl({
+    alias: "Full name",
+    placeholderText: "Enter full name",
+    tag: " full_name ",
+    type: "<w:text/>",
+  })
+    .replace(
+      '<w:tag w:val=" full_name "/>',
+      '<w:tag xmlns:ext="urn:fixture" ext:val="metadata" w:val=" \nfull_name "/>'
+    )
+    .replace(
+      "<w:sdtContent><w:r><w:t>Enter full name</w:t></w:r></w:sdtContent>",
+      '<w:sdtContent><w:p><w:r><w:rPr><w:b/></w:rPr><w:t>Enter</w:t></w:r></w:p><w:p><w:r><w:rPr><w:i/></w:rPr><w:t xml:space="preserve"> full name</w:t></w:r></w:p></w:sdtContent>'
+    )
+    .replace("<w:showingPlcHdr/>", "<w:showingPlcHdr></w:showingPlcHdr>");
+  const stateCheckboxControl = contentControl({
+    alias: "Checkbox with state children",
+    tag: "state_checkbox",
+    type: '<w14:checkbox><w14:checkedState w14:val="2713" w14:font="Ticket Symbols"/><w14:uncheckedState w14:val="25A1" w14:font="Ticket Symbols"/></w14:checkbox>',
+  })
+    .replace('<w:tag w:val="state_checkbox"/>', "")
+    .replace(
+      "</w14:checkbox>",
+      '</w14:checkbox><w:tag w:val="state_checkbox"/>'
+    );
+  const branchCheckboxControl = stateCheckboxControl.replaceAll(
+    "w14:",
+    "branch:"
+  );
+  const commentsControl = contentControl({
+    alias: "Comments",
+    placeholderText: "Add comments",
+    tag: "comments",
+    type: "<w:text/>",
+  }).replace(
+    "<w:sdtContent><w:r><w:t>Add comments</w:t></w:r></w:sdtContent>",
+    '<w:sdtContent><w:p><w:pPr><w:jc w:val="center"/></w:pPr><w:r><w:rPr><w:b/><w:color w:val="FF0000"/></w:rPr><w:t>Add comments</w:t></w:r></w:p></w:sdtContent>'
+  );
+  const valueCheckboxControl = contentControl({
+    alias: "Checkbox with unchecked marker value",
+    tag: "value_checkbox",
+    type: '<w14:checkbox><w14:checked/><w14:checkedState w14:val="2713" w14:font="Ticket Symbols"/><w14:uncheckedState w14:val="25A1" w14:font="Ticket Symbols"/></w14:checkbox>',
   });
   const formTemplate = docxXmlFixture({
     document: contentControlDocument(
       `<w:p><w:r><w:t>Static layout</w:t></w:r></w:p>` +
-        contentControl({
-          alias: "Full name",
-          placeholderText: "Enter full name",
-          tag: " full_name ",
-          type: "<w:text/>",
-        }) +
-        contentControl({
-          alias: "Comments",
-          placeholderText: "Add comments",
-          tag: "comments",
-          type: "<w:text/>",
-        })
+        `<mc:AlternateContent><mc:Choice xmlns:branch="http://schemas.microsoft.com/office/word/2010/wordml" Requires="branch">${
+          fullNameControl
+        }${commentsControl}${contentControl({
+          alias: "Enabled",
+          tag: "enabled",
+          type: "<w14:checkbox/>",
+        })}${
+          branchCheckboxControl
+        }</mc:Choice><mc:Fallback><w:sdt><w:sdtPr/></w:sdt></mc:Fallback></mc:AlternateContent>${
+          valueCheckboxControl
+        }${contentControl({
+          alias: "Start date",
+          tag: "start_date",
+          type: '<w:date w:fullDate="2020-01-01T00:00:00Z"><w:lid w:val="en-US"/><w:dateFormat w:val="dddd, MMMM d, yyyy &apos;d literal&apos;"/></w:date>',
+        })}${contentControl({
+          alias: "Cleared date",
+          tag: "cleared_date",
+          type: '<w:date w:fullDate="1999-12-31T00:00:00Z"><w:dateFormat w:val="dd/MM/yy"/></w:date>',
+        })}${contentControl({
+          alias: "Category",
+          tag: "category",
+          type: '<w:dropDownList w:lastValue="old_value"><w:listItem w:displayText="Friendly label" w:value="stored_value"/><w:listItem w:displayText="Empty option label" w:value=""/><w:listItem w:displayText="Choice B" w:value="Empty option label"/></w:dropDownList>',
+        })}${contentControl({
+          alias: "Empty category",
+          tag: "empty_category",
+          type: '<w:dropDownList><w:listItem w:displayText="Empty option label" w:value=""/><w:listItem w:displayText="Whitespace option label" w:value=" "/></w:dropDownList>',
+        })}${contentControl({
+          alias: "Nullable category",
+          tag: "nullable_category",
+          type: '<w:dropDownList><w:listItem w:displayText="Nullable empty option label" w:value=""/></w:dropDownList>',
+        })}${contentControl({
+          alias: "Cleared category",
+          tag: "cleared_category",
+          type: '<w:dropDownList w:lastValue="old_value"><w:listItem w:displayText="Old label" w:value="old_value"/></w:dropDownList>',
+        })}${contentControl({
+          alias: "Custom category",
+          tag: "custom_category",
+          type: '<w:comboBox><w:listItem w:displayText="Suggested label" w:value="suggested"/><w:listItem w:displayText="Empty combo label" w:value=""/><w:listItem w:displayText="Choice B" w:value="Empty combo label"/><w:listItem w:displayText="Whitespace combo label" w:value=" "/></w:comboBox>',
+        })}`
     ),
   });
   const createResponse = await app.handle(
@@ -1621,6 +3434,51 @@ test("Ticket 06 native text forms preserve drafts, Prefill, and Fill Method", as
     })
   );
   expect(requiredFieldResponse.status).toBe(200);
+  const requiredCheckboxResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${publicId}/field-rules`, {
+      body: JSON.stringify({
+        documentKey: adminEditor.config.document.key,
+        prefillPointer: null,
+        prefillPolicy: "editable",
+        previousTag: null,
+        required: true,
+        tag: "enabled",
+      }),
+      headers: capabilityHeaders(configureFieldsCapability),
+      method: "PATCH",
+    })
+  );
+  expect(requiredCheckboxResponse.status).toBe(200);
+  const requiredEmptyDropdownResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${publicId}/field-rules`, {
+      body: JSON.stringify({
+        documentKey: adminEditor.config.document.key,
+        prefillPointer: null,
+        prefillPolicy: "editable",
+        previousTag: null,
+        required: true,
+        tag: "empty_category",
+      }),
+      headers: capabilityHeaders(configureFieldsCapability),
+      method: "PATCH",
+    })
+  );
+  expect(requiredEmptyDropdownResponse.status).toBe(200);
+  const requiredComboResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${publicId}/field-rules`, {
+      body: JSON.stringify({
+        documentKey: adminEditor.config.document.key,
+        prefillPointer: null,
+        prefillPolicy: "editable",
+        previousTag: null,
+        required: true,
+        tag: "custom_category",
+      }),
+      headers: capabilityHeaders(configureFieldsCapability),
+      method: "PATCH",
+    })
+  );
+  expect(requiredComboResponse.status).toBe(200);
   const publishEditorResponse = await app.handle(
     new Request(`http://test.local/api/admin/forms/${publicId}/editor-config`, {
       headers: { Authorization: `Bearer ${adminBearer}` },
@@ -1668,6 +3526,83 @@ test("Ticket 06 native text forms preserve drafts, Prefill, and Fill Method", as
   if (!publishedManifest) {
     throw new Error("The Ticket 06 manifest was not published");
   }
+  const publishedTemplateBytes = await readObject(publishedTemplate.objectKey);
+  const unsupportedDateArchive = unzipSync(publishedTemplateBytes);
+  const publishedDocumentXml = new TextDecoder().decode(
+    unsupportedDateArchive["word/document.xml"]
+  );
+  unsupportedDateArchive["word/document.xml"] = strToU8(
+    publishedDocumentXml.replace(
+      'w:dateFormat w:val="dddd, MMMM d, yyyy &apos;d literal&apos;"',
+      'w:dateFormat w:val="yyyy-MM-dd HH:mm"'
+    )
+  );
+  await putObject(
+    publishedTemplate.objectKey,
+    zipSync(unsupportedDateArchive),
+    DOCX_CONTENT_TYPE
+  );
+  const unsupportedDateMethod = await patchFillMethod("native");
+  await putObject(
+    publishedTemplate.objectKey,
+    publishedTemplateBytes,
+    DOCX_CONTENT_TYPE
+  );
+  expect(unsupportedDateMethod.status).toBe(409);
+  expect(await unsupportedDateMethod.json()).toMatchObject({
+    error: "native_fill_unsupported",
+  });
+  const assertNativeFillRejected = async (documentXml: string) => {
+    const modifiedArchive = unzipSync(publishedTemplateBytes);
+    modifiedArchive["word/document.xml"] = strToU8(documentXml);
+    await putObject(
+      publishedTemplate.objectKey,
+      zipSync(modifiedArchive),
+      DOCX_CONTENT_TYPE
+    );
+    try {
+      const response = await patchFillMethod("native");
+      expect(response.status).toBe(409);
+      expect(await response.json()).toMatchObject({
+        error: "native_fill_unsupported",
+      });
+    } finally {
+      await putObject(
+        publishedTemplate.objectKey,
+        publishedTemplateBytes,
+        DOCX_CONTENT_TYPE
+      );
+      await patchFillMethod("onlyoffice");
+    }
+  };
+  const duplicateChoiceDocumentXml = publishedDocumentXml.replace(
+    "</mc:Choice>",
+    `</mc:Choice><mc:Choice xmlns:branch="http://schemas.microsoft.com/office/word/2010/wordml" Requires="branch">${fullNameControl}</mc:Choice>`
+  );
+  if (duplicateChoiceDocumentXml === publishedDocumentXml) {
+    throw new Error("The published Choice fixture is missing");
+  }
+  await assertNativeFillRejected(duplicateChoiceDocumentXml);
+  const supportedChoiceOpen =
+    '<mc:Choice xmlns:branch="http://schemas.microsoft.com/office/word/2010/wordml" Requires="branch">';
+  const earlierSupportedChoiceDocumentXml = publishedDocumentXml.replace(
+    supportedChoiceOpen,
+    `${supportedChoiceOpen}<w:p><w:r><w:t>Preferred branch without native fields</w:t></w:r></w:p></mc:Choice>${supportedChoiceOpen}`
+  );
+  if (earlierSupportedChoiceDocumentXml === publishedDocumentXml) {
+    throw new Error("The published Choice fixture is missing");
+  }
+  await assertNativeFillRejected(earlierSupportedChoiceDocumentXml);
+  const fallbackFieldDocumentXml = publishedDocumentXml.replace(
+    "</mc:Fallback>",
+    `${contentControl({ tag: "full_name", type: "<w:text/>" })}</mc:Fallback>`
+  );
+  await assertNativeFillRejected(fallbackFieldDocumentXml);
+  const unsupportedChoiceDocumentXml = publishedDocumentXml.replace(
+    'xmlns:branch="http://schemas.microsoft.com/office/word/2010/wordml" Requires="branch"',
+    'xmlns:branch="http://schemas.microsoft.com/office/word/2010/wordml" xmlns:unsupported="urn:unsupported" Requires="branch unsupported"'
+  );
+  await assertNativeFillRejected(unsupportedChoiceDocumentXml);
   await prisma.$transaction(async (tx) => {
     await tx.$executeRaw`ALTER TABLE "field_manifests" DISABLE TRIGGER "field_manifests_immutable"`;
     await tx.$executeRaw`ALTER TABLE "manifest_fields" DISABLE TRIGGER "manifest_fields_immutable"`;
@@ -1736,13 +3671,19 @@ test("Ticket 06 native text forms preserve drafts, Prefill, and Fill Method", as
     response?: { id?: string };
   };
   const responseId = startBody.response?.id;
-  const editorConfigUrl = startBody.editorConfigUrl;
+  const { editorConfigUrl } = startBody;
   if (!responseId || !editorConfigUrl) {
     throw new Error("The Ticket 06 native response did not start");
   }
   expect(startBody.fillMethod).toBe("native");
-  const prefillValues = { full_name: "Trusted Prefill" };
-  const prefillLocks = { full_name: true };
+  const prefillValues = {
+    full_name: "Trusted\nPrefill",
+    state_checkbox: true,
+  };
+  const prefillLocks = {
+    full_name: true,
+    state_checkbox: true,
+  };
   await prisma.prefillSnapshot.update({
     data: { lockedFields: prefillLocks, values: prefillValues },
     where: { responseId },
@@ -1753,6 +3694,7 @@ test("Ticket 06 native text forms preserve drafts, Prefill, and Fill Method", as
     documentKey: string;
     fields: {
       label: string;
+      options: { displayText: string; value: string }[];
       placeholder: string | null;
       position: number;
       required: boolean;
@@ -1781,8 +3723,9 @@ test("Ticket 06 native text forms preserve drafts, Prefill, and Fill Method", as
   });
   expect(
     nativeConfig.fields.map(
-      ({ label, placeholder, position, required, tag, type }) => ({
+      ({ label, options, placeholder, position, required, tag, type }) => ({
         label,
+        options,
         placeholder,
         position,
         required,
@@ -1793,6 +3736,7 @@ test("Ticket 06 native text forms preserve drafts, Prefill, and Fill Method", as
   ).toEqual([
     {
       label: "Full name",
+      options: [],
       placeholder: "Enter full name",
       position: 0,
       required: true,
@@ -1801,11 +3745,114 @@ test("Ticket 06 native text forms preserve drafts, Prefill, and Fill Method", as
     },
     {
       label: "Comments",
+      options: [],
       placeholder: "Add comments",
       position: 1,
       required: false,
       tag: "comments",
       type: "text",
+    },
+    {
+      label: "Enabled",
+      options: [],
+      placeholder: null,
+      position: 2,
+      required: true,
+      tag: "enabled",
+      type: "checkbox",
+    },
+    {
+      label: "Checkbox with state children",
+      options: [],
+      placeholder: null,
+      position: 3,
+      required: false,
+      tag: "state_checkbox",
+      type: "checkbox",
+    },
+    {
+      label: "Checkbox with unchecked marker value",
+      options: [],
+      placeholder: null,
+      position: 4,
+      required: false,
+      tag: "value_checkbox",
+      type: "checkbox",
+    },
+    {
+      label: "Start date",
+      options: [],
+      placeholder: null,
+      position: 5,
+      required: false,
+      tag: "start_date",
+      type: "date",
+    },
+    {
+      label: "Cleared date",
+      options: [],
+      placeholder: null,
+      position: 6,
+      required: false,
+      tag: "cleared_date",
+      type: "date",
+    },
+    {
+      label: "Category",
+      options: [
+        { displayText: "Friendly label", value: "stored_value" },
+        { displayText: "Empty option label", value: "" },
+        { displayText: "Choice B", value: "Empty option label" },
+      ],
+      placeholder: null,
+      position: 7,
+      required: false,
+      tag: "category",
+      type: "dropdown",
+    },
+    {
+      label: "Empty category",
+      options: [
+        { displayText: "Empty option label", value: "" },
+        { displayText: "Whitespace option label", value: " " },
+      ],
+      placeholder: null,
+      position: 8,
+      required: true,
+      tag: "empty_category",
+      type: "dropdown",
+    },
+    {
+      label: "Nullable category",
+      options: [{ displayText: "Nullable empty option label", value: "" }],
+      placeholder: null,
+      position: 9,
+      required: false,
+      tag: "nullable_category",
+      type: "dropdown",
+    },
+    {
+      label: "Cleared category",
+      options: [{ displayText: "Old label", value: "old_value" }],
+      placeholder: null,
+      position: 10,
+      required: false,
+      tag: "cleared_category",
+      type: "dropdown",
+    },
+    {
+      label: "Custom category",
+      options: [
+        { displayText: "Suggested label", value: "suggested" },
+        { displayText: "Empty combo label", value: "" },
+        { displayText: "Choice B", value: "Empty combo label" },
+        { displayText: "Whitespace combo label", value: " " },
+      ],
+      placeholder: null,
+      position: 11,
+      required: true,
+      tag: "custom_category",
+      type: "combo",
     },
   ]);
   const nativeDraftRequest = (
@@ -1851,6 +3898,18 @@ test("Ticket 06 native text forms preserve drafts, Prefill, and Fill Method", as
   expect(await invalidDraftResponse.json()).toMatchObject({
     error: "invalid_response_data",
   });
+  for (const invalidValue of [
+    { start_date: "2023-02-29" },
+    { category: "unknown" },
+    { custom_category: "x".repeat(10_001) },
+    { full_name: "Tampered locked Prefill" },
+  ]) {
+    const response = await nativeDraftRequest(nativeConfig, invalidValue);
+    expect(response.status).toBe(422);
+    expect(await response.json()).toMatchObject({
+      error: "invalid_response_data",
+    });
+  }
   await prisma.prefillSnapshot.update({
     data: { lockedFields: {}, values: {} },
     where: { responseId },
@@ -1862,6 +3921,49 @@ test("Ticket 06 native text forms preserve drafts, Prefill, and Fill Method", as
   expect(await invalidRequiredSubmit.json()).toMatchObject({
     error: "invalid_response_data",
   });
+  const uncheckedRequiredSubmit = await nativeSubmitRequest(nativeConfig, {
+    enabled: false,
+    full_name: "Present",
+  });
+  expect(uncheckedRequiredSubmit.status).toBe(422);
+  expect(await uncheckedRequiredSubmit.json()).toMatchObject({
+    error: "invalid_response_data",
+  });
+  const nullRequiredDropdownSubmit = await nativeSubmitRequest(nativeConfig, {
+    empty_category: null,
+    enabled: true,
+    full_name: "Present",
+  });
+  expect(nullRequiredDropdownSubmit.status).toBe(422);
+  expect(await nullRequiredDropdownSubmit.json()).toMatchObject({
+    error: "invalid_response_data",
+  });
+  const unselectedRequiredComboSubmit = await nativeSubmitRequest(
+    nativeConfig,
+    {
+      custom_category: null,
+      empty_category: "",
+      enabled: true,
+      full_name: "Present",
+    }
+  );
+  expect(unselectedRequiredComboSubmit.status).toBe(422);
+  expect(await unselectedRequiredComboSubmit.json()).toMatchObject({
+    error: "invalid_response_data",
+  });
+  const unlistedWhitespaceComboSubmit = await nativeSubmitRequest(
+    nativeConfig,
+    {
+      custom_category: "  ",
+      empty_category: "",
+      enabled: true,
+      full_name: "Present",
+    }
+  );
+  expect(unlistedWhitespaceComboSubmit.status).toBe(422);
+  expect(await unlistedWhitespaceComboSubmit.json()).toMatchObject({
+    error: "invalid_response_data",
+  });
   expect(await prisma.operation.count({ where: { responseId } })).toBe(
     operationsBeforeInvalidInput
   );
@@ -1870,8 +3972,18 @@ test("Ticket 06 native text forms preserve drafts, Prefill, and Fill Method", as
     where: { responseId },
   });
   const draftData = {
+    category: "stored_value",
+    cleared_category: null,
+    cleared_date: null,
     comments: "Saved native answer",
-    full_name: "Tampered client value",
+    custom_category: "suggested",
+    empty_category: "",
+    enabled: true,
+    full_name: "Trusted\nPrefill",
+    nullable_category: null,
+    start_date: "2024-02-29",
+    state_checkbox: true,
+    value_checkbox: false,
   };
   const failedStorageApp = createApp({
     legacySso: null,
@@ -1950,17 +4062,77 @@ test("Ticket 06 native text forms preserve drafts, Prefill, and Fill Method", as
     throw new Error("The saved Ticket 06 draft has no document key");
   }
   expect(savedResponse.draftData).toEqual({
+    category: "stored_value",
+    cleared_category: null,
+    cleared_date: null,
     comments: "Saved native answer",
-    full_name: "Trusted Prefill",
+    custom_category: "suggested",
+    empty_category: "",
+    enabled: true,
+    full_name: "Trusted\nPrefill",
+    nullable_category: null,
+    start_date: "2024-02-29",
+    state_checkbox: true,
+    value_checkbox: false,
   });
-  const savedArchive = unzipSync(await readObject(savedResponse.draftObjectKey!));
+  const savedArchive = unzipSync(
+    await readObject(savedResponse.draftObjectKey!)
+  );
   const savedDocumentXml = new TextDecoder().decode(
     savedArchive["word/document.xml"]
   );
   expect(savedDocumentXml).toContain("Static layout");
-  expect(savedDocumentXml).toContain("Trusted Prefill");
+  expect(savedDocumentXml).not.toContain("showingPlcHdr");
+  const nullableCategoryContent = savedDocumentXml.match(
+    /<w:tag w:val="nullable_category"\/>[\s\S]*?<w:sdtContent>([\s\S]*?)<\/w:sdtContent>/u
+  )?.[1];
+  expect(nullableCategoryContent).toBe("<w:r><w:t></w:t></w:r>");
+  expect(savedDocumentXml).toContain(
+    '<w:tag xmlns:ext="urn:fixture" ext:val="metadata" w:val="full_name"/>'
+  );
+  expect(savedDocumentXml).toContain("<w:rPr><w:b/></w:rPr><w:t>Trusted</w:t>");
+  expect(savedDocumentXml).toContain(
+    '<w:rPr><w:i/></w:rPr><w:t xml:space="preserve">Prefill</w:t>'
+  );
   expect(savedDocumentXml).toContain("Saved native answer");
-  expect(savedDocumentXml).not.toContain("Tampered client value");
+  expect(savedDocumentXml).toContain('<w:pPr><w:jc w:val="center"/></w:pPr>');
+  expect(savedDocumentXml).toContain(
+    '<w:rPr><w:b/><w:color w:val="FF0000"/></w:rPr>'
+  );
+  expect(savedDocumentXml).toContain(
+    'xmlns:branch="http://schemas.microsoft.com/office/word/2010/wordml"'
+  );
+  expect(savedDocumentXml).toContain("☒");
+  expect(savedDocumentXml.match(/<w14:checked w14:val="1"\/>/gu)).toHaveLength(
+    1
+  );
+  expect(
+    savedDocumentXml.match(/<branch:checked branch:val="1"\/>/gu)
+  ).toHaveLength(1);
+  expect(savedDocumentXml).toContain(
+    '<w14:checkbox><w14:checked w14:val="0"/><w14:checkedState w14:val="2713" w14:font="Ticket Symbols"/>'
+  );
+  expect(savedDocumentXml).toContain(
+    '<branch:checkbox><branch:checked branch:val="1"/><branch:checkedState branch:val="2713" branch:font="Ticket Symbols"/>'
+  );
+  expect(savedDocumentXml).toContain("✓");
+  expect(savedDocumentXml).toContain("□");
+  expect(
+    savedDocumentXml.match(
+      /<w:rFonts w:ascii="Ticket Symbols" w:hAnsi="Ticket Symbols"\/>/gu
+    )
+  ).toHaveLength(2);
+  expect(savedDocumentXml).toContain('w:fullDate="2024-02-29T00:00:00Z"');
+  expect(savedDocumentXml).toContain("Thursday, February 29, 2024");
+  expect(savedDocumentXml).toContain("Thursday, February 29, 2024 d literal");
+  expect(savedDocumentXml).not.toContain('w:fullDate="1999-12-31T00:00:00Z"');
+  expect(savedDocumentXml).toContain('w:lastValue="stored_value"');
+  expect(savedDocumentXml).toContain('w:lastValue=""');
+  expect(savedDocumentXml).not.toContain('w:lastValue="old_value"');
+  expect(savedDocumentXml).toContain("Empty option label");
+  expect(savedDocumentXml).toContain("Friendly label");
+  expect(savedDocumentXml).toContain("Suggested label");
+  expect(savedDocumentXml).toContain('w:value="stored_value"');
   let pdfConversions = 0;
   const pdfApp = createApp({
     onlyOffice: {
@@ -2001,7 +4173,19 @@ test("Ticket 06 native text forms preserve drafts, Prefill, and Fill Method", as
   }
   nativeConfig = await getNativeConfig();
   expect(nativeConfig).toMatchObject({
-    data: { comments: "Saved native answer", full_name: "Trusted Prefill" },
+    data: {
+      category: "stored_value",
+      cleared_category: null,
+      cleared_date: null,
+      comments: "Saved native answer",
+      custom_category: "suggested",
+      empty_category: "",
+      enabled: true,
+      full_name: "Trusted\nPrefill",
+      start_date: "2024-02-29",
+      state_checkbox: true,
+      value_checkbox: false,
+    },
     lockedFields: prefillLocks,
   });
   const onlyOfficeMethodResponse = await patchFillMethod("onlyoffice");
@@ -2043,17 +4227,19 @@ test("Ticket 06 native text forms preserve drafts, Prefill, and Fill Method", as
                 data: Record<string, unknown>;
                 editableFields: Record<string, unknown>;
               };
+              tagAliases?: Record<string, string>;
             }
           >;
         };
       };
     };
+    bridge?: {
+      capabilities?: Record<"save-draft" | "submit", string>;
+    };
     fillMethod?: string;
   };
   expect(onlyOfficeConfig.fillMethod).toBe("onlyoffice");
-  expect(onlyOfficeConfig.config?.document?.key).toBe(
-    savedDraftDocumentKey
-  );
+  expect(onlyOfficeConfig.config?.document?.key).toBe(savedDraftDocumentKey);
   expect(
     onlyOfficeConfig.config?.editorConfig?.plugins?.options?.[pluginGuid]
       ?.prefill
@@ -2061,6 +4247,599 @@ test("Ticket 06 native text forms preserve drafts, Prefill, and Fill Method", as
     data: prefillValues,
     editableFields: { full_name: false },
   });
+  expect(
+    onlyOfficeConfig.config?.editorConfig?.plugins?.options?.[pluginGuid]
+      ?.tagAliases
+  ).toEqual({ metadata: "full_name" });
+  const onlyOfficeSaveCapabilityFor = (
+    config: typeof onlyOfficeConfig
+  ): string => {
+    const capability = config.bridge?.capabilities?.["save-draft"];
+    if (!capability) {
+      throw new Error("The ONLYOFFICE save capability is missing");
+    }
+    return capability;
+  };
+  const onlyOfficeSubmitCapability =
+    onlyOfficeConfig.bridge?.capabilities?.submit;
+  if (!onlyOfficeSubmitCapability) {
+    throw new Error("The ONLYOFFICE submit capability is missing");
+  }
+  let onlyOfficeSaveCapability = onlyOfficeSaveCapabilityFor(onlyOfficeConfig);
+  let onlyOfficeDocumentKey = onlyOfficeConfig.config?.document?.key;
+  if (!onlyOfficeDocumentKey) {
+    throw new Error("The switched ONLYOFFICE document key is missing");
+  }
+  const onlyOfficeDraftRequest = (data: Record<string, unknown>) =>
+    app.handle(
+      new Request(`http://test.local/api/forms/${publicId}/draft`, {
+        body: JSON.stringify({
+          data,
+          documentKey: onlyOfficeDocumentKey,
+          responseId,
+        }),
+        headers: capabilityHeaders(onlyOfficeSaveCapability),
+        method: "POST",
+      })
+    );
+  const onlyOfficeSubmitRequest = (data: Record<string, unknown>) =>
+    app.handle(
+      new Request(`http://test.local/api/forms/${publicId}/submit`, {
+        body: JSON.stringify({
+          data,
+          documentKey: onlyOfficeDocumentKey,
+          responseId,
+        }),
+        headers: capabilityHeaders(onlyOfficeSubmitCapability),
+        method: "POST",
+      })
+    );
+  const refreshOnlyOfficeEditorConfig = async () => {
+    const startResponse = await app.handle(
+      new Request(`http://test.local/api/forms/${publicId}/start`, {
+        headers: { Authorization: `Bearer ${userBearer}` },
+        method: "POST",
+      })
+    );
+    const start = (await startResponse.json()) as {
+      editorConfigUrl?: string;
+    };
+    if (!start.editorConfigUrl) {
+      throw new Error("The saved ONLYOFFICE response did not reopen");
+    }
+    const configResponse = await app.handle(
+      new Request(
+        new URL(start.editorConfigUrl, "http://test.local").toString(),
+        { headers: { Authorization: `Bearer ${userBearer}` } }
+      )
+    );
+    const config = (await configResponse.json()) as typeof onlyOfficeConfig;
+    const documentKey = config.config?.document?.key;
+    if (!documentKey) {
+      throw new Error("The refreshed ONLYOFFICE document key is missing");
+    }
+    onlyOfficeSaveCapability = onlyOfficeSaveCapabilityFor(config);
+    onlyOfficeDocumentKey = documentKey;
+  };
+  const operationsBeforeInvalidOnlyOfficeSubmit = await prisma.operation.count({
+    where: { responseId },
+  });
+  const unlistedWhitespaceOnlyOfficeSubmit = await onlyOfficeSubmitRequest({
+    custom_category: "  ",
+    empty_category: "",
+    enabled: true,
+    full_name: "Trusted\nPrefill",
+  });
+  expect(unlistedWhitespaceOnlyOfficeSubmit.status).toBe(422);
+  expect(await unlistedWhitespaceOnlyOfficeSubmit.json()).toMatchObject({
+    error: "invalid_response_data",
+  });
+  expect(await prisma.operation.count({ where: { responseId } })).toBe(
+    operationsBeforeInvalidOnlyOfficeSubmit
+  );
+  const onlyOfficeOperationsBeforeInvalidInput = await prisma.operation.count({
+    where: { responseId },
+  });
+  for (const invalidData of [
+    { enabled: "invalid checkbox value" },
+    { category: "Unknown option label" },
+    { start_date: "Thursday, February 30, 2024 d literal" },
+    { cleared_date: "31/12/99" },
+    { comments: "x".repeat(10_001) },
+    { custom_category: "x".repeat(10_001) },
+    { full_name: "Tampered locked Prefill" },
+  ]) {
+    const invalidOnlyOfficeResponse = await onlyOfficeDraftRequest(invalidData);
+    expect(invalidOnlyOfficeResponse.status).toBe(422);
+    expect(await invalidOnlyOfficeResponse.json()).toMatchObject({
+      error: "invalid_response_data",
+    });
+  }
+  expect(await prisma.operation.count({ where: { responseId } })).toBe(
+    onlyOfficeOperationsBeforeInvalidInput
+  );
+  const canonicalIsoDateResponse = await onlyOfficeDraftRequest({
+    cleared_date: "1999-12-31",
+  });
+  expect(canonicalIsoDateResponse.status).toBe(202);
+  const canonicalIsoDateOperation = (await canonicalIsoDateResponse.json()) as {
+    operationCapability?: string;
+    operationId?: string;
+  };
+  if (
+    !canonicalIsoDateOperation.operationCapability ||
+    !canonicalIsoDateOperation.operationId
+  ) {
+    throw new Error("The canonical ISO date draft operation was not created");
+  }
+  expect(
+    await waitForOperation(canonicalIsoDateOperation.operationId, {
+      "X-Editor-Capability": canonicalIsoDateOperation.operationCapability,
+    })
+  ).toMatchObject({ status: "completed" });
+  await refreshOnlyOfficeEditorConfig();
+  const onlyOfficeDisplayData = {
+    category: "Friendly label",
+    cleared_category: "",
+    cleared_date: "",
+    comments: "",
+    custom_category: "Whitespace combo label",
+    empty_category: "Whitespace option label",
+    enabled: "☒",
+    full_name: "Trusted\nPrefill",
+    nullable_category: "",
+    start_date: "Thursday, February 29, 2024 d literal",
+    value_checkbox: "□",
+  };
+  const callbackSource = await prisma.response.findUniqueOrThrow({
+    select: { draftObjectKey: true },
+    where: { id: responseId },
+  });
+  if (!callbackSource.draftObjectKey) {
+    throw new Error("The ONLYOFFICE callback source document is missing");
+  }
+  const callbackArchive = unzipSync(
+    await readObject(callbackSource.draftObjectKey)
+  );
+  const callbackXml = new TextDecoder().decode(
+    callbackArchive["word/document.xml"]
+  );
+  if (!callbackXml.includes("</w:body>")) {
+    throw new Error("The ONLYOFFICE callback source XML has no body");
+  }
+  callbackArchive["word/document.xml"] = strToU8(
+    callbackXml
+      .replace("<w:t>Trusted</w:t>", "<w:t>Wrong</w:t><w:tab/>")
+      .replace(
+        '<w:rPr><w:rFonts w:ascii="Ticket Symbols" w:hAnsi="Ticket Symbols"/></w:rPr>',
+        '<w:rPr xmlns:fontAlias="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:b/><w:rFonts fontAlias:ascii="Old Ticket Font" fontAlias:hAnsi="Old Ticket Font" fontAlias:asciiTheme="majorAscii" fontAlias:hAnsiTheme="majorHAnsi"/></w:rPr>'
+      )
+      .replace(
+        /(<w:r><w:rPr xmlns:fontAlias="http:\/\/schemas\.openxmlformats\.org\/wordprocessingml\/2006\/main"><w:b\/><w:rFonts fontAlias:ascii="Old Ticket Font" fontAlias:hAnsi="Old Ticket Font" fontAlias:asciiTheme="majorAscii" fontAlias:hAnsiTheme="majorHAnsi"\/><\/w:rPr><w:t>[^<]*<\/w:t><\/w:r>)/u,
+        '$1<w:r><w:rPr xmlns:fontAlias="urn:fixture"><w:rFonts fontAlias:asciiTheme="keep"/></w:rPr><w:t>extension marker</w:t></w:r>'
+      )
+      .replace(
+        '<w:rPr><w:b/><w:color w:val="FF0000"/></w:rPr>',
+        '<w:rPr><w:i/><w:color w:val="00FF00"/></w:rPr>'
+      )
+      .replace("<w:t>Suggested label</w:t>", "<w:t>custom-browser-value</w:t>")
+      .replace(
+        "<w:t>Saved native answer</w:t>",
+        "<w:t>Saved</w:t><w:br/><w:t>native</w:t><w:tab/><w:t>answer</w:t>"
+      )
+      .replace(
+        "</w:body>",
+        "<w:p><w:r><w:t>OnlyOffice-only edit</w:t></w:r></w:p></w:body>"
+      )
+  );
+
+  await putObject(
+    callbackSource.draftObjectKey,
+    zipSync(callbackArchive),
+    DOCX_CONTENT_TYPE
+  );
+  const onlyOfficeDraftResponse = await onlyOfficeDraftRequest(
+    onlyOfficeDisplayData
+  );
+  expect(onlyOfficeDraftResponse.status).toBe(202);
+  const onlyOfficeDraftBody = (await onlyOfficeDraftResponse.json()) as {
+    operationCapability?: string;
+    operationId?: string;
+  };
+  if (
+    !onlyOfficeDraftBody.operationCapability ||
+    !onlyOfficeDraftBody.operationId
+  ) {
+    throw new Error("The ONLYOFFICE draft operation was not created");
+  }
+  expect(
+    await waitForOperation(onlyOfficeDraftBody.operationId, {
+      "X-Editor-Capability": onlyOfficeDraftBody.operationCapability,
+    })
+  ).toMatchObject({ status: "completed" });
+  const onlyOfficeCanonicalData = {
+    category: "stored_value",
+    cleared_category: null,
+    cleared_date: null,
+    comments: "Saved\nnative\tanswer",
+
+    custom_category: " ",
+    empty_category: " ",
+    enabled: true,
+    full_name: "Trusted\nPrefill",
+    nullable_category: "",
+    start_date: "2024-02-29",
+    state_checkbox: true,
+    value_checkbox: false,
+  };
+  const onlyOfficeDraft = await prisma.response.findUniqueOrThrow({
+    select: { draftData: true, draftObjectKey: true },
+    where: { id: responseId },
+  });
+  expect(onlyOfficeDraft.draftData).toMatchObject({
+    custom_category: " ",
+    empty_category: " ",
+    nullable_category: null,
+  });
+  expect(onlyOfficeDraft.draftData).toMatchObject({
+    comments: "Saved\nnative\tanswer",
+  });
+  if (!onlyOfficeDraft.draftObjectKey) {
+    throw new Error("The ONLYOFFICE draft document was not stored");
+  }
+  const onlyOfficeDraftXml = new TextDecoder().decode(
+    unzipSync(await readObject(onlyOfficeDraft.draftObjectKey))[
+      "word/document.xml"
+    ]
+  );
+  expect(onlyOfficeDraftXml).toContain("OnlyOffice-only edit");
+  expect(onlyOfficeDraftXml).toContain("Friendly label");
+  expect(onlyOfficeDraftXml).toContain("custom-browser-value");
+  expect(onlyOfficeDraftXml).toContain("Whitespace option label");
+  expect(onlyOfficeDraftXml).toContain("Whitespace combo label");
+  expect(onlyOfficeDraftXml).toContain("☒");
+  expect(onlyOfficeDraftXml).toContain("✓");
+  expect(onlyOfficeDraftXml).toContain("□");
+  expect(onlyOfficeDraftXml).toContain("Static layout");
+  expect(onlyOfficeDraftXml).toContain(
+    '<w:rPr><w:b/></w:rPr><w:t>Trust</w:t><w:t xml:space="preserve">ed</w:t>'
+  );
+  expect(onlyOfficeDraftXml).toContain(
+    '<w:rPr><w:i/></w:rPr><w:t xml:space="preserve">Prefill</w:t>'
+  );
+  expect(onlyOfficeDraftXml).not.toContain("Wrong");
+  const onlyOfficeFullNameContent = onlyOfficeDraftXml.match(
+    /<w:tag\b[^>]*\bw:val="full_name"\/>[\s\S]*?<w:sdtContent>(?<content>[\s\S]*?)<\/w:sdtContent>/u
+  )?.groups?.content;
+  expect(onlyOfficeFullNameContent).not.toContain("<w:tab/>");
+
+  expect(onlyOfficeDraftXml).toContain(
+    '<w:rPr xmlns:fontAlias="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:b/><w:rFonts fontAlias:ascii="Ticket Symbols" fontAlias:hAnsi="Ticket Symbols"/></w:rPr>'
+  );
+  expect(onlyOfficeDraftXml).not.toContain('fontAlias:asciiTheme="majorAscii"');
+  expect(onlyOfficeDraftXml).not.toContain('fontAlias:hAnsiTheme="majorHAnsi"');
+  expect(onlyOfficeDraftXml).toContain('fontAlias:asciiTheme="keep"');
+  const onlyOfficeCommentsContent = onlyOfficeDraftXml.match(
+    /<w:tag w:val="comments"\/>[\s\S]*?<w:sdtContent>(?<content>[\s\S]*?)<\/w:sdtContent>/u
+  )?.groups?.content;
+  expect(onlyOfficeCommentsContent).toContain("<w:br/>");
+  expect(onlyOfficeCommentsContent).toContain("<w:tab/>");
+
+  expect(onlyOfficeDraftXml).toContain(
+    '<w:rPr><w:i/><w:color w:val="00FF00"/></w:rPr>'
+  );
+  expect(onlyOfficeDraftXml).toContain('<w:pPr><w:jc w:val="center"/></w:pPr>');
+  expect(onlyOfficeDraftXml).toContain(
+    'xmlns:branch="http://schemas.microsoft.com/office/word/2010/wordml"'
+  );
+  expect(onlyOfficeDraftXml).toContain("Empty option label");
+  expect(onlyOfficeDraftXml).toContain("Nullable empty option label");
+  const callbackNullableCategoryContent = onlyOfficeDraftXml.match(
+    /<w:tag w:val="nullable_category"\/>[\s\S]*?<w:sdtContent>([\s\S]*?)<\/w:sdtContent>/u
+  )?.[1];
+  expect(callbackNullableCategoryContent).toBe("<w:r><w:t></w:t></w:r>");
+  expect(onlyOfficeDraftXml).toContain('w:fullDate="2024-02-29T00:00:00Z"');
+  expect(onlyOfficeDraftXml).not.toContain("AlternateContent");
+  await refreshOnlyOfficeEditorConfig();
+  const emptyCheckboxResponse = await onlyOfficeDraftRequest({
+    category: "",
+    custom_category: "",
+    enabled: "",
+    start_date: "",
+  });
+  expect(emptyCheckboxResponse.status).toBe(202);
+  const emptyCheckboxOperation = (await emptyCheckboxResponse.json()) as {
+    operationCapability?: string;
+    operationId?: string;
+  };
+  if (
+    !emptyCheckboxOperation.operationCapability ||
+    !emptyCheckboxOperation.operationId
+  ) {
+    throw new Error("The empty checkbox draft operation was not created");
+  }
+  expect(
+    await waitForOperation(emptyCheckboxOperation.operationId, {
+      "X-Editor-Capability": emptyCheckboxOperation.operationCapability,
+    })
+  ).toMatchObject({ status: "completed" });
+  const emptyScalarDraft = await prisma.response.findUniqueOrThrow({
+    select: {
+      draftData: true,
+      draftDocumentKey: true,
+      draftObjectKey: true,
+    },
+    where: { id: responseId },
+  });
+  const { draftObjectKey } = emptyScalarDraft;
+  const { draftDocumentKey } = emptyScalarDraft;
+  if (!draftObjectKey || !draftDocumentKey) {
+    throw new Error("The saved scalar draft document is missing");
+  }
+  const emptyScalarBytes = await readObject(draftObjectKey);
+  const emptyScalarArchive = unzipSync(emptyScalarBytes);
+  const emptyScalarXml = new TextDecoder().decode(
+    emptyScalarArchive["word/document.xml"]
+  );
+  expect(emptyScalarXml).toContain("<w14:checkbox");
+  expect(emptyScalarXml).toContain("<w:date");
+  expect(emptyScalarXml).toContain("<w:dropDownList");
+  expect(emptyScalarXml).toContain("<w:comboBox");
+  const nestedBlockControlXml =
+    '<w:sdt><w:sdtPr><w:text/><w:tag w:val="nested_block"/></w:sdtPr><w:sdtContent><w:p><w:r><w:t>Nested block</w:t></w:r></w:p></w:sdtContent></w:sdt>';
+  const pdfScalarFixtureWithNestedBlockXml = emptyScalarXml.replace(
+    /(?<contentOpen><w:tag\b[^>]*w:val="enabled"\/>[\s\S]*?<w:sdtContent)(?<contentStart>>)[\s\S]*?(?<contentClose><\/w:sdtContent>)/u,
+    `$<contentOpen> xmlns:pdfAlias="urn:ticket07:pdf"$<contentStart>${nestedBlockControlXml}$<contentClose>`
+  );
+  const customXmlBlockXml =
+    "<w:customXml><w:p><w:r><w:t>Custom XML block</w:t></w:r></w:p></w:customXml>";
+  const pdfScalarFixtureXml = pdfScalarFixtureWithNestedBlockXml.replace(
+    /(?<contentOpen><w:tag\b[^>]*w:val="cleared_date"\/>[\s\S]*?<w:sdtContent>)[\s\S]*?(?<contentClose><\/w:sdtContent>)/u,
+    `$<contentOpen>${customXmlBlockXml}$<contentClose>`
+  );
+  if (
+    pdfScalarFixtureWithNestedBlockXml === emptyScalarXml ||
+    pdfScalarFixtureXml === pdfScalarFixtureWithNestedBlockXml
+  ) {
+    throw new Error("The scalar block control fixtures are missing");
+  }
+  emptyScalarArchive["word/document.xml"] = strToU8(pdfScalarFixtureXml);
+  await putObject(
+    draftObjectKey,
+    zipSync(emptyScalarArchive),
+    DOCX_CONTENT_TYPE
+  );
+  try {
+    const pdfDocumentUrl = new URL(
+      `/onlyoffice/document/${encodeURIComponent(draftDocumentKey)}?token=${encodeURIComponent(createDocumentAccessToken(draftDocumentKey))}&pdf=1`,
+      "http://test.local"
+    );
+    const pdfDocumentResponse = await app.handle(
+      new Request(pdfDocumentUrl.toString(), {
+        headers: {
+          Authorization: createOnlyOfficeAuthorization({
+            url: pdfDocumentUrl.toString(),
+          }),
+        },
+      })
+    );
+    expect(pdfDocumentResponse.status).toBe(200);
+    const pdfOnlyXml = new TextDecoder().decode(
+      unzipSync(new Uint8Array(await pdfDocumentResponse.arrayBuffer()))[
+        "word/document.xml"
+      ]
+    );
+    expect(pdfOnlyXml).toContain("Thursday, February 29, 2024");
+    expect(pdfOnlyXml).toContain("Friendly label");
+    expect(pdfOnlyXml).toContain("custom-browser-value");
+    expect(pdfOnlyXml).toContain("Nested block");
+    expect(pdfOnlyXml).toContain("Custom XML block");
+    expect(pdfOnlyXml).toContain('xmlns:pdfAlias="urn:ticket07:pdf"');
+    expect(pdfOnlyXml).not.toContain("<w:p><w:sdt");
+    expect(pdfOnlyXml).not.toContain("<w:p><w:customXml");
+    const remainingPdfControlTags = [
+      ...pdfOnlyXml.matchAll(/<w:tag\b[^>]*w:val="(?<tag>[^"]+)"/gu),
+    ].map(({ groups }) => groups?.tag ?? "untagged");
+    expect(remainingPdfControlTags).toEqual([
+      "full_name",
+      "comments",
+      "nested_block",
+    ]);
+    expect(pdfOnlyXml).not.toContain("<w14:checkbox");
+    expect(pdfOnlyXml).not.toContain("<w:date");
+    expect(pdfOnlyXml).not.toContain("<w:dropDownList");
+    expect(pdfOnlyXml).not.toContain("<w:comboBox");
+  } finally {
+    await putObject(draftObjectKey, emptyScalarBytes, DOCX_CONTENT_TYPE);
+  }
+  const unchangedDocxXml = new TextDecoder().decode(
+    unzipSync(await readObject(draftObjectKey))["word/document.xml"]
+  );
+  expect(unchangedDocxXml).toContain("<w14:checkbox>");
+  expect(unchangedDocxXml).toContain("Thursday, February 29, 2024");
+  expect(emptyScalarXml).toContain("☒");
+  expect(emptyScalarXml).toContain("Thursday, February 29, 2024");
+  expect(emptyScalarXml).toContain("Friendly label");
+  expect(emptyScalarXml).toContain("Whitespace combo label");
+  expect(emptyScalarDraft.draftData).toMatchObject({
+    category: "stored_value",
+    custom_category: "custom-browser-value",
+    enabled: true,
+    start_date: "2024-02-29",
+  });
+  await refreshOnlyOfficeEditorConfig();
+  const checkedCheckboxResponse = await onlyOfficeDraftRequest({
+    enabled: true,
+  });
+  expect(checkedCheckboxResponse.status).toBe(202);
+  const checkedCheckboxOperation = (await checkedCheckboxResponse.json()) as {
+    operationCapability?: string;
+    operationId?: string;
+  };
+  if (
+    !checkedCheckboxOperation.operationCapability ||
+    !checkedCheckboxOperation.operationId
+  ) {
+    throw new Error("The checked checkbox draft operation was not created");
+  }
+  expect(
+    await waitForOperation(checkedCheckboxOperation.operationId, {
+      "X-Editor-Capability": checkedCheckboxOperation.operationCapability,
+    })
+  ).toMatchObject({ status: "completed" });
+  expect(
+    (
+      await prisma.response.findUniqueOrThrow({
+        select: { draftData: true },
+        where: { id: responseId },
+      })
+    ).draftData
+  ).toMatchObject({ enabled: true });
+  await refreshOnlyOfficeEditorConfig();
+  const explicitEmptyOptionSource = await prisma.response.findUniqueOrThrow({
+    select: { draftObjectKey: true },
+    where: { id: responseId },
+  });
+  if (!explicitEmptyOptionSource.draftObjectKey) {
+    throw new Error("The explicit empty option source document is missing");
+  }
+  const explicitEmptyOptionArchive = unzipSync(
+    await readObject(explicitEmptyOptionSource.draftObjectKey)
+  );
+  const explicitEmptyOptionSourceXml = new TextDecoder().decode(
+    explicitEmptyOptionArchive["word/document.xml"]
+  );
+  explicitEmptyOptionArchive["word/document.xml"] = strToU8(
+    explicitEmptyOptionSourceXml.replace(
+      /(<w:tag w:val="nullable_category"\/>[\s\S]*?<w:sdtContent>)[\s\S]*?(<\/w:sdtContent>)/u,
+      "$1<w:r><w:t>Nullable empty option label</w:t></w:r>$2"
+    )
+  );
+  await putObject(
+    explicitEmptyOptionSource.draftObjectKey,
+    zipSync(explicitEmptyOptionArchive),
+    DOCX_CONTENT_TYPE
+  );
+  const explicitEmptyOptionResponse = await onlyOfficeDraftRequest({
+    ...onlyOfficeDisplayData,
+    nullable_category: "Nullable empty option label",
+  });
+  expect(explicitEmptyOptionResponse.status).toBe(202);
+  const explicitEmptyOptionOperation =
+    (await explicitEmptyOptionResponse.json()) as {
+      operationCapability?: string;
+      operationId?: string;
+    };
+  if (
+    !explicitEmptyOptionOperation.operationCapability ||
+    !explicitEmptyOptionOperation.operationId
+  ) {
+    throw new Error("The explicit empty option callback did not start");
+  }
+  expect(
+    await waitForOperation(explicitEmptyOptionOperation.operationId, {
+      "X-Editor-Capability": explicitEmptyOptionOperation.operationCapability,
+    })
+  ).toMatchObject({ status: "completed" });
+  const explicitEmptyOptionDraft = await prisma.response.findUniqueOrThrow({
+    select: { draftData: true, draftObjectKey: true },
+    where: { id: responseId },
+  });
+  expect(explicitEmptyOptionDraft.draftData).toMatchObject({
+    nullable_category: "",
+  });
+  const explicitEmptyOptionXml = new TextDecoder().decode(
+    unzipSync(await readObject(explicitEmptyOptionDraft.draftObjectKey!))[
+      "word/document.xml"
+    ]
+  );
+  const explicitEmptyOptionContent = explicitEmptyOptionXml.match(
+    /<w:tag w:val="nullable_category"\/>[\s\S]*?<w:sdtContent>([\s\S]*?)<\/w:sdtContent>/u
+  )?.[1];
+  expect(explicitEmptyOptionContent).toContain(
+    "<w:t>Nullable empty option label</w:t>"
+  );
+  const saveOnlyOfficeDisplayDraft = async (data: Record<string, unknown>) => {
+    const response = await onlyOfficeDraftRequest(data);
+    expect(response.status).toBe(202);
+    const operation = (await response.json()) as {
+      operationCapability?: string;
+      operationId?: string;
+    };
+    if (!operation.operationCapability || !operation.operationId) {
+      throw new Error("The display draft operation was not created");
+    }
+    expect(
+      await waitForOperation(operation.operationId, {
+        "X-Editor-Capability": operation.operationCapability,
+      })
+    ).toMatchObject({ status: "completed" });
+    return prisma.response.findUniqueOrThrow({
+      select: { draftData: true },
+      where: { id: responseId },
+    });
+  };
+  for (const { data, expected } of [
+    {
+      data: { category: "Empty option label" },
+      expected: { category: "" },
+    },
+    {
+      data: { category: "Choice B" },
+      expected: { category: "Empty option label" },
+    },
+    {
+      data: { category: "Friendly label" },
+      expected: { category: "stored_value" },
+    },
+    {
+      data: { custom_category: "" },
+      expected: { custom_category: " " },
+    },
+    {
+      data: { custom_category: "Empty combo label" },
+      expected: { custom_category: "" },
+    },
+    {
+      data: { custom_category: "Choice B" },
+      expected: { custom_category: "Empty combo label" },
+    },
+    {
+      data: { custom_category: "custom-browser-value" },
+      expected: { custom_category: "custom-browser-value" },
+    },
+    {
+      data: { custom_category: "Whitespace combo label" },
+      expected: { custom_category: " " },
+    },
+  ]) {
+    await refreshOnlyOfficeEditorConfig();
+    const displayDraft = await saveOnlyOfficeDisplayDraft(data);
+    expect(displayDraft.draftData).toMatchObject(expected);
+  }
+  await refreshOnlyOfficeEditorConfig();
+  const explicitlyClearedDraft = await saveOnlyOfficeDisplayDraft({
+    category: null,
+    enabled: false,
+    start_date: null,
+  });
+  expect(explicitlyClearedDraft.draftData).toMatchObject({
+    category: null,
+    enabled: false,
+    start_date: null,
+  });
+  await refreshOnlyOfficeEditorConfig();
+  const restoredDraft = await saveOnlyOfficeDisplayDraft({
+    category: "Friendly label",
+    enabled: "☒",
+    start_date: "Thursday, February 29, 2024 d literal",
+  });
+  expect(restoredDraft.draftData).toMatchObject({
+    category: "stored_value",
+    enabled: true,
+    start_date: "2024-02-29",
+  });
+
   const nativeAgainResponse = await patchFillMethod("native");
   expect(nativeAgainResponse.status).toBe(200);
   const nativeAgainStartResponse = await app.handle(
@@ -2076,10 +4855,27 @@ test("Ticket 06 native text forms preserve drafts, Prefill, and Fill Method", as
   expect(nativeAgainStart.fillMethod).toBe("native");
   nativeConfig = await getNativeConfig();
   expect(nativeConfig).toMatchObject({
-    data: { comments: "Saved native answer", full_name: "Trusted Prefill" },
+    data: {
+      category: "stored_value",
+      cleared_category: null,
+      cleared_date: null,
+      comments: "Saved\nnative\tanswer",
+
+      custom_category: " ",
+      empty_category: " ",
+      enabled: true,
+      full_name: "Trusted\nPrefill",
+      nullable_category: "",
+      start_date: "2024-02-29",
+      state_checkbox: true,
+      value_checkbox: false,
+    },
     lockedFields: prefillLocks,
   });
-  const submitResponse = await nativeSubmitRequest(nativeConfig, draftData);
+  const submitResponse = await nativeSubmitRequest(nativeConfig, {
+    ...onlyOfficeCanonicalData,
+    empty_category: "",
+  });
   expect(submitResponse.status).toBe(202);
   const submitBody = (await submitResponse.json()) as {
     operationCapability?: string;
@@ -2100,16 +4896,34 @@ test("Ticket 06 native text forms preserve drafts, Prefill, and Fill Method", as
   });
   expect(submission).toMatchObject({
     data: {
-      comments: "Saved native answer",
-      full_name: "Trusted Prefill",
+      category: "stored_value",
+      cleared_category: null,
+      cleared_date: null,
+      comments: "Saved\nnative\tanswer",
+
+      custom_category: " ",
+      empty_category: "",
+      full_name: "Trusted\nPrefill",
+      nullable_category: "",
+      start_date: "2024-02-29",
+      state_checkbox: true,
+      value_checkbox: false,
     },
     responseId,
   });
   const submissionXml = new TextDecoder().decode(
     unzipSync(await readObject(submission.objectKey))["word/document.xml"]
   );
-  expect(submissionXml).toContain("Trusted Prefill");
-  expect(submissionXml).toContain("Saved native answer");
+  expect(submissionXml).toContain("<w:rPr><w:b/></w:rPr><w:t>Trusted</w:t>");
+  expect(submissionXml).toContain(
+    '<w:rPr><w:i/></w:rPr><w:t xml:space="preserve">Prefill</w:t>'
+  );
+  const submissionCommentsContent = submissionXml.match(
+    /<w:tag w:val="comments"\/>[\s\S]*?<w:sdtContent>(?<content>[\s\S]*?)<\/w:sdtContent>/u
+  )?.groups?.content;
+  expect(submissionCommentsContent).toContain("<w:br/>");
+  expect(submissionCommentsContent).toContain("<w:tab/>");
+  expect(submissionXml).toContain("Whitespace combo label");
   const submittedResponse = await prisma.response.findUniqueOrThrow({
     select: { status: true },
     where: { id: responseId },
@@ -2126,13 +4940,7 @@ test("Ticket 06 native text forms preserve drafts, Prefill, and Fill Method", as
   });
 
   const checkboxTemplate = docxXmlFixture({
-    document: contentControlDocument(
-      contentControl({
-        alias: "Accept terms",
-        tag: "accept_terms",
-        type: "<w14:checkbox/>",
-      })
-    ),
+    document: `<document xmlns="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml" xmlns:word="urn:fixture"><body><sdt><sdtPr><alias w:val="Accept terms"/><tag w:val="accept_terms"/><checkbox xmlns="http://schemas.microsoft.com/office/word/2010/wordml"><w14:checkedState w14:val="2713" w14:font="Ticket Symbols"/><w14:uncheckedState w14:val="25A1" w14:font="Ticket Symbols"/></checkbox></sdtPr><sdtContent><p><r><rPr><rFonts word:extension="keep"/></rPr><t>☐</t></r></p></sdtContent></sdt><sdt><sdtPr><alias w:val="Existing checked"/><tag w:val="existing_terms"/><checkbox xmlns="http://schemas.microsoft.com/office/word/2010/wordml"><checked val="0"/><w14:checkedState w14:val="2713" w14:font="Ticket Symbols"/><w14:uncheckedState w14:val="25A1" w14:font="Ticket Symbols"/></checkbox></sdtPr><sdtContent><p><r><t>☐</t></r></p></sdtContent></sdt><sdt><sdtPr><alias w:val="Self-closing checkbox"/><tag w:val="selfclosing_terms"/><checkbox xmlns="http://schemas.microsoft.com/office/word/2010/wordml"/></sdtPr><sdtContent><p><r><t>☐</t></r></p></sdtContent></sdt><sdt><sdtPr><alias w:val="Default date"/><tag w:val="default_date"/><date><dateFormat w:val="yyyy-MM-dd"/></date></sdtPr><sdtContent><p><r><t>2024-01-01</t></r></p></sdtContent></sdt><sdt><sdtPr><alias w:val="Default category"/><tag w:val="default_category"/><dropDownList><listItem w:displayText="Picked label" w:value="picked_value"/></dropDownList></sdtPr><sdtContent><p><r><t>Picked label</t></r></p></sdtContent></sdt><sdt xmlns="http://purl.oclc.org/ooxml/wordprocessingml/main" xmlns:w="http://purl.oclc.org/ooxml/wordprocessingml/main"><sdtPr><alias w:val="Strict terms"/><tag w:val="strict_terms"/><w14:checkbox><w14:checkedState w14:val="2713" w14:font="Ticket Symbols"/><w14:uncheckedState w14:val="25A1" w14:font="Ticket Symbols"/></w14:checkbox></sdtPr><sdtContent><p><r><rPr><rFonts word:extension="strict-keep"/></rPr><t>☐</t></r></p></sdtContent></sdt><sectPr/></body></document>`,
   });
   const checkboxCreateResponse = await app.handle(
     formCreationRequest({
@@ -2147,7 +4955,9 @@ test("Ticket 06 native text forms preserve drafts, Prefill, and Fill Method", as
   };
   const checkboxPublicId = checkboxCreated.form?.publicId;
   if (!checkboxPublicId) {
-    throw new Error("The Ticket 06 checkbox form was not created");
+    throw new Error(
+      `The Ticket 06 checkbox form was not created: ${JSON.stringify(checkboxCreated)} (HTTP ${checkboxCreateResponse.status})`
+    );
   }
   const checkboxEditorResponse = await app.handle(
     new Request(
@@ -2162,13 +4972,16 @@ test("Ticket 06 native text forms preserve drafts, Prefill, and Fill Method", as
     throw new Error("The Ticket 06 checkbox publish capability is missing");
   }
   const checkboxPublishResponse = await app.handle(
-    new Request(`http://test.local/api/admin/forms/${checkboxPublicId}/publish`, {
-      body: JSON.stringify({
-        documentKey: checkboxEditor.config.document.key,
-      }),
-      headers: capabilityHeaders(checkboxPublishCapability),
-      method: "POST",
-    })
+    new Request(
+      `http://test.local/api/admin/forms/${checkboxPublicId}/publish`,
+      {
+        body: JSON.stringify({
+          documentKey: checkboxEditor.config.document.key,
+        }),
+        headers: capabilityHeaders(checkboxPublishCapability),
+        method: "POST",
+      }
+    )
   );
   const checkboxPublishBody = (await checkboxPublishResponse.json()) as {
     operationCapability?: string;
@@ -2185,34 +4998,439 @@ test("Ticket 06 native text forms preserve drafts, Prefill, and Fill Method", as
       "X-Editor-Capability": checkboxPublishBody.operationCapability,
     })
   ).toMatchObject({ status: "completed" });
-  const unsupportedNativeResponse = await app.handle(
+  const nativeCheckboxResponse = await app.handle(
     new Request(`http://test.local/api/admin/forms/${checkboxPublicId}`, {
       body: JSON.stringify({ fillMethod: "native" }),
       headers: { ...jsonHeaders, Authorization: `Bearer ${adminBearer}` },
       method: "PATCH",
     })
   );
-  expect(unsupportedNativeResponse.status).toBe(409);
-  expect(await unsupportedNativeResponse.json()).toMatchObject({
-    error: "native_fill_unsupported",
-  });
+  expect(nativeCheckboxResponse.status).toBe(200);
   const checkboxDetailResponse = await app.handle(
     new Request(`http://test.local/api/admin/forms/${checkboxPublicId}`, {
       headers: { Authorization: `Bearer ${adminBearer}` },
     })
   );
   expect(await checkboxDetailResponse.json()).toMatchObject({
-    form: { fillMethod: "onlyoffice", nativeFillAvailable: false },
+    form: { fillMethod: "native", nativeFillAvailable: true },
   });
+  const checkboxStartResponse = await app.handle(
+    new Request(`http://test.local/api/forms/${checkboxPublicId}/start`, {
+      headers: { Authorization: `Bearer ${userBearer}` },
+      method: "POST",
+    })
+  );
+  const checkboxStart = (await checkboxStartResponse.json()) as {
+    editorConfigUrl?: string;
+    response?: { id?: string };
+  };
+  if (!checkboxStart.editorConfigUrl || !checkboxStart.response?.id) {
+    throw new Error("The default-namespace checkbox response did not start");
+  }
+  const checkboxNativeEditorResponse = await app.handle(
+    new Request(
+      new URL(checkboxStart.editorConfigUrl, "http://test.local").toString(),
+      { headers: { Authorization: `Bearer ${userBearer}` } }
+    )
+  );
+  const checkboxNativeEditor = (await checkboxNativeEditorResponse.json()) as {
+    capabilities: Record<"save-draft", string>;
+    documentKey: string;
+  };
+  const checkboxSaveResponse = await app.handle(
+    new Request(`http://test.local/api/forms/${checkboxPublicId}/draft`, {
+      body: JSON.stringify({
+        data: {
+          accept_terms: true,
+          default_category: "picked_value",
+          default_date: "2025-04-07",
+          existing_terms: true,
+          selfclosing_terms: true,
+          strict_terms: true,
+        },
+        documentKey: checkboxNativeEditor.documentKey,
+        fillMethod: "native",
+        responseId: checkboxStart.response.id,
+      }),
+      headers: capabilityHeaders(
+        checkboxNativeEditor.capabilities["save-draft"]
+      ),
+      method: "POST",
+    })
+  );
+  const checkboxSave = (await checkboxSaveResponse.json()) as {
+    operationCapability?: string;
+    operationId?: string;
+  };
+  if (!checkboxSave.operationCapability || !checkboxSave.operationId) {
+    throw new Error("The default-namespace checkbox save did not start");
+  }
+  expect(
+    await waitForOperation(checkboxSave.operationId, {
+      "X-Editor-Capability": checkboxSave.operationCapability,
+    })
+  ).toMatchObject({ status: "completed" });
+  const checkboxSaved = await prisma.response.findUniqueOrThrow({
+    select: { draftObjectKey: true },
+    where: { id: checkboxStart.response.id },
+  });
+  const checkboxSavedXml = new TextDecoder().decode(
+    unzipSync(await readObject(checkboxSaved.draftObjectKey!))[
+      "word/document.xml"
+    ]
+  );
+  expect(checkboxSavedXml).toContain(
+    '<rFonts word:extension="keep" xmlns:word1="http://schemas.openxmlformats.org/wordprocessingml/2006/main" word1:ascii="Ticket Symbols" word1:hAnsi="Ticket Symbols"/>'
+  );
+  expect(checkboxSavedXml).toContain(
+    '<rFonts word:extension="strict-keep" xmlns:word1="http://purl.oclc.org/ooxml/wordprocessingml/main" word1:ascii="Ticket Symbols" word1:hAnsi="Ticket Symbols"/>'
+  );
+  expect(checkboxSavedXml).toMatch(
+    /<date[^>]*word:fullDate="2025-04-07T00:00:00Z"[^>]*xmlns:word="http:\/\/schemas\.openxmlformats\.org\/wordprocessingml\/2006\/main"/u
+  );
+  expect(checkboxSavedXml).toMatch(
+    /<dropDownList[^>]*word:lastValue="picked_value"[^>]*xmlns:word="http:\/\/schemas\.openxmlformats\.org\/wordprocessingml\/2006\/main"/u
+  );
+  expect(checkboxSavedXml).toContain('xmlns:word="urn:fixture"');
+  expect(checkboxSavedXml.match(/<checked w14:val="1"\/>/gu)).toHaveLength(3);
+  expect(checkboxSavedXml).not.toMatch(/<checked\s+val=/u);
+  expect(checkboxSavedXml).not.toMatch(
+    /<(?:rFonts|date|dropDownList)[^>]*\s(?:ascii|hAnsi|fullDate|lastValue)=/u
+  );
+  const strictCheckboxTemplate = docxXmlFixture({
+    document: `<document xmlns="http://purl.oclc.org/ooxml/wordprocessingml/main" xmlns:w="http://purl.oclc.org/ooxml/wordprocessingml/main" xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml" xmlns:word="urn:fixture"><body><sdt><sdtPr><alias w:val="Strict terms"/><tag w:val="strict_terms"/><w14:checkbox><w14:checkedState w14:val="2713" w14:font="Ticket Symbols"/><w14:uncheckedState w14:val="25A1" w14:font="Ticket Symbols"/></w14:checkbox></sdtPr><sdtContent/></sdt><sectPr/></body></document>`,
+  });
+  const strictCheckboxCreateResponse = await app.handle(
+    formCreationRequest({
+      authorization: adminBearer,
+      source: "upload",
+      template: { bytes: strictCheckboxTemplate, name: "strict-checkbox.docx" },
+      title: "Ticket 07 Strict WordML Checkbox",
+    })
+  );
+  const strictCheckboxCreated = (await strictCheckboxCreateResponse.json()) as {
+    form?: { publicId?: string };
+  };
+  const strictCheckboxPublicId = strictCheckboxCreated.form?.publicId;
+  if (!strictCheckboxPublicId) {
+    throw new Error("The Strict WordML checkbox form was not created");
+  }
+  const strictCheckboxAdminEditorResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/forms/${strictCheckboxPublicId}/editor-config`,
+      { headers: { Authorization: `Bearer ${adminBearer}` } }
+    )
+  );
+  const strictCheckboxAdminEditor =
+    (await strictCheckboxAdminEditorResponse.json()) as EditorConfigBody;
+  const strictCheckboxPublishCapability =
+    strictCheckboxAdminEditor.bridge.capabilities.publish;
+  if (!strictCheckboxPublishCapability) {
+    throw new Error("The Strict WordML checkbox publish capability is missing");
+  }
+  const strictCheckboxPublishResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/forms/${strictCheckboxPublicId}/publish`,
+      {
+        body: JSON.stringify({
+          documentKey: strictCheckboxAdminEditor.config.document.key,
+        }),
+        headers: capabilityHeaders(strictCheckboxPublishCapability),
+        method: "POST",
+      }
+    )
+  );
+  const strictCheckboxPublish =
+    (await strictCheckboxPublishResponse.json()) as {
+      operationCapability?: string;
+      operationId?: string;
+    };
+  if (
+    !strictCheckboxPublish.operationCapability ||
+    !strictCheckboxPublish.operationId
+  ) {
+    throw new Error("The Strict WordML checkbox publish did not start");
+  }
+  expect(
+    await waitForOperation(strictCheckboxPublish.operationId, {
+      "X-Editor-Capability": strictCheckboxPublish.operationCapability,
+    })
+  ).toMatchObject({ status: "completed" });
+  const strictCheckboxNativeResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${strictCheckboxPublicId}`, {
+      body: JSON.stringify({ fillMethod: "native" }),
+      headers: { ...jsonHeaders, Authorization: `Bearer ${adminBearer}` },
+      method: "PATCH",
+    })
+  );
+  expect(strictCheckboxNativeResponse.status).toBe(200);
+  const strictCheckboxStartResponse = await app.handle(
+    new Request(`http://test.local/api/forms/${strictCheckboxPublicId}/start`, {
+      headers: { Authorization: `Bearer ${userBearer}` },
+      method: "POST",
+    })
+  );
+  const strictCheckboxStart = (await strictCheckboxStartResponse.json()) as {
+    editorConfigUrl?: string;
+    response?: { id?: string };
+  };
+  if (
+    !strictCheckboxStart.editorConfigUrl ||
+    !strictCheckboxStart.response?.id
+  ) {
+    throw new Error("The Strict WordML checkbox response did not start");
+  }
+  const strictCheckboxEditorResponse = await app.handle(
+    new Request(
+      new URL(
+        strictCheckboxStart.editorConfigUrl,
+        "http://test.local"
+      ).toString(),
+      { headers: { Authorization: `Bearer ${userBearer}` } }
+    )
+  );
+  const strictCheckboxEditor = (await strictCheckboxEditorResponse.json()) as {
+    capabilities: Record<"save-draft", string>;
+    documentKey: string;
+  };
+  const strictCheckboxSaveResponse = await app.handle(
+    new Request(`http://test.local/api/forms/${strictCheckboxPublicId}/draft`, {
+      body: JSON.stringify({
+        data: { strict_terms: true },
+        documentKey: strictCheckboxEditor.documentKey,
+        fillMethod: "native",
+        responseId: strictCheckboxStart.response.id,
+      }),
+      headers: capabilityHeaders(
+        strictCheckboxEditor.capabilities["save-draft"]
+      ),
+      method: "POST",
+    })
+  );
+  const strictCheckboxSave = (await strictCheckboxSaveResponse.json()) as {
+    operationCapability?: string;
+    operationId?: string;
+  };
+  if (
+    !strictCheckboxSave.operationCapability ||
+    !strictCheckboxSave.operationId
+  ) {
+    throw new Error("The Strict WordML checkbox save did not start");
+  }
+  expect(
+    await waitForOperation(strictCheckboxSave.operationId, {
+      "X-Editor-Capability": strictCheckboxSave.operationCapability,
+    })
+  ).toMatchObject({ status: "completed" });
+  const strictCheckboxSaved = await prisma.response.findUniqueOrThrow({
+    select: { draftObjectKey: true },
+    where: { id: strictCheckboxStart.response.id },
+  });
+  const strictCheckboxSavedXml = new TextDecoder().decode(
+    unzipSync(await readObject(strictCheckboxSaved.draftObjectKey!))[
+      "word/document.xml"
+    ]
+  );
+  expect(strictCheckboxSavedXml).toContain(
+    '<rFonts xmlns:word="http://purl.oclc.org/ooxml/wordprocessingml/main" word:ascii="Ticket Symbols" word:hAnsi="Ticket Symbols"/>'
+  );
+  expect(strictCheckboxSavedXml).toContain('xmlns:word="urn:fixture"');
+  const assertDateTemplateFallsBack = async (
+    template: Uint8Array,
+    name: string,
+    title: string
+  ): Promise<string> => {
+    const createResponse = await app.handle(
+      formCreationRequest({
+        authorization: adminBearer,
+        source: "upload",
+        template: { bytes: template, name },
+        title,
+      })
+    );
+    expect(createResponse.status).toBe(200);
+    const created = (await createResponse.json()) as {
+      form?: { publicId?: string };
+    };
+    const fallbackPublicId = created.form?.publicId;
+    if (!fallbackPublicId) {
+      throw new Error(`${title} form was not created`);
+    }
+    const editorResponse = await app.handle(
+      new Request(
+        `http://test.local/api/admin/forms/${fallbackPublicId}/editor-config`,
+        { headers: { Authorization: `Bearer ${adminBearer}` } }
+      )
+    );
+    const editor = (await editorResponse.json()) as EditorConfigBody;
+    const publishCapability = editor.bridge.capabilities.publish;
+    if (!publishCapability) {
+      throw new Error(`${title} publish capability is missing`);
+    }
+    const publishResponse = await app.handle(
+      new Request(
+        `http://test.local/api/admin/forms/${fallbackPublicId}/publish`,
+        {
+          body: JSON.stringify({ documentKey: editor.config.document.key }),
+          headers: capabilityHeaders(publishCapability),
+          method: "POST",
+        }
+      )
+    );
+    const publish = (await publishResponse.json()) as {
+      operationCapability?: string;
+      operationId?: string;
+    };
+    if (!publish.operationCapability || !publish.operationId) {
+      throw new Error(`${title} publish operation was not created`);
+    }
+    expect(
+      await waitForOperation(publish.operationId, {
+        "X-Editor-Capability": publish.operationCapability,
+      })
+    ).toMatchObject({ status: "completed" });
+    const detailResponse = await app.handle(
+      new Request(`http://test.local/api/admin/forms/${fallbackPublicId}`, {
+        headers: { Authorization: `Bearer ${adminBearer}` },
+      })
+    );
+    expect(await detailResponse.json()).toMatchObject({
+      form: { fillMethod: "onlyoffice", nativeFillAvailable: false },
+    });
+    const nativeMethodResponse = await app.handle(
+      new Request(`http://test.local/api/admin/forms/${fallbackPublicId}`, {
+        body: JSON.stringify({ fillMethod: "native" }),
+        headers: { ...jsonHeaders, Authorization: `Bearer ${adminBearer}` },
+        method: "PATCH",
+      })
+    );
+    expect(nativeMethodResponse.status).toBe(409);
+    const fallbackForm = await prisma.form.findUniqueOrThrow({
+      select: { id: true },
+      where: { publicId: fallbackPublicId },
+    });
+    const publishedTemplate = await prisma.publishedTemplate.findUniqueOrThrow({
+      select: { objectKey: true },
+      where: { formId: fallbackForm.id },
+    });
+    const document = new TextDecoder().decode(
+      unzipSync(await readObject(publishedTemplate.objectKey))[
+        "word/document.xml"
+      ]
+    );
+    expect(document).toContain('w:fullDate="2024-02-29T00:00:00Z"');
+    return fallbackPublicId;
+  };
+  const thaiCalendarTemplate = docxXmlFixture({
+    document: contentControlDocument(
+      contentControl({
+        alias: "Thai calendar date",
+        tag: "thai_date",
+        type: '<w:date w:fullDate="2024-02-29T00:00:00Z"><w:calendar w:val="thai"/><w:dateFormat w:val="yyyy-MM-dd"/></w:date>',
+      }) +
+        contentControl({
+          alias: "Thai calendar display date",
+          tag: "thai_display_date",
+          type: '<w:date w:fullDate="2024-02-29T00:00:00Z"><w:calendar w:val="thai"/><w:dateFormat w:val="yyyy-MM-dd"/></w:date>',
+        }) +
+        contentControl({
+          alias: "Thai calendar checkbox",
+          tag: "thai_checkbox",
+          type: "<w14:checkbox/>",
+        })
+    ),
+  });
+  const thaiCalendarPublicId = await assertDateTemplateFallsBack(
+    thaiCalendarTemplate,
+    "thai-calendar.docx",
+    "Ticket 07 Thai Calendar Form"
+  );
+  const thaiStartResponse = await app.handle(
+    new Request(`http://test.local/api/forms/${thaiCalendarPublicId}/start`, {
+      headers: { Authorization: `Bearer ${userBearer}` },
+      method: "POST",
+    })
+  );
+  const thaiStart = (await thaiStartResponse.json()) as {
+    editorConfigUrl?: string;
+    response?: { id?: string };
+  };
+  if (!thaiStart.editorConfigUrl || !thaiStart.response?.id) {
+    throw new Error("The Thai calendar response did not start");
+  }
+  const thaiEditorResponse = await app.handle(
+    new Request(
+      new URL(thaiStart.editorConfigUrl, "http://test.local").toString(),
+      { headers: { Authorization: `Bearer ${userBearer}` } }
+    )
+  );
+  const thaiEditor = (await thaiEditorResponse.json()) as EditorConfigBody;
+  const thaiSaveCapability = thaiEditor.bridge.capabilities["save-draft"];
+  const thaiDocumentKey = thaiEditor.config.document.key;
+  if (!thaiSaveCapability || !thaiDocumentKey) {
+    throw new Error("The Thai calendar save capability is missing");
+  }
+  const thaiDraftResponse = await app.handle(
+    new Request(`http://test.local/api/forms/${thaiCalendarPublicId}/draft`, {
+      body: JSON.stringify({
+        canonicalDateFields: ["thai_date"],
+        data: {
+          thai_checkbox: "☒",
+          thai_date: "2025-03-04",
+          thai_display_date: "2568-03-04",
+        },
+        documentKey: thaiDocumentKey,
+        responseId: thaiStart.response.id,
+      }),
+      headers: capabilityHeaders(thaiSaveCapability),
+      method: "POST",
+    })
+  );
+  expect(thaiDraftResponse.status).toBe(202);
+  const thaiDraft = (await thaiDraftResponse.json()) as {
+    operationCapability?: string;
+    operationId?: string;
+  };
+  if (!thaiDraft.operationCapability || !thaiDraft.operationId) {
+    throw new Error("The Thai calendar draft operation was not created");
+  }
+  expect(
+    await waitForOperation(thaiDraft.operationId, {
+      "X-Editor-Capability": thaiDraft.operationCapability,
+    })
+  ).toMatchObject({ status: "completed" });
+  const thaiSavedResponse = await prisma.response.findUniqueOrThrow({
+    select: { draftData: true },
+    where: { id: thaiStart.response.id },
+  });
+  expect(thaiSavedResponse.draftData).toMatchObject({
+    thai_checkbox: true,
+    thai_date: "2025-03-04",
+    thai_display_date: "2025-03-04",
+  });
+  const frenchDateTemplate = docxXmlFixture({
+    document: contentControlDocument(
+      contentControl({
+        alias: "French date language",
+        tag: "french_date",
+        type: '<w:date w:fullDate="2024-02-29T00:00:00Z"><w:lid w:val="fr-FR"/><w:dateFormat w:val="d MMMM yyyy"/></w:date>',
+      })
+    ),
+  });
+  await assertDateTemplateFallsBack(
+    frenchDateTemplate,
+    "french-date.docx",
+    "Ticket 07 French Date Language Form"
+  );
   const nestedTemplate = docxXmlFixture({
     document: contentControlDocument(
-      `<w:sdt><w:sdtPr><w:alias w:val="Group"/><w:tag w:val="group"/><w:text/></w:sdtPr><w:sdtContent><w:r><w:t>Group</w:t></w:r>` +
-        contentControl({
+      `<w:sdt><w:sdtPr><w:alias w:val="Group"/><w:tag w:val="group"/><w:text/></w:sdtPr><w:sdtContent><w:r><w:t>Group</w:t></w:r>${contentControl(
+        {
           alias: "Nested name",
           tag: "nested_name",
           type: "<w:text/>",
-        }) +
-        "</w:sdtContent></w:sdt>"
+        }
+      )}</w:sdtContent></w:sdt>`
     ),
   });
   const nestedCreateResponse = await app.handle(
@@ -2282,6 +5500,167 @@ test("Ticket 06 native text forms preserve drafts, Prefill, and Fill Method", as
     error: "native_fill_unsupported",
   });
 });
+
+test("Ticket 07 preserves local namespaces when expanding empty content", async () => {
+  const adminEmail = `ticket-07-local-namespace-admin-${crypto.randomUUID()}@example.com`;
+  const userEmail = `ticket-07-local-namespace-user-${crypto.randomUUID()}@example.com`;
+  const password = "Ticket07-local-namespace-password";
+  await createCredentialFixture({
+    email: adminEmail,
+    name: "Ticket 07 Local Namespace Admin",
+    password,
+    role: "admin",
+  });
+  await createCredentialFixture({
+    email: userEmail,
+    name: "Ticket 07 Local Namespace User",
+    password,
+  });
+  const adminBearer = await bearerFor(adminEmail, password);
+  const userBearer = await bearerFor(userEmail, password);
+  const wordNamespace =
+    "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+  const template = docxXmlFixture({
+    document:
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+      `<word:document xmlns:word="${wordNamespace}"><word:body>` +
+      `<word:sdt><word:sdtPr><word:alias word:val="Local namespace text"/>` +
+      `<word:tag word:val="local_namespace_text"/><word:text/></word:sdtPr>` +
+      `<w:sdtContent xmlns:w="${wordNamespace}"/></word:sdt>` +
+      `<word:sectPr/></word:body></word:document>`,
+  });
+  const createResponse = await app.handle(
+    formCreationRequest({
+      authorization: adminBearer,
+      source: "upload",
+      template: { bytes: template, name: "local-namespace.docx" },
+      title: "Ticket 07 Local Content Namespace",
+    })
+  );
+  expect(createResponse.status).toBe(200);
+  const created = (await createResponse.json()) as {
+    form?: { publicId?: string };
+  };
+  const publicId = created.form?.publicId;
+  if (!publicId) {
+    throw new Error("The local namespace form was not created");
+  }
+  const editorResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${publicId}/editor-config`, {
+      headers: { Authorization: `Bearer ${adminBearer}` },
+    })
+  );
+  const editor = (await editorResponse.json()) as EditorConfigBody;
+  const publishCapability = editor.bridge.capabilities.publish;
+  const templateDocumentKey = editor.config.document.key;
+  if (!publishCapability || !templateDocumentKey) {
+    throw new Error("The local namespace publish capability is missing");
+  }
+  const publishResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${publicId}/publish`, {
+      body: JSON.stringify({ documentKey: templateDocumentKey }),
+      headers: {
+        ...jsonHeaders,
+        "X-Editor-Capability": publishCapability,
+      },
+      method: "POST",
+    })
+  );
+  expect(publishResponse.status).toBe(202);
+  const publishOperation = (await publishResponse.json()) as {
+    operationCapability?: string;
+    operationId?: string;
+  };
+  if (!publishOperation.operationCapability || !publishOperation.operationId) {
+    throw new Error("The local namespace publish operation did not start");
+  }
+  expect(
+    await waitForOperation(publishOperation.operationId, {
+      "X-Editor-Capability": publishOperation.operationCapability,
+    })
+  ).toMatchObject({ status: "completed" });
+  const nativeMethodResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${publicId}`, {
+      body: JSON.stringify({ fillMethod: "native" }),
+      headers: { ...jsonHeaders, Authorization: `Bearer ${adminBearer}` },
+      method: "PATCH",
+    })
+  );
+  expect(nativeMethodResponse.status).toBe(200);
+  const startResponse = await app.handle(
+    new Request(`http://test.local/api/forms/${publicId}/start`, {
+      headers: { Authorization: `Bearer ${userBearer}` },
+      method: "POST",
+    })
+  );
+  expect(startResponse.status).toBe(200);
+  const start = (await startResponse.json()) as {
+    editorConfigUrl?: string;
+    response?: { id?: string };
+  };
+  const responseId = start.response?.id;
+  if (!start.editorConfigUrl || !responseId) {
+    throw new Error("The local namespace response did not start");
+  }
+  const responseEditor = await app.handle(
+    new Request(
+      new URL(start.editorConfigUrl, "http://test.local").toString(),
+      { headers: { Authorization: `Bearer ${userBearer}` } }
+    )
+  );
+  expect(responseEditor.status).toBe(200);
+  const responseConfig = (await responseEditor.json()) as {
+    capabilities?: Partial<Record<"save-draft" | "submit", string>>;
+    documentKey?: string;
+  };
+  const saveCapability = responseConfig.capabilities?.["save-draft"];
+  const responseDocumentKey = responseConfig.documentKey;
+  if (!saveCapability || !responseDocumentKey) {
+    throw new Error("The local namespace save capability is missing");
+  }
+  const saveResponse = await app.handle(
+    new Request(`http://test.local/api/forms/${publicId}/draft`, {
+      body: JSON.stringify({
+        data: { local_namespace_text: "Saved text" },
+        documentKey: responseDocumentKey,
+        fillMethod: "native",
+        responseId,
+      }),
+      headers: {
+        ...jsonHeaders,
+        "X-Editor-Capability": saveCapability,
+      },
+      method: "POST",
+    })
+  );
+  expect(saveResponse.status).toBe(202);
+  const saveOperation = (await saveResponse.json()) as {
+    operationCapability?: string;
+    operationId?: string;
+  };
+  if (!saveOperation.operationCapability || !saveOperation.operationId) {
+    throw new Error("The local namespace save operation did not start");
+  }
+  expect(
+    await waitForOperation(saveOperation.operationId, {
+      "X-Editor-Capability": saveOperation.operationCapability,
+    })
+  ).toMatchObject({ status: "completed" });
+  const savedDraft = await prisma.response.findUniqueOrThrow({
+    select: { draftObjectKey: true },
+    where: { id: responseId },
+  });
+  if (!savedDraft.draftObjectKey) {
+    throw new Error("The local namespace draft was not stored");
+  }
+  const savedXml = new TextDecoder().decode(
+    unzipSync(await readObject(savedDraft.draftObjectKey))["word/document.xml"]
+  );
+  expect(savedXml).toContain(
+    `<w:sdtContent xmlns:w="${wordNamespace}"><w:p><w:r>`
+  );
+  expect(savedXml).toContain('<w:t xml:space="preserve">Saved text</w:t>');
+});
 test("serves authenticated Admin and User workflows through HTTP", async () => {
   const adminEmail = `ticket-02-admin-${crypto.randomUUID()}@example.com`;
   const userEmail = `ticket-02-user-${crypto.randomUUID()}@example.com`;
@@ -2338,27 +5717,33 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     select: bootstrapUserSelect,
     where: { email: bootstrapEmail },
   });
+  const existingAdmin = await prisma.user.findFirst({
+    select: { id: true },
+    where: { role: "admin" },
+  });
   const existingBootstrapAccount = existingBootstrap
     ? await prisma.account.findFirst({
         where: { providerId: "credential", userId: existingBootstrap.id },
       })
     : null;
   const firstBootstrapResult = await ensureBootstrapAdmin();
-  expect(firstBootstrapResult).toBe(!existingBootstrap);
+  expect(firstBootstrapResult).toBe(!existingAdmin);
   const bootstrapBefore = await prisma.user.findUnique({
     select: bootstrapUserSelect,
     where: { email: bootstrapEmail },
   });
-  if (!bootstrapBefore) {
-    throw new Error("Bootstrap Admin was not created");
-  }
-  const bootstrapAccountBefore = await prisma.account.findFirst({
-    where: { providerId: "credential", userId: bootstrapBefore.id },
-  });
+  const bootstrapAccountBefore = bootstrapBefore
+    ? await prisma.account.findFirst({
+        where: { providerId: "credential", userId: bootstrapBefore.id },
+      })
+    : null;
   if (existingBootstrap) {
     expect(bootstrapBefore).toEqual(existingBootstrap);
     expect(bootstrapAccountBefore).toEqual(existingBootstrapAccount);
-  } else {
+  } else if (!existingAdmin) {
+    if (!bootstrapBefore) {
+      throw new Error("Bootstrap Admin was not created");
+    }
     expect(bootstrapBefore).toMatchObject({
       email: bootstrapEmail,
       enabled: true,
@@ -2373,6 +5758,8 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
       providerId: "credential",
       userId: bootstrapBefore.id,
     });
+  } else {
+    expect(bootstrapBefore).toBeNull();
   }
   const adminCountBeforeSecondEnsure = await prisma.user.count({
     where: { role: "admin" },
@@ -2385,13 +5772,17 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
       where: { role: "admin" },
     })
   ).toBe(adminCountBeforeSecondEnsure);
-  const bootstrapAfter = await prisma.user.findUnique({
-    select: bootstrapUserSelect,
-    where: { id: bootstrapBefore.id },
-  });
-  const bootstrapAccountAfter = await prisma.account.findFirst({
-    where: { providerId: "credential", userId: bootstrapBefore.id },
-  });
+  const bootstrapAfter = bootstrapBefore
+    ? await prisma.user.findUnique({
+        select: bootstrapUserSelect,
+        where: { id: bootstrapBefore.id },
+      })
+    : null;
+  const bootstrapAccountAfter = bootstrapBefore
+    ? await prisma.account.findFirst({
+        where: { providerId: "credential", userId: bootstrapBefore.id },
+      })
+    : null;
   expect(bootstrapAfter).toEqual(bootstrapBefore);
   expect(bootstrapAccountAfter).toEqual(bootstrapAccountBefore);
 
@@ -4324,6 +7715,15 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
       type: "picture",
     })
   );
+  const pictureFormDetailResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/forms/${requiredPicturePublicId}`,
+      { headers: { Authorization: `Bearer ${adminBearer}` } }
+    )
+  );
+  expect(await pictureFormDetailResponse.json()).toMatchObject({
+    form: { nativeFillAvailable: true },
+  });
   let nextPictureDocument = pictureDocumentFixture({
     images: [{ bytes: pngFixture(), extension: "png" }],
     includeStaticImage: true,
@@ -6915,35 +10315,23 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     data: { values: { full_name: trustedPrefillValue } },
     where: { responseId },
   });
-  const oversizedClientValueResponse = await draftRequest({
-    full_name: "x".repeat(10_001),
+  const draftDataBeforeLockedEdit = await prisma.response.findUniqueOrThrow({
+    select: { draftData: true },
+    where: { id: responseId },
   });
-  expect(oversizedClientValueResponse.status).toBe(202);
-  const oversizedClientValueBody =
-    (await oversizedClientValueResponse.json()) as {
-      operationCapability?: string;
-      operationId?: string;
-    };
-  if (
-    !oversizedClientValueBody.operationCapability ||
-    !oversizedClientValueBody.operationId
-  ) {
-    throw new Error("The locked client value operation was not created");
-  }
-  const oversizedClientValueOperation = await waitForOperation(
-    oversizedClientValueBody.operationId,
-    { "X-Editor-Capability": oversizedClientValueBody.operationCapability }
-  );
-  expect(oversizedClientValueOperation.status).toBe("completed");
-  await refreshResponseEditor();
-  const normalizedClientTamperResponse =
+  const lockedClientEditResponse = await draftRequest({
+    full_name: "Tampered client value",
+  });
+  expect(lockedClientEditResponse.status).toBe(422);
+  expect(await lockedClientEditResponse.json()).toMatchObject({
+    error: "invalid_response_data",
+  });
+  expect(
     await prisma.response.findUniqueOrThrow({
       select: { draftData: true },
       where: { id: responseId },
-    });
-  expect(normalizedClientTamperResponse.draftData).toEqual({
-    full_name: trustedPrefillValue,
-  });
+    })
+  ).toEqual(draftDataBeforeLockedEdit);
   const savedDraftData = {
     accept_terms: true,
     department: "engineering",
@@ -7065,6 +10453,7 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   }
   expect(savedResponseDocumentKey).not.toBe(originalResponseDocumentKey);
   expect(saveOperationResult.documentKey).toBe(savedResponseDocumentKey);
+  const savedResponseDocumentBytes = await readObject(savedResponseObjectKey);
   const staleDraftResponse = await app.handle(
     new Request(`http://test.local/api/forms/${formRecord.publicId}/draft`, {
       body: JSON.stringify({
@@ -7225,6 +10614,46 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     nextCursor: string | null;
     results: Record<string, unknown>[];
   };
+  const unsavedDraftResponse = await prisma.response.findFirstOrThrow({
+    select: { id: true },
+    where: { userId: firstPaginationUser.id },
+  });
+  const unsavedDraftDetailResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/results/${unsavedDraftResponse.id}`,
+      {
+        headers: { Authorization: `Bearer ${adminBearer}` },
+      }
+    )
+  );
+  expect(unsavedDraftDetailResponse.status).toBe(200);
+  expect(await unsavedDraftDetailResponse.json()).toMatchObject({
+    result: { document: { available: false, state: "draft" }, state: "draft" },
+  });
+  const forbiddenUnsavedDraftDetailResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/results/${unsavedDraftResponse.id}`,
+      { headers: { Authorization: `Bearer ${userBearer}` } }
+    )
+  );
+  expect(forbiddenUnsavedDraftDetailResponse.status).toBe(403);
+  const unavailableDraftViewerResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/results/${unsavedDraftResponse.id}/viewer-config`,
+      { headers: { Authorization: `Bearer ${adminBearer}` } }
+    )
+  );
+  expect(unavailableDraftViewerResponse.status).toBe(409);
+  expect(await unavailableDraftViewerResponse.json()).toMatchObject({
+    error: "document_unavailable",
+  });
+  const forbiddenUnsavedDraftViewerResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/results/${unsavedDraftResponse.id}/viewer-config`,
+      { headers: { Authorization: `Bearer ${userBearer}` } }
+    )
+  );
+  expect(forbiddenUnsavedDraftViewerResponse.status).toBe(403);
   await prisma.response.deleteMany({
     where: {
       userId: {
@@ -7255,15 +10684,102 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     })
   );
   expect(adminDraftDetailResponse.status).toBe(200);
+  const forbiddenSavedDraftDetailResponse = await app.handle(
+    new Request(`http://test.local/api/admin/results/${responseId}`, {
+      headers: { Authorization: `Bearer ${userBearer}` },
+    })
+  );
+  expect(forbiddenSavedDraftDetailResponse.status).toBe(403);
   const adminDraftDetailBody = (await adminDraftDetailResponse.json()) as {
-    result: Record<string, unknown>;
+    result: {
+      fields: {
+        label: string;
+        options: { displayText: string; value: string }[];
+        placeholder: string | null;
+        position: number;
+        tag: string;
+        type: string;
+      }[];
+    } & Record<string, unknown>;
   };
+  const expectedAdminDraftFields = [...publishedManifestRecord.manifest.fields]
+    .toSorted((left, right) => left.position - right.position)
+    .map(({ label, options, placeholder, position, tag, type }) => {
+      const receiptOptions = Array.isArray(options)
+        ? options.flatMap((option) => {
+            if (
+              !option ||
+              typeof option !== "object" ||
+              Array.isArray(option)
+            ) {
+              return [];
+            }
+            const optionRecord = option as Record<string, unknown>;
+            const { displayText } = optionRecord;
+            const { value } = optionRecord;
+            return typeof displayText === "string" && typeof value === "string"
+              ? [{ displayText, value }]
+              : [];
+          })
+        : [];
+      return {
+        label,
+        options: receiptOptions,
+        placeholder,
+        position,
+        tag,
+        type,
+      };
+    });
   expect(adminDraftDetailBody.result).toMatchObject({
     data: savedDraftData,
     document: { available: true, state: "draft" },
     id: responseId,
     state: "draft",
   });
+  expect(adminDraftDetailBody.result.fields).toEqual(expectedAdminDraftFields);
+  const adminDraftViewerResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/results/${responseId}/viewer-config`,
+      { headers: { Authorization: `Bearer ${adminBearer}` } }
+    )
+  );
+  expect(adminDraftViewerResponse.status).toBe(200);
+  expect(await adminDraftViewerResponse.json()).toMatchObject({
+    config: {
+      document: {
+        fileType: "docx",
+        key: savedResponseDocumentKey,
+        permissions: {
+          comment: false,
+          download: false,
+          edit: false,
+          fillForms: false,
+          review: false,
+        },
+      },
+      editorConfig: { mode: "view" },
+    },
+  });
+  const forbiddenDraftViewerResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/results/${responseId}/viewer-config`,
+      { headers: { Authorization: `Bearer ${userBearer}` } }
+    )
+  );
+  expect(forbiddenDraftViewerResponse.status).toBe(403);
+  expect(
+    await prisma.response.findUniqueOrThrow({
+      select: { draftData: true, draftObjectKey: true },
+      where: { id: responseId },
+    })
+  ).toMatchObject({
+    draftData: savedDraftData,
+    draftObjectKey: savedResponseObjectKey,
+  });
+  expect(await readObject(savedResponseObjectKey)).toEqual(
+    savedResponseDocumentBytes
+  );
   expect(JSON.stringify(adminDraftDetailBody)).not.toContain("draftObjectKey");
   const adminDraftExportResponse = await app.handle(
     new Request(`http://test.local/api/responses/${responseId}/draft/json`, {
@@ -7994,12 +11510,13 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     ...savedDraftData,
     description_1: "แก้ไขข้อมูลโดยผู้ดูแล",
   };
+  const correctionInputData = { ...correctionData, department: "Engineering" };
   const correctionSaveResponse = await app.handle(
     new Request(
       `http://test.local/api/admin/results/${responseId}/correction`,
       {
         body: JSON.stringify({
-          data: correctionData,
+          data: correctionInputData,
           documentKey: correctionDocumentKey,
           reason: "แก้ไขตามเอกสารต้นฉบับ",
         }),
@@ -8187,6 +11704,15 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
       revision: 1,
     },
   });
+  const originalAdminResultResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/results/${responseId}?revision=original`,
+      { headers: { Authorization: `Bearer ${adminBearer}` } }
+    )
+  );
+  expect(await originalAdminResultResponse.json()).toMatchObject({
+    result: { data: savedDraftData, revision: 0 },
+  });
   const forbiddenAdminResultResponse = await app.handle(
     new Request(`http://test.local/api/admin/results/${responseId}`, {
       headers: { Authorization: `Bearer ${otherUserBearer}` },
@@ -8202,7 +11728,7 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   expect(forbiddenViewerConfigResponse.status).toBe(403);
   const invalidViewerRevisionResponse = await app.handle(
     new Request(
-      `http://test.local/api/admin/results/${responseId}/viewer-config?revision=2`,
+      `http://test.local/api/admin/results/${responseId}/viewer-config?revision=bogus`,
       { headers: { Authorization: `Bearer ${adminBearer}` } }
     )
   );
@@ -8252,7 +11778,7 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     throw new Error("The signed viewer configuration was not returned");
   }
   const signedViewerConfig = JSON.parse(
-    Buffer.from(viewerTokenPayload, "base64url").toString("utf8")
+    Buffer.from(viewerTokenPayload, "base64url").toString("utf-8")
   ) as Record<string, unknown>;
   expect(signedViewerConfig).toMatchObject({
     document: {
@@ -8267,8 +11793,8 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     )
   );
   expect(originalViewerResponse.status).toBe(200);
-  const originalViewerConfig = (await originalViewerResponse.json()) as
-    typeof latestViewerConfig;
+  const originalViewerConfig =
+    (await originalViewerResponse.json()) as typeof latestViewerConfig;
   expect(originalViewerConfig.config.document.key).toBe(
     originalSubmissionBeforeCorrection.documentKey
   );
@@ -8388,6 +11914,228 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     )
   );
   expect(failedCorrectionReleaseResponse.status).toBe(200);
+  const latestCorrectionData = {
+    ...correctionData,
+    description_1: "แก้ไขครั้งล่าสุด",
+  };
+  const latestCorrectionDocumentKey = crypto.randomUUID();
+  const latestCorrectionObjectKey = objectKey(
+    "submissions",
+    completedSubmissionId,
+    "revision-2",
+    crypto.randomUUID(),
+    "docx"
+  );
+  await putObject(
+    latestCorrectionObjectKey,
+    docxFixture("Ticket 04 latest correction"),
+    DOCX_CONTENT_TYPE
+  );
+  await prisma.correction.create({
+    data: {
+      actorId: adminId,
+      changedData: { description_1: "แก้ไขครั้งล่าสุด" },
+      data: latestCorrectionData,
+      documentKey: latestCorrectionDocumentKey,
+      objectKey: latestCorrectionObjectKey,
+      reason: "Correction ล่าสุด",
+      responseId,
+      revision: 2,
+      submissionId: completedSubmissionId,
+    },
+  });
+  const allRevisionHistoryResponse = await app.handle(
+    new Request(`http://test.local/api/responses/${responseId}/corrections`, {
+      headers: { Authorization: `Bearer ${userBearer}` },
+    })
+  );
+  expect(allRevisionHistoryResponse.status).toBe(200);
+  expect(await allRevisionHistoryResponse.json()).toMatchObject({
+    latestRevision: 2,
+    revisions: [
+      { data: savedDraftData, revision: 0 },
+      { data: correctionData, revision: 1 },
+      { data: latestCorrectionData, revision: 2 },
+    ],
+  });
+  const implicitLatestDataResponse = await app.handle(
+    new Request(
+      `http://test.local/api/submissions/${completedSubmissionId}/data`,
+      { headers: { Authorization: `Bearer ${userBearer}` } }
+    )
+  );
+  expect(implicitLatestDataResponse.status).toBe(200);
+  expect(await implicitLatestDataResponse.json()).toMatchObject({
+    correction: { revision: 2 },
+    data: latestCorrectionData,
+    revision: 2,
+  });
+  const implicitLatestDocxResponse = await app.handle(
+    new Request(
+      `http://test.local/api/submissions/${completedSubmissionId}/docx`,
+      { headers: { Authorization: `Bearer ${userBearer}` } }
+    )
+  );
+  expect(implicitLatestDocxResponse.status).toBe(200);
+  expect(
+    new Uint8Array(await implicitLatestDocxResponse.arrayBuffer())
+  ).toEqual(Uint8Array.from(await readObject(latestCorrectionObjectKey)));
+  const implicitLatestPdfResponse = await app.handle(
+    new Request(
+      `http://test.local/api/submissions/${completedSubmissionId}/pdf`,
+      { headers: { Authorization: `Bearer ${userBearer}` } }
+    )
+  );
+  expect(implicitLatestPdfResponse.status).toBe(200);
+  expect(convertedDocumentKeys.at(-1)).toBe(latestCorrectionDocumentKey);
+  const revisionArtifacts = [
+    {
+      data: savedDraftData,
+      document: submissionDocument,
+      documentKey: originalSubmissionBeforeCorrection.documentKey,
+      revision: 0,
+    },
+    {
+      data: correctionData,
+      document: await readObject(correction.objectKey),
+      documentKey: correction.documentKey,
+      revision: 1,
+    },
+    {
+      data: latestCorrectionData,
+      document: await readObject(latestCorrectionObjectKey),
+      documentKey: latestCorrectionDocumentKey,
+      revision: 2,
+    },
+  ];
+  for (const revision of revisionArtifacts) {
+    const revisionQuery = `?revision=${revision.revision}`;
+    const revisionDataResponse = await app.handle(
+      new Request(
+        `http://test.local/api/submissions/${completedSubmissionId}/data${revisionQuery}`,
+        { headers: { Authorization: `Bearer ${userBearer}` } }
+      )
+    );
+    expect(revisionDataResponse.status).toBe(200);
+    expect(await revisionDataResponse.json()).toMatchObject({
+      data: revision.data,
+      revision: revision.revision,
+    });
+    const revisionDocxResponse = await app.handle(
+      new Request(
+        `http://test.local/api/submissions/${completedSubmissionId}/docx${revisionQuery}`,
+        { headers: { Authorization: `Bearer ${userBearer}` } }
+      )
+    );
+    expect(revisionDocxResponse.status).toBe(200);
+    expect(new Uint8Array(await revisionDocxResponse.arrayBuffer())).toEqual(
+      Uint8Array.from(revision.document)
+    );
+    const revisionPdfResponse = await app.handle(
+      new Request(
+        `http://test.local/api/submissions/${completedSubmissionId}/pdf${revisionQuery}`,
+        { headers: { Authorization: `Bearer ${userBearer}` } }
+      )
+    );
+    expect(revisionPdfResponse.status).toBe(200);
+    expect(revisionPdfResponse.headers.get("content-disposition")).toContain(
+      revision.revision === 0 ? ".pdf" : `-revision-${revision.revision}.pdf`
+    );
+    expect(convertedDocumentKeys.at(-1)).toBe(revision.documentKey);
+    const adminRevisionQuery = `?revision=${revision.revision}`;
+    const adminResultResponse = await app.handle(
+      new Request(
+        `http://test.local/api/admin/results/${responseId}${adminRevisionQuery}`,
+        { headers: { Authorization: `Bearer ${adminBearer}` } }
+      )
+    );
+    expect(adminResultResponse.status).toBe(200);
+    expect(await adminResultResponse.json()).toMatchObject({
+      result: {
+        correction:
+          revision.revision === 0
+            ? null
+            : {
+                reason:
+                  revision.revision === 1
+                    ? "แก้ไขตามเอกสารต้นฉบับ"
+                    : "Correction ล่าสุด",
+                revision: revision.revision,
+              },
+        data: revision.data,
+        document: {
+          available: true,
+          state: revision.revision === 0 ? "submission" : "correction",
+        },
+        latestCorrectionNumber: 2,
+        revision: revision.revision,
+      },
+    });
+    const adminViewerResponse = await app.handle(
+      new Request(
+        `http://test.local/api/admin/results/${responseId}/viewer-config${adminRevisionQuery}`,
+        { headers: { Authorization: `Bearer ${adminBearer}` } }
+      )
+    );
+    expect(adminViewerResponse.status).toBe(200);
+    const adminViewerBody = (await adminViewerResponse.json()) as {
+      config: { document: { key: string } };
+    };
+    expect(adminViewerBody.config.document.key).toBe(revision.documentKey);
+  }
+  const implicitAdminResultResponse = await app.handle(
+    new Request(`http://test.local/api/admin/results/${responseId}`, {
+      headers: { Authorization: `Bearer ${adminBearer}` },
+    })
+  );
+  expect(await implicitAdminResultResponse.json()).toMatchObject({
+    result: {
+      data: latestCorrectionData,
+      latestCorrectionNumber: 2,
+      revision: 2,
+    },
+  });
+  const implicitAdminViewerResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/results/${responseId}/viewer-config`,
+      { headers: { Authorization: `Bearer ${adminBearer}` } }
+    )
+  );
+  const implicitAdminViewerBody =
+    (await implicitAdminViewerResponse.json()) as {
+      config: { document: { key: string } };
+    };
+  expect(implicitAdminViewerBody.config.document.key).toBe(
+    latestCorrectionDocumentKey
+  );
+  const missingAdminResultRevisionResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/results/${responseId}?revision=3`,
+      { headers: { Authorization: `Bearer ${adminBearer}` } }
+    )
+  );
+  expect(missingAdminResultRevisionResponse.status).toBe(404);
+  const missingAdminViewerRevisionResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/results/${responseId}/viewer-config?revision=3`,
+      { headers: { Authorization: `Bearer ${adminBearer}` } }
+    )
+  );
+  expect(missingAdminViewerRevisionResponse.status).toBe(404);
+  const missingRevisionResponse = await app.handle(
+    new Request(
+      `http://test.local/api/submissions/${completedSubmissionId}/data?revision=3`,
+      { headers: { Authorization: `Bearer ${userBearer}` } }
+    )
+  );
+  expect(missingRevisionResponse.status).toBe(404);
+  const otherOwnerRevisionResponse = await app.handle(
+    new Request(
+      `http://test.local/api/submissions/${completedSubmissionId}/data?revision=1`,
+      { headers: { Authorization: `Bearer ${otherUserBearer}` } }
+    )
+  );
+  expect(otherOwnerRevisionResponse.status).toBe(403);
   const exportAudits = await prisma.auditEvent.findMany({
     orderBy: { createdAt: "asc" },
     where: {
@@ -8419,7 +12167,7 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   });
   const conversionFailureResponse = await conversionFailureApp.handle(
     new Request(
-      `http://test.local/api/submissions/${completedSubmissionId}/pdf`,
+      `http://test.local/api/submissions/${completedSubmissionId}/pdf?revision=original`,
       {
         headers: { Authorization: `Bearer ${userBearer}` },
       }
@@ -10824,8 +14572,7 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     })
   );
   expect(cleanupAfterAiHandoff.status).toBe(200);
-  const cleanupAfterAiHandoffBody: unknown =
-    await cleanupAfterAiHandoff.json();
+  const cleanupAfterAiHandoffBody: unknown = await cleanupAfterAiHandoff.json();
   if (
     !cleanupAfterAiHandoffBody ||
     typeof cleanupAfterAiHandoffBody !== "object" ||
@@ -10848,7 +14595,9 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     .get("set-cookie")
     ?.split(";", 1)[0];
   if (!cleanupAfterAiPendingCookie) {
-    throw new Error("The AI cleanup handoff did not set a pending claim cookie");
+    throw new Error(
+      "The AI cleanup handoff did not set a pending claim cookie"
+    );
   }
   const cleanupAfterAiStart = await app.handle(
     new Request(`http://test.local/api/forms/${formRecord.publicId}/start`, {
@@ -11245,6 +14994,420 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   }
   expect(tombstoneMutationBlocked).toBe(true);
 });
+test("Ticket 08 native Picture uploads survive response workflows", async () => {
+  const adminPassword = "Ticket08-picture-admin-password";
+  const userPassword = "Ticket08-picture-user-password";
+  const adminEmail = `ticket-08-picture-admin-${crypto.randomUUID()}@example.com`;
+  const userEmail = `ticket-08-picture-user-${crypto.randomUUID()}@example.com`;
+  await createCredentialFixture({
+    email: adminEmail,
+    name: "Ticket 08 Picture Admin",
+    password: adminPassword,
+    role: "admin",
+  });
+  await createCredentialFixture({
+    email: userEmail,
+    name: "Ticket 08 Picture User",
+    password: userPassword,
+  });
+  const adminBearer = await bearerFor(adminEmail, adminPassword);
+  const userBearer = await bearerFor(userEmail, userPassword);
+  const createResponse = await app.handle(
+    formCreationRequest({
+      authorization: adminBearer,
+      source: "upload",
+      template: {
+        bytes: pictureDocumentFixture(),
+        name: "ticket-08-picture.docx",
+      },
+      title: "Ticket 08 Native Picture",
+    })
+  );
+  expect(createResponse.status).toBe(200);
+  const created = (await createResponse.json()) as {
+    form?: { publicId?: string };
+  };
+  const publicId = created.form?.publicId;
+  if (!publicId) {
+    throw new Error("The Ticket 08 Picture form was not created");
+  }
+  const adminEditorResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${publicId}/editor-config`, {
+      headers: { Authorization: `Bearer ${adminBearer}` },
+    })
+  );
+  const adminEditor = (await adminEditorResponse.json()) as EditorConfigBody;
+  const configureCapability =
+    adminEditor.bridge.capabilities["configure-fields"];
+  if (!configureCapability) {
+    throw new Error("The Ticket 08 Picture configure capability is missing");
+  }
+  const fieldRuleResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${publicId}/field-rules`, {
+      body: JSON.stringify({
+        documentKey: adminEditor.config.document.key,
+        prefillPointer: null,
+        prefillPolicy: "editable",
+        previousTag: null,
+        required: true,
+        tag: "photo",
+      }),
+      headers: {
+        ...jsonHeaders,
+        ...editorCapabilityHeaders(configureCapability),
+      },
+      method: "PATCH",
+    })
+  );
+  expect(fieldRuleResponse.status).toBe(200);
+  const publishEditorResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${publicId}/editor-config`, {
+      headers: { Authorization: `Bearer ${adminBearer}` },
+    })
+  );
+  const publishEditor =
+    (await publishEditorResponse.json()) as EditorConfigBody;
+  const publishCapability = publishEditor.bridge.capabilities.publish;
+  if (!publishCapability) {
+    throw new Error("The Ticket 08 Picture publish capability is missing");
+  }
+  const publishResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${publicId}/publish`, {
+      body: JSON.stringify({
+        documentKey: publishEditor.config.document.key,
+      }),
+      headers: {
+        ...jsonHeaders,
+        ...editorCapabilityHeaders(publishCapability),
+      },
+      method: "POST",
+    })
+  );
+  expect(publishResponse.status).toBe(202);
+  const publish = (await publishResponse.json()) as {
+    operationCapability?: string;
+    operationId?: string;
+  };
+  if (!publish.operationCapability || !publish.operationId) {
+    throw new Error("The Ticket 08 Picture publish operation is missing");
+  }
+  expect(
+    await waitForOperation(publish.operationId, {
+      "X-Editor-Capability": publish.operationCapability,
+    })
+  ).toMatchObject({ status: "completed" });
+  const formDetailResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${publicId}`, {
+      headers: { Authorization: `Bearer ${adminBearer}` },
+    })
+  );
+  expect(await formDetailResponse.json()).toMatchObject({
+    form: { nativeFillAvailable: true },
+  });
+  const methodResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${publicId}`, {
+      body: JSON.stringify({ fillMethod: "native" }),
+      headers: {
+        ...jsonHeaders,
+        Authorization: `Bearer ${adminBearer}`,
+      },
+      method: "PATCH",
+    })
+  );
+  expect(methodResponse.status).toBe(200);
+  const startResponse = await app.handle(
+    new Request(`http://test.local/api/forms/${publicId}/start`, {
+      headers: { Authorization: `Bearer ${userBearer}` },
+      method: "POST",
+    })
+  );
+  expect(startResponse.status).toBe(200);
+  const start = (await startResponse.json()) as {
+    editorConfigUrl?: string;
+    response?: { id?: string };
+  };
+  const responseId = start.response?.id;
+  const { editorConfigUrl } = start;
+  if (!responseId || !editorConfigUrl) {
+    throw new Error("The Ticket 08 Picture response did not start");
+  }
+  interface PictureNativeConfig {
+    capabilities: { "save-draft": string; submit: string };
+    documentKey: string;
+    pictures: Record<string, boolean>;
+    responseId: string;
+  }
+  const getNativeConfig = async () => {
+    const response = await app.handle(
+      new Request(new URL(editorConfigUrl, "http://test.local").toString(), {
+        headers: { Authorization: `Bearer ${userBearer}` },
+      })
+    );
+    expect(response.status).toBe(200);
+    return (await response.json()) as PictureNativeConfig;
+  };
+  let nativeConfig = await getNativeConfig();
+  expect(nativeConfig).toMatchObject({
+    pictures: { photo: false },
+    responseId,
+  });
+  const upload = (
+    action: "draft" | "submit",
+    image?: { bytes: Uint8Array; name: string; type: string }
+  ) => {
+    const body = new FormData();
+    body.set(
+      "payload",
+      JSON.stringify({
+        data: { photo: "must not enter scalar data" },
+        documentKey: nativeConfig.documentKey,
+        fillMethod: "native",
+        responseId,
+      })
+    );
+    if (image) {
+      body.set(
+        "picture:photo",
+        new File([image.bytes], image.name, {
+          type: image.type,
+        })
+      );
+    }
+    return app.handle(
+      new Request(`http://test.local/api/forms/${publicId}/${action}`, {
+        body,
+        headers: editorCapabilityHeaders(
+          nativeConfig.capabilities[
+            action === "draft" ? "save-draft" : "submit"
+          ]
+        ),
+        method: "POST",
+      })
+    );
+  };
+  const initialDraft = await prisma.response.findUniqueOrThrow({
+    select: { draftData: true, draftObjectKey: true, status: true },
+    where: { id: responseId },
+  });
+  const missingRequired = await upload("submit");
+  expect(missingRequired.status).toBe(422);
+  expect(
+    await prisma.response.findUniqueOrThrow({
+      select: { draftData: true, draftObjectKey: true, status: true },
+      where: { id: responseId },
+    })
+  ).toEqual(initialDraft);
+  const oversized = await upload("draft", {
+    bytes: pngFixture(1, 1, 10 * 1024 * 1024 + 1),
+    name: "oversized.png",
+    type: "image/png",
+  });
+  expect(oversized.status).toBe(413);
+  const wrongMime = await upload("draft", {
+    bytes: pngFixture(),
+    name: "wrong-type.gif",
+    type: "image/gif",
+  });
+  expect(wrongMime.status).toBe(415);
+  const oversizedDimensions = await upload("draft", {
+    bytes: pngFixture(4097, 1),
+    name: "too-wide.png",
+    type: "image/png",
+  });
+  expect(oversizedDimensions.status).toBe(422);
+  const png = pngFixture();
+  const savePngResponse = await upload("draft", {
+    bytes: png,
+    name: "photo.png",
+    type: "image/png",
+  });
+  expect(savePngResponse.status).toBe(202);
+  const savePng = (await savePngResponse.json()) as {
+    operationCapability?: string;
+    operationId?: string;
+  };
+  if (!savePng.operationCapability || !savePng.operationId) {
+    throw new Error("The Ticket 08 PNG draft operation is missing");
+  }
+  expect(
+    await waitForOperation(savePng.operationId, {
+      "X-Editor-Capability": savePng.operationCapability,
+    })
+  ).toMatchObject({ status: "completed" });
+  const savedDraft = await prisma.response.findUniqueOrThrow({
+    select: {
+      draftData: true,
+      draftDocumentKey: true,
+      draftObjectKey: true,
+      status: true,
+    },
+    where: { id: responseId },
+  });
+  expect(savedDraft.draftData).toEqual({});
+  expect(savedDraft.status).toBe("draft");
+  if (!savedDraft.draftObjectKey || !savedDraft.draftDocumentKey) {
+    throw new Error("The Ticket 08 PNG draft object is missing");
+  }
+  const pngDocx = await readObject(savedDraft.draftObjectKey);
+  const pngArchive = unzipSync(pngDocx);
+  expect(
+    Object.entries(pngArchive).some(
+      ([path, bytes]) =>
+        path.startsWith("word/media/") &&
+        Buffer.from(bytes).equals(Buffer.from(png))
+    )
+  ).toBe(true);
+  nativeConfig = await getNativeConfig();
+  expect(nativeConfig.pictures).toMatchObject({ photo: true });
+  const resumedResponse = await app.handle(
+    new Request(`http://test.local/api/forms/${publicId}/start`, {
+      headers: { Authorization: `Bearer ${userBearer}` },
+      method: "POST",
+    })
+  );
+  expect(await resumedResponse.json()).toMatchObject({
+    response: { id: responseId, status: "draft" },
+  });
+  const persistedPngDraft = await prisma.response.findUniqueOrThrow({
+    select: { draftData: true, draftObjectKey: true },
+    where: { id: responseId },
+  });
+  const failedReplacement = await upload("draft", {
+    bytes: png,
+    name: "wrong-type.gif",
+    type: "image/gif",
+  });
+  expect(failedReplacement.status).toBe(415);
+  expect(
+    await prisma.response.findUniqueOrThrow({
+      select: { draftData: true, draftObjectKey: true },
+      where: { id: responseId },
+    })
+  ).toEqual(persistedPngDraft);
+  if (!persistedPngDraft.draftObjectKey) {
+    throw new Error("The saved Ticket 08 PNG draft object is missing");
+  }
+  expect(await readObject(persistedPngDraft.draftObjectKey)).toEqual(pngDocx);
+  const draftPdf = await app.handle(
+    new Request(`http://test.local/api/responses/${responseId}/draft/pdf`, {
+      headers: { Authorization: `Bearer ${userBearer}` },
+    })
+  );
+  expect(draftPdf.status).toBe(200);
+  expect(draftPdf.headers.get("content-type")).toBe("application/pdf");
+  expect(convertedDocumentKeys).toContain(savedDraft.draftDocumentKey);
+  const onlyOfficeMethod = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${publicId}`, {
+      body: JSON.stringify({ fillMethod: "onlyoffice" }),
+      headers: {
+        ...jsonHeaders,
+        Authorization: `Bearer ${adminBearer}`,
+      },
+      method: "PATCH",
+    })
+  );
+  expect(onlyOfficeMethod.status).toBe(200);
+  const onlyOfficeConfigResponse = await app.handle(
+    new Request(
+      `http://test.local/api/forms/${publicId}/editor-config?responseId=${responseId}&action=draft`,
+      { headers: { Authorization: `Bearer ${userBearer}` } }
+    )
+  );
+  expect(onlyOfficeConfigResponse.status).toBe(200);
+  const onlyOfficeConfig =
+    (await onlyOfficeConfigResponse.json()) as EditorConfigBody;
+  const docxUrl = onlyOfficeConfig.config.document.url;
+  const docxResponse = await app.handle(
+    new Request(docxUrl, {
+      headers: {
+        Authorization: createOnlyOfficeAuthorization({ url: docxUrl }),
+      },
+    })
+  );
+  expect(docxResponse.status).toBe(200);
+  expect(
+    Buffer.from(new Uint8Array(await docxResponse.arrayBuffer())).equals(
+      Buffer.from(pngDocx)
+    )
+  ).toBe(true);
+  const backToNative = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${publicId}`, {
+      body: JSON.stringify({ fillMethod: "native" }),
+      headers: {
+        ...jsonHeaders,
+        Authorization: `Bearer ${adminBearer}`,
+      },
+      method: "PATCH",
+    })
+  );
+  expect(backToNative.status).toBe(200);
+  nativeConfig = await getNativeConfig();
+  expect(nativeConfig.pictures).toMatchObject({ photo: true });
+  const jpeg = jpegFixture();
+  const saveJpegResponse = await upload("draft", {
+    bytes: jpeg,
+    name: "photo.jpg",
+    type: "image/jpeg",
+  });
+  expect(saveJpegResponse.status).toBe(202);
+  const saveJpeg = (await saveJpegResponse.json()) as {
+    operationCapability?: string;
+    operationId?: string;
+  };
+  if (!saveJpeg.operationCapability || !saveJpeg.operationId) {
+    throw new Error("The Ticket 08 JPEG draft operation is missing");
+  }
+  expect(
+    await waitForOperation(saveJpeg.operationId, {
+      "X-Editor-Capability": saveJpeg.operationCapability,
+    })
+  ).toMatchObject({ status: "completed" });
+  nativeConfig = await getNativeConfig();
+  const savedJpegDraft = await prisma.response.findUniqueOrThrow({
+    select: { draftObjectKey: true },
+    where: { id: responseId },
+  });
+  if (!savedJpegDraft.draftObjectKey) {
+    throw new Error("The saved Ticket 08 JPEG draft object is missing");
+  }
+  const pictureMedia = Object.entries(
+    unzipSync(await readObject(savedJpegDraft.draftObjectKey))
+  ).filter(([path]) => path.startsWith("word/media/picture-"));
+  expect(pictureMedia).toHaveLength(1);
+  expect(
+    Buffer.from(pictureMedia[0]?.[1] ?? new Uint8Array()).equals(
+      Buffer.from(jpeg)
+    )
+  ).toBe(true);
+  const submitResponse = await upload("submit");
+  expect(submitResponse.status).toBe(202);
+  const submit = (await submitResponse.json()) as {
+    operationCapability?: string;
+    operationId?: string;
+  };
+  if (!submit.operationCapability || !submit.operationId) {
+    throw new Error("The Ticket 08 submission operation is missing");
+  }
+  expect(
+    await waitForOperation(submit.operationId, {
+      "X-Editor-Capability": submit.operationCapability,
+    })
+  ).toMatchObject({ status: "completed" });
+  const submission = await prisma.submission.findUniqueOrThrow({
+    select: { data: true, objectKey: true },
+    where: { responseId },
+  });
+  expect(submission.data).toEqual({});
+  const submissionDocx = await readObject(submission.objectKey);
+  expect(
+    Object.entries(unzipSync(submissionDocx)).some(
+      ([path, bytes]) =>
+        path.startsWith("word/media/") &&
+        Buffer.from(bytes).equals(Buffer.from(jpeg))
+    )
+  ).toBe(true);
+});
+
 test("Ticket 17 sign-out always revokes and clears tombstones after failures", async () => {
   const authoring = new AiAuthoringSessions(null);
   const endedOwnerSessions = Reflect.get(
@@ -11317,9 +15480,8 @@ test("Ticket 17 sign-out always revokes and clears tombstones after failures", a
   await secondConcurrentEnd;
   expect(endedOwnerSessions.has("concurrent-sign-out")).toBe(false);
 
-
   for (const ownerSessionId of ["normal-sign-out-2", "normal-sign-out-3"]) {
-    await authoring.endForSession(ownerSessionId, async () => undefined);
+    await authoring.endForSession(ownerSessionId, async () => {});
   }
   expect(endedOwnerSessions.size).toBe(0);
   const sessions = Reflect.get(authoring, "sessions") as Map<
@@ -11609,12 +15771,11 @@ test("Ticket 17 authoring shutdown cleans every active session after errors", as
       closeError = error;
     }
     if (!(closeError instanceof AggregateError)) {
-      throw new Error("AI authoring shutdown did not aggregate cleanup failures");
+      throw new Error(
+        "AI authoring shutdown did not aggregate cleanup failures"
+      );
     }
-    expect(closeError.errors).toEqual([
-      pendingDisposeError,
-      disposeError,
-    ]);
+    expect(closeError.errors).toEqual([pendingDisposeError, disposeError]);
     expect(firstDocument).toEqual(new Uint8Array([0, 0]));
     expect(secondDocument).toEqual(new Uint8Array([0, 0]));
     expect(firstTurns).toEqual([]);
@@ -11635,7 +15796,7 @@ test("Ticket 17 authoring shutdown cleans every active session after errors", as
     ]);
   }
 });
-test("Ticket 17 AI Authoring requires Admin consent and uploads a validated DOCX", async () => {
+test("Ticket 17/18 AI Authoring creates, revises, restores, and uploads a validated DOCX", async () => {
   const model = "ticket-17-local-model";
   const serviceKey = `ticket-17-local-only-${crypto.randomUUID()}`;
   const generatedTemplate = {
@@ -11650,6 +15811,25 @@ test("Ticket 17 AI Authoring requires Admin consent and uploads a validated DOCX
     paragraphs: ["Complete each field."],
     title: "Equipment Request",
   };
+  const revisedTemplate = {
+    ...generatedTemplate,
+    fields: [
+      ...generatedTemplate.fields,
+      {
+        label: "Department",
+        placeholder: "Enter department",
+        tag: "department",
+      },
+    ],
+    paragraphs: [...generatedTemplate.paragraphs, "Route through Facilities."],
+  };
+  const omittedTemplate = {
+    ...revisedTemplate,
+    paragraphs: ["Route through Facilities.", "Send to manager for approval."],
+  };
+  const revisionPrompt = "Add a Department field and a Facilities routing note";
+  const failedRevisionPrompt = "Add an approval note below the existing paragraphs";
+  let revisionCalls = 0;
   let upstreamCalls = 0;
   let forcedToolCalls: boolean[] = [];
   let omitAssistantSummary = false;
@@ -11682,7 +15862,6 @@ test("Ticket 17 AI Authoring requires Admin consent and uploads a validated DOCX
   let restoreAgentSessionHooks: (() => void) | undefined;
   const upstream = Bun.serve({
     fetch: async (request) => {
-      upstreamCalls += 1;
       expect(request.method).toBe("POST");
       expect(new URL(request.url).pathname).toBe("/v1/chat/completions");
       expect(request.headers.get("authorization")).toBe(`Bearer ${serviceKey}`);
@@ -11691,10 +15870,31 @@ test("Ticket 17 AI Authoring requires Admin consent and uploads a validated DOCX
         model?: unknown;
         tools?: { function?: { name?: unknown } }[];
       };
+      const messages = JSON.stringify(requestBody.messages ?? []);
+      const isRevision =
+        messages.includes(revisionPrompt) ||
+        messages.includes(failedRevisionPrompt);
+      if (isRevision) {
+        revisionCalls += 1;
+        expect(messages).toContain("Create an equipment request form");
+        expect(messages).toContain("Complete each field.");
+        expect(messages).toContain("employee_name");
+        expect(messages).toContain(
+          "Created Equipment Request with 1 tagged fields."
+        );
+        expect(messages).toContain(
+          "Created Equipment Request with one tagged field."
+        );
+        expect(messages).toContain("CURRENT document:");
+        if (messages.includes(failedRevisionPrompt)) {
+          expect(messages).toContain("Route through Facilities.");
+          expect(messages).toContain("department");
+        }
+      } else {
+        upstreamCalls += 1;
+        expect(messages).toContain("Create an equipment request form");
+      }
       expect(requestBody.model).toBe(model);
-      expect(JSON.stringify(requestBody.messages)).toContain(
-        "Create an equipment request form"
-      );
       expect(
         requestBody.tools?.some(
           (tool) => tool.function?.name === "create_template_docx"
@@ -11708,7 +15908,13 @@ test("Ticket 17 AI Authoring requires Admin consent and uploads a validated DOCX
         notifyProviderBlocked();
         await providerResponseGate;
       }
-      const toolCall = forcedToolCalls.shift() ?? upstreamCalls % 2 === 1;
+      const toolCall =
+        forcedToolCalls.shift() ??
+        (isRevision ? revisionCalls % 2 === 1 : upstreamCalls % 2 === 1);
+      const template = isRevision ? revisedTemplate : generatedTemplate;
+      const toolArguments = messages.includes(failedRevisionPrompt)
+        ? omittedTemplate
+        : template;
       const completionChunks = toolCall
         ? [
             {
@@ -11717,10 +15923,10 @@ test("Ticket 17 AI Authoring requires Admin consent and uploads a validated DOCX
                 tool_calls: [
                   {
                     function: {
-                      arguments: JSON.stringify(generatedTemplate),
+                      arguments: JSON.stringify(toolArguments),
                       name: "create_template_docx",
                     },
-                    id: `call-${upstreamCalls}`,
+                    id: `call-${upstreamCalls}-${revisionCalls}`,
                     index: 0,
                     type: "function",
                   },
@@ -11735,7 +15941,9 @@ test("Ticket 17 AI Authoring requires Admin consent and uploads a validated DOCX
           : [
               {
                 delta: {
-                  content: "Created Equipment Request with one tagged field.",
+                  content: isRevision
+                    ? "Updated Equipment Request with Department and Facilities routing."
+                    : "Created Equipment Request with one tagged field.",
                   role: "assistant",
                 },
                 finish_reason: null,
@@ -11750,7 +15958,7 @@ test("Ticket 17 AI Authoring requires Admin consent and uploads a validated DOCX
             JSON.stringify({
               choices: [{ index: 0, ...chunk }],
               created: createdAt,
-              id: `chatcmpl-${upstreamCalls}`,
+              id: `chatcmpl-${upstreamCalls}-${revisionCalls}`,
               model,
               object: "chat.completion.chunk",
             }),
@@ -11808,6 +16016,7 @@ test("Ticket 17 AI Authoring requires Admin consent and uploads a validated DOCX
         downloadUrl: string;
         fields: { label: string; placeholder: string; tag: string }[];
         paragraphs: string[];
+        turns: { assistantMessage: string; prompt: string }[];
         sessionId: string;
         title: string;
       };
@@ -11839,6 +16048,7 @@ test("Ticket 17 AI Authoring requires Admin consent and uploads a validated DOCX
   let otherAdminBearer = "";
   let userBearer = "";
   let mutationActorBearer = "";
+  let sameUserOtherBearer = "";
   let deletionActorBearer = "";
   let cleanupTargetBearer = "";
   let activeSessionId: string | undefined;
@@ -11951,9 +16161,9 @@ test("Ticket 17 AI Authoring requires Admin consent and uploads a validated DOCX
             method: "POST",
           })
         )
-        .catch(() => undefined);
+        .catch(() => {});
       releaseBody();
-      await delayedCreate?.catch(() => undefined);
+      await delayedCreate?.catch(() => {});
     }
     const unauthenticatedStatus = await aiApp.handle(
       new Request("http://test.local/api/admin/ai-authoring")
@@ -12054,9 +16264,72 @@ test("Ticket 17 AI Authoring requires Admin consent and uploads a validated DOCX
     expect(first.session.description).toBe(generatedTemplate.description);
     expect(first.session.paragraphs).toEqual(generatedTemplate.paragraphs);
     expect(first.session.fields).toEqual(generatedTemplate.fields);
-    expect(first.session.assistantMessage).toContain("Created Equipment Request");
+    expect(first.session.assistantMessage).toContain(
+      "Created Equipment Request"
+    );
     expect(await temporaryDirectories()).toContain(first.directory);
     expect(firstDirectories.has(first.directory)).toBe(false);
+    expect(upstreamCalls).toBe(2);
+    expect(first.session.turns).toEqual([
+      {
+        assistantMessage: first.session.assistantMessage,
+        prompt: "Create an equipment request form",
+      },
+    ]);
+    const currentUrl = "http://test.local/api/admin/ai-authoring/sessions/current";
+    const revisionUrl = `http://test.local/api/admin/ai-authoring/sessions/${first.session.sessionId}/revisions`;
+    const currentBeforeRevision = await aiApp.handle(
+      new Request(currentUrl, {
+        headers: { Authorization: `Bearer ${adminBearer}` },
+      })
+    );
+    expect(currentBeforeRevision.status).toBe(200);
+    expect(await currentBeforeRevision.json()).toEqual({
+      session: first.session,
+    });
+    sameUserOtherBearer = await bearerFor(admin.email, adminPassword);
+    for (const authorization of [sameUserOtherBearer, otherAdminBearer]) {
+      const otherCurrent = await aiApp.handle(
+        new Request(currentUrl, {
+          headers: { Authorization: `Bearer ${authorization}` },
+        })
+      );
+      expect(otherCurrent.status).toBe(200);
+      expect(await otherCurrent.json()).toEqual({ session: null });
+      const otherRevision = await aiApp.handle(
+        new Request(revisionUrl, {
+          body: JSON.stringify({ consent: true, prompt: revisionPrompt }),
+          headers: {
+            ...jsonHeaders,
+            Authorization: `Bearer ${authorization}`,
+          },
+          method: "POST",
+        })
+      );
+      expect(otherRevision.status).toBe(404);
+    }
+    const userCurrent = await aiApp.handle(
+      new Request(currentUrl, {
+        headers: { Authorization: `Bearer ${userBearer}` },
+      })
+    );
+    expect(userCurrent.status).toBe(403);
+    const anonymousCurrent = await aiApp.handle(new Request(currentUrl));
+    expect(anonymousCurrent.status).toBe(401);
+    const duplicateCreate = await aiApp.handle(
+      new Request("http://test.local/api/admin/ai-authoring/sessions", {
+        body: JSON.stringify({
+          consent: true,
+          prompt: "Create another equipment request form",
+        }),
+        headers: {
+          ...jsonHeaders,
+          Authorization: `Bearer ${adminBearer}`,
+        },
+        method: "POST",
+      })
+    );
+    expect(duplicateCreate.status).toBe(409);
     expect(upstreamCalls).toBe(2);
 
     const unauthenticatedDownload = await aiApp.handle(
@@ -12091,14 +16364,16 @@ test("Ticket 17 AI Authoring requires Admin consent and uploads a validated DOCX
       })
     );
     expect(downloadResponse.status).toBe(200);
-    expect(downloadResponse.headers.get("content-type")).toBe(DOCX_CONTENT_TYPE);
+    expect(downloadResponse.headers.get("content-type")).toBe(
+      DOCX_CONTENT_TYPE
+    );
     expect(downloadResponse.headers.get("cache-control")).toBe(
       "private, no-store"
     );
-    const documentBytes = new Uint8Array(
+    const initialDocumentBytes = new Uint8Array(
       await downloadResponse.arrayBuffer()
     );
-    const archive = unzipSync(documentBytes);
+    const archive = unzipSync(initialDocumentBytes);
     const documentXmlBytes = archive["word/document.xml"];
     if (!documentXmlBytes) {
       throw new Error("AI Authoring did not return a DOCX document part");
@@ -12110,6 +16385,100 @@ test("Ticket 17 AI Authoring requires Admin consent and uploads a validated DOCX
     expect(documentXml).toContain("<w:sdt>");
     expect(documentXml).toContain('<w:tag w:val="employee_name"/>');
     expect(documentXml).toContain("Enter employee name");
+    const noRevisionConsent = await aiApp.handle(
+      new Request(revisionUrl, {
+        body: JSON.stringify({ consent: false, prompt: revisionPrompt }),
+        headers: {
+          ...jsonHeaders,
+          Authorization: `Bearer ${adminBearer}`,
+        },
+        method: "POST",
+      })
+    );
+    expect(noRevisionConsent.status).toBe(428);
+    const revisedResponse = await aiApp.handle(
+      new Request(revisionUrl, {
+        body: JSON.stringify({ consent: true, prompt: revisionPrompt }),
+        headers: {
+          ...jsonHeaders,
+          Authorization: `Bearer ${adminBearer}`,
+        },
+        method: "POST",
+      })
+    );
+    expect(revisedResponse.status).toBe(200);
+    const { session: revised } = (await revisedResponse.json()) as {
+      session: typeof first.session;
+    };
+    expect(revisionCalls).toBe(2);
+    expect(revised.sessionId).toBe(first.session.sessionId);
+    expect(revised.downloadUrl).toBe(first.session.downloadUrl);
+    expect(revised.fields).toEqual(revisedTemplate.fields);
+    expect(revised.paragraphs).toEqual(revisedTemplate.paragraphs);
+    expect(revised.turns).toEqual([
+      {
+        assistantMessage: first.session.assistantMessage,
+        prompt: "Create an equipment request form",
+      },
+      {
+        assistantMessage:
+          "Updated Equipment Request with Department and Facilities routing.",
+        prompt: revisionPrompt,
+      },
+    ]);
+    const restoredResponse = await aiApp.handle(
+      new Request(currentUrl, {
+        headers: { Authorization: `Bearer ${adminBearer}` },
+      })
+    );
+    expect(restoredResponse.status).toBe(200);
+    expect(await restoredResponse.json()).toEqual({ session: revised });
+    expect(await temporaryDirectories()).toContain(first.directory);
+    const revisedDownload = await aiApp.handle(
+      new Request(`http://test.local${revised.downloadUrl}`, {
+        headers: { Authorization: `Bearer ${adminBearer}` },
+      })
+    );
+    expect(revisedDownload.status).toBe(200);
+    const documentBytes = new Uint8Array(await revisedDownload.arrayBuffer());
+    expect(documentBytes).not.toEqual(initialDocumentBytes);
+    const revisedXmlBytes = unzipSync(documentBytes)["word/document.xml"];
+    if (!revisedXmlBytes) {
+      throw new Error("Revised AI Authoring DOCX has no document part");
+    }
+    const revisedXml = new TextDecoder().decode(revisedXmlBytes);
+    expect(revisedXml).toContain("Complete each field.");
+    expect(revisedXml).toContain('<w:tag w:val="employee_name"/>');
+    expect(revisedXml).toContain("Route through Facilities.");
+    expect(revisedXml).toContain('<w:tag w:val="department"/>');
+    expect(revisedXml).toContain("Enter department");
+    const failedRevision = await aiApp.handle(
+      new Request(revisionUrl, {
+        body: JSON.stringify({ consent: true, prompt: failedRevisionPrompt }),
+        headers: {
+          ...jsonHeaders,
+          Authorization: `Bearer ${adminBearer}`,
+        },
+        method: "POST",
+      })
+    );
+    expect(failedRevision.status).toBe(502);
+    const afterFailedRevision = await aiApp.handle(
+      new Request(currentUrl, {
+        headers: { Authorization: `Bearer ${adminBearer}` },
+      })
+    );
+    expect(await afterFailedRevision.json()).toEqual({ session: revised });
+    const retainedDownload = await aiApp.handle(
+      new Request(`http://test.local${revised.downloadUrl}`, {
+        headers: { Authorization: `Bearer ${adminBearer}` },
+      })
+    );
+    expect(retainedDownload.status).toBe(200);
+    expect(new Uint8Array(await retainedDownload.arrayBuffer())).toEqual(
+      documentBytes
+    );
+    expect(await temporaryDirectories()).toContain(first.directory);
 
     const uploadResponse = await aiApp.handle(
       formCreationRequest({
@@ -12170,6 +16539,12 @@ test("Ticket 17 AI Authoring requires Admin consent and uploads a validated DOCX
       })
     );
     expect(endedDownload.status).toBe(404);
+    const endedCurrent = await aiApp.handle(
+      new Request(currentUrl, {
+        headers: { Authorization: `Bearer ${adminBearer}` },
+      })
+    );
+    expect(await endedCurrent.json()).toEqual({ session: null });
 
     omitAssistantSummary = true;
     const second = await createPreview(adminBearer);
@@ -12195,35 +16570,65 @@ test("Ticket 17 AI Authoring requires Admin consent and uploads a validated DOCX
     expect(expiredSession.status).toBe(404);
     activeSessionId = undefined;
     expect(await temporaryDirectories()).not.toContain(second.directory);
+    const expiredCurrent = await aiApp.handle(
+      new Request(currentUrl, {
+        headers: { Authorization: `Bearer ${adminBearer}` },
+      })
+    );
+    expect(await expiredCurrent.json()).toEqual({ session: null });
 
     const third = await createPreview(adminBearer);
     activeSessionId = third.session.sessionId;
+    const signOutWorkspace = await aiApp.handle(
+      new Request("http://test.local/api/auth/sign-out", {
+        headers: { Authorization: `Bearer ${adminBearer}` },
+        method: "POST",
+      })
+    );
+    expect(signOutWorkspace.status).toBe(200);
+    signedOut = true;
+    activeSessionId = undefined;
+    expect(await temporaryDirectories()).not.toContain(third.directory);
+    const signedOutCurrent = await aiApp.handle(
+      new Request("http://test.local/api/admin/ai-authoring/sessions/current", {
+        headers: { Authorization: `Bearer ${adminBearer}` },
+      })
+    );
+    expect(signedOutCurrent.status).toBe(401);
+    adminBearer = await bearerFor(admin.email, adminPassword);
+    signedOut = false;
+    const newAuthSessionCurrent = await aiApp.handle(
+      new Request(currentUrl, {
+        headers: { Authorization: `Bearer ${adminBearer}` },
+      })
+    );
+    expect(await newAuthSessionCurrent.json()).toEqual({ session: null });
     const agentPrototype = AgentSession.prototype as unknown as Record<
       string,
       unknown
     >;
-    const originalNormalizePromptImages =
-      agentPrototype._normalizePromptImages;
+    const originalNormalizePromptImages = agentPrototype._normalizePromptImages;
     if (typeof originalNormalizePromptImages !== "function") {
-      throw new Error("Pi AgentSession lacks prompt image normalization");
+      throw new TypeError("Pi AgentSession lacks prompt image normalization");
     }
     const normalizePromptImages = originalNormalizePromptImages as (
       this: AgentSession,
       images: unknown
     ) => Promise<unknown>;
     const originalAbort = AgentSession.prototype.abort;
-    agentPrototype._normalizePromptImages = async function (
-      this: AgentSession,
-      images: unknown
-    ): Promise<unknown> {
-      if (blockNextPromptPreflight) {
-        blockNextPromptPreflight = false;
-        notifyPromptPreflightPaused();
-        await promptPreflightGate;
-      }
-      return await normalizePromptImages.call(this, images);
-    };
-    AgentSession.prototype.abort = async function (
+    agentPrototype._normalizePromptImages =
+      async function _normalizePromptImages(
+        this: AgentSession,
+        images: unknown
+      ): Promise<unknown> {
+        if (blockNextPromptPreflight) {
+          blockNextPromptPreflight = false;
+          notifyPromptPreflightPaused();
+          await promptPreflightGate;
+        }
+        return await normalizePromptImages.call(this, images);
+      };
+    AgentSession.prototype.abort = async function abort(
       this: AgentSession
     ): Promise<void> {
       notifyPromptAbortRequested();
@@ -12256,7 +16661,9 @@ test("Ticket 17 AI Authoring requires Admin consent and uploads a validated DOCX
     expect(preflightDirectories).toHaveLength(1);
     const preflightDirectory = preflightDirectories[0];
     if (!preflightDirectory) {
-      throw new Error("Preflight AI Authoring did not create its temporary directory");
+      throw new Error(
+        "Preflight AI Authoring did not create its temporary directory"
+      );
     }
     const signOutPreflight = aiApp.handle(
       new Request("http://test.local/api/auth/sign-out", {
@@ -12282,6 +16689,17 @@ test("Ticket 17 AI Authoring requires Admin consent and uploads a validated DOCX
 
     forcedToolCalls = [true, false];
     const laterSession = await createPreview(otherAdminBearer);
+    const endLaterSession = await aiApp.handle(
+      new Request(
+        `http://test.local/api/admin/ai-authoring/sessions/${laterSession.session.sessionId}`,
+        {
+          headers: { Authorization: `Bearer ${otherAdminBearer}` },
+          method: "DELETE",
+        }
+      )
+    );
+    expect(endLaterSession.status).toBe(200);
+    expect(await temporaryDirectories()).not.toContain(laterSession.directory);
     const directoriesBeforePending = new Set(await temporaryDirectories());
     blockNextProviderRequest = true;
     const pendingCreate = aiApp.handle(
@@ -12304,12 +16722,18 @@ test("Ticket 17 AI Authoring requires Admin consent and uploads a validated DOCX
     expect(pendingDirectories).toHaveLength(1);
     const pendingDirectory = pendingDirectories[0];
     if (!pendingDirectory) {
-      throw new Error("Pending AI Authoring did not create its temporary directory");
+      throw new Error(
+        "Pending AI Authoring did not create its temporary directory"
+      );
     }
-    const pendingDisposeError = new Error("Pending AI authoring cleanup failed");
+    const pendingDisposeError = new Error(
+      "Pending AI authoring cleanup failed"
+    );
     const originalDispose = AgentSession.prototype.dispose;
     let pendingDisposeFailed = false;
-    AgentSession.prototype.dispose = function (this: AgentSession): void {
+    AgentSession.prototype.dispose = function dispose(
+      this: AgentSession
+    ): void {
       if (!pendingDisposeFailed) {
         pendingDisposeFailed = true;
         throw pendingDisposeError;
@@ -12467,7 +16891,7 @@ test("Ticket 17 AI Authoring requires Admin consent and uploads a validated DOCX
     AgentSession.prototype.dispose = () => {
       throw new Error("Pi disposal failed");
     };
-    Uint8Array.prototype.fill = function (
+    Uint8Array.prototype.fill = function fill(
       this: Uint8Array,
       value: number,
       start?: number,
@@ -12548,7 +16972,7 @@ test("Ticket 17 AI Authoring requires Admin consent and uploads a validated DOCX
             method: "DELETE",
           })
         )
-        .catch(() => undefined);
+        .catch(() => {});
     }
     if (activeSessionId && adminBearer && !signedOut) {
       await aiApp
@@ -12561,7 +16985,7 @@ test("Ticket 17 AI Authoring requires Admin consent and uploads a validated DOCX
             }
           )
         )
-        .catch(() => undefined);
+        .catch(() => {});
     }
     if (adminBearer && !signedOut) {
       await aiApp
@@ -12571,10 +16995,11 @@ test("Ticket 17 AI Authoring requires Admin consent and uploads a validated DOCX
             method: "POST",
           })
         )
-        .catch(() => undefined);
+        .catch(() => {});
     }
     for (const bearer of [
       otherAdminBearer,
+      sameUserOtherBearer,
       userBearer,
       mutationActorBearer,
       deletionActorBearer,
@@ -12588,7 +17013,7 @@ test("Ticket 17 AI Authoring requires Admin consent and uploads a validated DOCX
               method: "POST",
             })
           )
-          .catch(() => undefined);
+          .catch(() => {});
       }
     }
     upstream.stop(true);

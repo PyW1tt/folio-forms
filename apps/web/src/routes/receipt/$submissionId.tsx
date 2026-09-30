@@ -40,9 +40,7 @@ const ReceiptRoute = () => {
   const [revisions, setRevisions] = useState<
     ResponseRevisionsResponse["revisions"]
   >([]);
-  const [viewRevision, setViewRevision] = useState<"original" | "latest">(
-    "latest"
-  );
+  const [viewRevision, setViewRevision] = useState(0);
   const [returnUrl, setReturnUrl] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -63,7 +61,7 @@ const ReceiptRoute = () => {
           `/api/responses/${payload.submission.responseId}/corrections`
         );
         if (!cancelled) {
-          setViewRevision("latest");
+          setViewRevision(history.latestRevision);
           setData(payload.data);
           setFields(payload.fields);
           setRevisions(history.revisions);
@@ -113,18 +111,15 @@ const ReceiptRoute = () => {
     );
   }
 
-  const latestRevision = revisions.at(-1)?.revision ?? 0;
-  const selectedRevision = viewRevision === "latest" ? latestRevision : 0;
+  const selectedRevision = viewRevision;
   const selectedRevisionRecord = revisions.find(
     (revision) => revision.revision === selectedRevision
   );
   const displayedData = selectedRevisionRecord?.data ?? data ?? {};
   const selectedPictures = selectedRevisionRecord?.pictures ?? null;
-  const revisionQuery = viewRevision === "latest" ? "?revision=latest" : "";
+  const revisionQuery = `?revision=${selectedRevision}`;
   const revisionSuffix =
-    viewRevision === "latest" && latestRevision > 0
-      ? `-revision-${latestRevision}`
-      : "";
+    selectedRevision > 0 ? `-revision-${selectedRevision}` : "";
   const download = async (format: "docx" | "pdf") => {
     await downloadArtifact(
       `/api/submissions/${submissionId}/${format}${revisionQuery}`,
@@ -162,23 +157,26 @@ const ReceiptRoute = () => {
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-3 border-b border-[var(--line)] p-5">
-            <span className="text-sm font-semibold">ฉบับที่ดู</span>
-            <button
-              type="button"
-              aria-pressed={viewRevision === "original"}
-              onClick={() => setViewRevision("original")}
-              className="inline-flex min-h-10 items-center rounded-[10px] border border-[var(--line-strong)] bg-[var(--paper)] px-3 text-sm font-semibold hover:border-[var(--ink)]"
+            <label
+              className="text-sm font-semibold"
+              htmlFor="receipt-revision"
             >
-              เดิม
-            </button>
-            <button
-              type="button"
-              aria-pressed={viewRevision === "latest"}
-              onClick={() => setViewRevision("latest")}
-              className="inline-flex min-h-10 items-center rounded-[10px] border border-[var(--line-strong)] bg-[var(--paper)] px-3 text-sm font-semibold hover:border-[var(--ink)]"
+              ฉบับที่ดู
+            </label>
+            <select
+              id="receipt-revision"
+              value={viewRevision}
+              onChange={(event) => setViewRevision(Number(event.target.value))}
+              className="min-h-10 rounded-[10px] border border-[var(--line-strong)] bg-[var(--paper)] px-3 text-sm font-semibold"
             >
-              ล่าสุด{latestRevision > 0 ? ` (Correction ${latestRevision})` : ""}
-            </button>
+              {revisions.map((revision) => (
+                <option key={revision.revision} value={revision.revision}>
+                  {revision.revision === 0
+                    ? "Submission เดิม"
+                    : `Correction ${revision.revision}`}
+                </option>
+              ))}
+            </select>
             <button
               type="button"
               onClick={() => download("docx")}

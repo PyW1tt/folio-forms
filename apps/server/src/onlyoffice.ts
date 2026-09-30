@@ -1,5 +1,5 @@
 // oxlint-disable func-style no-await-in-loop -- Preserve function contracts; bounded streams must be consumed sequentially.
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 
 import { env } from "@onlyoffice/env/server";
@@ -132,6 +132,7 @@ export interface EditorOptions {
   };
   publicId: string;
   responseId?: string;
+  tagAliases?: Record<string, string>;
 }
 
 interface ConverterResponse {
@@ -562,10 +563,12 @@ export function readOnlyViewerConfig(
   };
 }
 
-
 export interface OnlyOfficeClient {
   forceSave: (documentKey: string, userdata: string) => Promise<boolean>;
-  convertDocxToPdf: (documentKey: string) => Promise<Uint8Array>;
+  convertDocxToPdf: (
+    documentKey: string,
+    pdfOnly?: boolean
+  ) => Promise<Uint8Array>;
 }
 
 export interface OnlyOfficeClientOptions {
@@ -575,9 +578,14 @@ export interface OnlyOfficeClientOptions {
   maxDownloadBytes?: number;
 }
 
-function documentUrlFor(documentKey: string, baseUrl: string): string {
+function documentUrlFor(
+  documentKey: string,
+  baseUrl: string,
+  pdfOnly = false
+): string {
   const token = createDocumentAccessToken(documentKey);
-  return `${trimOrigin(baseUrl)}/onlyoffice/document/${encodeURIComponent(documentKey)}?token=${encodeURIComponent(token)}`;
+  const pdfParameter = pdfOnly ? "&pdf=1" : "";
+  return `${trimOrigin(baseUrl)}/onlyoffice/document/${encodeURIComponent(documentKey)}?token=${encodeURIComponent(token)}${pdfParameter}`;
 }
 
 function converterResponseError(payload: unknown): string | null {
@@ -653,15 +661,16 @@ export function createOnlyOfficeClient(
     options.maxDownloadBytes ?? maxOnlyOfficeDownloadBytes;
 
   return {
-    async convertDocxToPdf(documentKey): Promise<Uint8Array> {
+    async convertDocxToPdf(documentKey, pdfOnly = false): Promise<Uint8Array> {
+      const conversionKey = pdfOnly ? randomUUID() : documentKey;
       const endpoint = `${trimOrigin(internalUrl)}/converter?shardkey=${encodeURIComponent(documentKey)}`;
       const conversion = {
         async: false,
         filetype: "docx",
-        key: documentKey,
+        key: conversionKey,
         outputtype: "pdf",
-        title: `${documentKey}.docx`,
-        url: documentUrlFor(documentKey, documentBaseUrl),
+        title: `${conversionKey}.docx`,
+        url: documentUrlFor(documentKey, documentBaseUrl, pdfOnly),
       };
       const response = await request(endpoint, {
         body: JSON.stringify(conversion),

@@ -9,9 +9,9 @@ import { useEffect, useRef, useState } from "react";
 
 import { Button, Card, Input, Notice, Spinner } from "@/components/ui";
 import {
-  API_ORIGIN,
   legacySsoEnabled as checkLegacySsoEnabled,
   safeReturnPath,
+  startLegacySso as beginLegacySso,
 } from "@/lib/api";
 import { authErrorMessage, roleFor, useAuth } from "@/lib/auth";
 
@@ -35,17 +35,19 @@ const LoginRoute = () => {
 
   useEffect(() => {
     let active = true;
-    void checkLegacySsoEnabled()
-      .then((enabled) => {
+    const loadLegacySsoAvailability = async () => {
+      try {
+        const enabled = await checkLegacySsoEnabled();
         if (active) {
           setLegacySsoAvailable(enabled);
         }
-      })
-      .catch(() => {
+      } catch {
         if (active) {
           setLegacySsoAvailable(false);
         }
-      });
+      }
+    };
+    void loadLegacySsoAvailability();
     return () => {
       active = false;
     };
@@ -58,7 +60,7 @@ const LoginRoute = () => {
   }, [legacySso]);
 
   useEffect(() => {
-    if (!user) {
+    if (!user || legacySso) {
       return;
     }
 
@@ -82,13 +84,43 @@ const LoginRoute = () => {
     };
 
     void redirect();
-  }, [navigate, returnTo, user]);
+  }, [legacySso, navigate, returnTo, user]);
 
   if (authLoading) {
     return (
       <div className="grid min-h-screen place-items-center gap-3 bg-[var(--ink)] text-sm text-[var(--paper)]">
         <Spinner />
         <span>กำลังตรวจสอบเซสชัน…</span>
+      </div>
+    );
+  }
+  if (user && legacySso) {
+    const pending = legacySso === "pending";
+    const destination = returnTo ?? "/dashboard";
+    return (
+      <div className="grid min-h-screen place-items-center bg-[var(--ink)] px-5 py-12">
+        <Card className="w-full max-w-[440px] p-6 sm:p-8">
+          <h1 className="text-2xl font-bold">สถานะบัญชีระบบเดิม</h1>
+          <p className="mt-2 text-sm text-[var(--ink-soft)]">
+            บัญชีปัจจุบัน: {user.name ?? user.email}
+          </p>
+          <div className="mt-5">
+            <Notice tone={pending ? "neutral" : "danger"}>
+              {pending
+                ? "บัญชีระบบเดิมกำลังรอผู้ดูแลตรวจสอบ เซสชัน Folio ปัจจุบันยังใช้งานได้"
+                : "ไม่สามารถเปลี่ยนบัญชีผ่านระบบเดิมได้ เซสชัน Folio ปัจจุบันยังไม่เปลี่ยน"}
+            </Notice>
+          </div>
+          <Button
+            className="mt-5 w-full"
+            onClick={async () => {
+              await navigate({ replace: true, to: destination });
+            }}
+            type="button"
+          >
+            กลับไปทำงานต่อ
+          </Button>
+        </Card>
       </div>
     );
   }
@@ -132,12 +164,16 @@ const LoginRoute = () => {
       setBusy(false);
     }
   };
-  const startLegacySso = () => {
-    const startUrl = new URL("/api/legacy-sso/start", API_ORIGIN);
-    if (returnTo) {
-      startUrl.searchParams.set("returnTo", returnTo);
+  const startLegacySso = async () => {
+    setError(null);
+    setBusy(true);
+    try {
+      const { authorizationUrl } = await beginLegacySso(returnTo);
+      window.location.assign(authorizationUrl);
+    } catch {
+      setError("ไม่สามารถเริ่มเข้าสู่ระบบผ่านระบบเดิมได้ กรุณาลองอีกครั้ง");
+      setBusy(false);
     }
-    window.location.assign(startUrl.href);
   };
 
   return (
@@ -159,6 +195,14 @@ const LoginRoute = () => {
           {error ? (
             <div ref={errorRef} id="login-error" className="mt-5" tabIndex={-1}>
               <Notice tone="danger">{error}</Notice>
+            </div>
+          ) : null}
+          {legacySso === "pending" ? (
+            <div className="mt-5">
+              <Notice tone="neutral">
+                คำขอเชื่อมบัญชีกำลังรอผู้ดูแลระบบตรวจสอบ คุณยังไม่ได้เข้าสู่ระบบ ใช้บัญชี Folio
+                Forms เดิม หรือลองเข้าสู่ระบบผ่านระบบเดิมอีกครั้งหลังอนุมัติ
+              </Notice>
             </div>
           ) : null}
           {success ? (
@@ -222,6 +266,7 @@ const LoginRoute = () => {
                 type="button"
                 variant="secondary"
                 onClick={startLegacySso}
+                disabled={busy}
               >
                 <LockKeyhole size={17} />
                 เข้าสู่ระบบผ่านระบบเดิม
@@ -241,6 +286,8 @@ export const Route = createFileRoute("/login")({
   component: LoginRoute,
   validateSearch: (search) => ({
     returnTo: safeReturnPath(search.returnTo) ?? undefined,
-    ...(search.legacySso === "failed" ? { legacySso: "failed" as const } : {}),
+    ...(search.legacySso === "failed" || search.legacySso === "pending"
+      ? { legacySso: search.legacySso }
+      : {}),
   }),
 });

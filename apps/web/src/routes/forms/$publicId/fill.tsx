@@ -10,9 +10,10 @@ import {
 import { ArrowLeft, CheckCircle2, Monitor } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
+import { LegacySsoSwitchButton } from "@/components/legacy-sso-switch-button";
+import { NativeForm } from "@/components/native-form";
+import type { NativeFormField } from "@/components/native-form";
 import { OnlyOfficeEditor } from "@/components/onlyoffice-editor";
-import { NativeTextForm } from "@/components/native-text-form";
-import type { NativeTextField } from "@/components/native-text-form";
 import type { EditorBridgeMessage } from "@/components/onlyoffice-editor";
 import { Button, Notice, Spinner } from "@/components/ui";
 import {
@@ -20,13 +21,13 @@ import {
   apiDelete,
   apiGet,
   apiPost,
-  waitForOperation,
+  apiPostFormData,
   downloadArtifact,
   safeReturnPath,
+  waitForOperation,
 } from "@/lib/api";
-import type { Operation } from "@/lib/api";
-import type { FillMethod } from "@/lib/api";
-import { useAuth } from "@/lib/auth";
+import type { FillMethod, Operation } from "@/lib/api";
+import { roleFor, useAuth } from "@/lib/auth";
 import {
   createDeferred,
   isSaveFlowBusy,
@@ -93,23 +94,69 @@ interface NativeEditorConfig {
   capabilities: Record<"save-draft" | "submit", string>;
   data: Record<string, unknown>;
   documentKey: string;
-  fields: NativeTextField[];
+  fields: NativeFormField[];
   fillMethod: "native";
   lockedFields: Record<string, boolean>;
+  pictures: Record<string, boolean>;
   responseId: string;
 }
 
 const nativeValuesFromConfig = (
   config: NativeEditorConfig
-): Record<string, string> => {
-  const values: Record<string, string> = {};
+): Record<string, unknown> => {
+  const values: Record<string, unknown> = {};
   for (const field of config.fields) {
     const value = config.data[field.tag];
-    values[field.tag] = typeof value === "string" ? value : "";
+    switch (field.type) {
+      case "checkbox": {
+        values[field.tag] = value === true;
+        break;
+      }
+      case "combo":
+      case "dropdown": {
+        values[field.tag] = typeof value === "string" ? value : null;
+        break;
+      }
+      case "picture": {
+        values[field.tag] = "";
+        break;
+      }
+      default: {
+        values[field.tag] = typeof value === "string" ? value : "";
+      }
+    }
   }
   return values;
 };
 
+const nativeSaveSuccessMessage = (
+  exportFormat: ExportFormat | null | undefined
+): string => {
+  if (exportFormat === "docx") {
+    return "บันทึกและดาวน์โหลด DOCX แล้ว";
+  }
+  if (exportFormat === "pdf") {
+    return "บันทึกและดาวน์โหลด PDF แล้ว";
+  }
+  return "บันทึกฉบับร่างคำตอบแล้ว";
+};
+
+const nativeSaveErrorMessage = (
+  action: "save-draft" | "submit",
+  saved: boolean,
+  exportFormat: ExportFormat | null | undefined
+): string => {
+  if (action === "submit") {
+    return "ส่งแบบฟอร์มไม่สำเร็จ กรุณาลองใหม่";
+  }
+  if (!saved) {
+    return "บันทึกฉบับร่างไม่สำเร็จ กรุณาลองใหม่";
+  }
+  if (exportFormat) {
+    return "บันทึกแล้ว แต่ดาวน์โหลดไฟล์ไม่สำเร็จ กรุณาลองใหม่";
+  }
+  return "บันทึกแล้ว แต่โหลดคำตอบล่าสุดไม่สำเร็จ กรุณาโหลดแบบฟอร์มใหม่";
+};
 // oxlint-disable-next-line complexity -- Coordinates the public form editor, draft lifecycle, and exit confirmation.
 const FillRoute = () => {
   const { publicId } = useParams({ from: "/forms/$publicId/fill" });
@@ -118,9 +165,14 @@ const FillRoute = () => {
   const navigate = useNavigate();
   const [form, setForm] = useState<PublicForm | null>(null);
   const [editorConfigUrl, setEditorConfigUrl] = useState<string | null>(null);
-  const [nativeConfig, setNativeConfig] =
-    useState<NativeEditorConfig | null>(null);
-  const [nativeValues, setNativeValues] = useState<Record<string, string>>({});
+  const [nativeConfig, setNativeConfig] = useState<NativeEditorConfig | null>(
+    null
+  );
+  const [nativeValues, setNativeValues] = useState<Record<string, unknown>>({});
+  const [nativePictureFiles, setNativePictureFiles] = useState<
+    Record<string, File>
+  >({});
+  const [pictureInputKey, setPictureInputKey] = useState(0);
   const [nativeSaving, setNativeSaving] = useState(false);
   const [editorRevision, setEditorRevision] = useState(0);
   const [activeResponseId, setActiveResponseId] = useState(responseId);
@@ -186,6 +238,7 @@ const FillRoute = () => {
     setEditorConfigUrl(null);
     setNativeConfig(null);
     setNativeValues({});
+    setNativePictureFiles({});
     setError(null);
     setHandoffError(false);
     const loadForm = async () => {
@@ -281,24 +334,23 @@ const FillRoute = () => {
         }
         const config =
           result.fillMethod === "native" && result.editorConfigUrl
-            ? await apiGet<
-                NativeEditorConfig | { fillMethod: "onlyoffice" }
-              >(result.editorConfigUrl)
+            ? await apiGet<NativeEditorConfig | { fillMethod: "onlyoffice" }>(
+                result.editorConfigUrl
+              )
             : null;
         if (cancelled) {
           return;
         }
         const fillMethod = config?.fillMethod ?? result.fillMethod;
         setActiveResponseId(result.response?.id ?? activeResponseId);
-        setForm((current) =>
-          current ? { ...current, fillMethod } : current
-        );
+        setForm((current) => (current ? { ...current, fillMethod } : current));
         if (config?.fillMethod === "native") {
           setNativeConfig(config);
           setNativeValues(nativeValuesFromConfig(config));
         } else {
           setNativeConfig(null);
           setNativeValues({});
+          setNativePictureFiles({});
         }
         setEditorConfigUrl(result.editorConfigUrl ?? null);
       } catch (caughtError) {
@@ -361,6 +413,11 @@ const FillRoute = () => {
           : (message.error ?? "การดำเนินการกับเอกสารไม่สำเร็จ กรุณาลองใหม่")
       );
       setSuccess(null);
+      if (message.action === "save-draft" && exitIntent === "reauth") {
+        setExitIntent(null);
+        reauthResolverRef.current?.(false);
+        reauthResolverRef.current = null;
+      }
       return;
     }
 
@@ -415,21 +472,155 @@ const FillRoute = () => {
       }
     }
   };
+  const loadLatestNativeConfig = async (
+    currentConfig: NativeEditorConfig,
+    configUrl: string
+  ): Promise<NativeEditorConfig> => {
+    const latestConfig = await apiGet<
+      NativeEditorConfig | { fillMethod: "onlyoffice" }
+    >(configUrl);
+    if (latestConfig.fillMethod !== "native") {
+      setForm((current) =>
+        current ? { ...current, fillMethod: "onlyoffice" } : current
+      );
+      setNativeConfig(null);
+      setNativePictureFiles({});
+      setNativeValues({});
+      throw new Error("The form Fill Method changed");
+    }
+    if (latestConfig.documentKey !== currentConfig.documentKey) {
+      setNativeConfig(latestConfig);
+      if (!dirty) {
+        setNativeValues(nativeValuesFromConfig(latestConfig));
+      }
+      throw new Error("The saved response changed in another session");
+    }
+    setNativeConfig(latestConfig);
+    return latestConfig;
+  };
+
+  const submitNativeResponse = async (
+    action: "save-draft" | "submit",
+    config: NativeEditorConfig
+  ): Promise<Operation> => {
+    const payload = {
+      data: Object.fromEntries(
+        config.fields
+          .filter((field) => field.type !== "picture")
+          .map((field): [string, unknown] => {
+            const value = nativeValues[field.tag];
+            return [
+              field.tag,
+              field.type === "date" && value === "" ? null : value,
+            ];
+          })
+      ),
+      documentKey: config.documentKey,
+      fillMethod: "native",
+      responseId: config.responseId,
+    };
+    const formData = new FormData();
+    formData.set("payload", JSON.stringify(payload));
+    for (const [tag, file] of Object.entries(nativePictureFiles)) {
+      formData.set(`picture:${tag}`, file);
+    }
+    const endpoint = action === "save-draft" ? "draft" : "submit";
+    const { operationId } = await apiPostFormData<{ operationId: string }>(
+      `/api/forms/${publicId}/${endpoint}`,
+      formData,
+      config.capabilities[action]
+    );
+    setOperation({ id: operationId, status: "pending" });
+    const completed = await waitForOperation(operationId, setOperation);
+    setOperation(completed);
+    return completed;
+  };
+
+  const refreshNativeResponse = async (configUrl: string): Promise<void> => {
+    const refreshedConfig = await apiGet<
+      NativeEditorConfig | { fillMethod: "onlyoffice" }
+    >(configUrl);
+    setForm((current) =>
+      current ? { ...current, fillMethod: refreshedConfig.fillMethod } : current
+    );
+    setNativePictureFiles({});
+    setPictureInputKey((key) => key + 1);
+    if (refreshedConfig.fillMethod === "native") {
+      setNativeConfig(refreshedConfig);
+      setNativeValues(nativeValuesFromConfig(refreshedConfig));
+    } else {
+      setNativeConfig(null);
+      setNativeValues({});
+    }
+    setDirty(false);
+    setOperationError(null);
+  };
+
+  const finishNativeSaveExit = async (): Promise<void> => {
+    const intent = exitIntent;
+    setSaveBeforeExit(false);
+    setExitIntent(null);
+    if (intent === "reauth") {
+      reauthResolverRef.current?.(true);
+      reauthResolverRef.current = null;
+      return;
+    }
+    allowNavigationRef.current = true;
+    if (intent === "dashboard") {
+      await navigate({ to: "/dashboard" });
+      return;
+    }
+    navigationBlockerRef.current?.proceed();
+  };
+  const finishNativeResponse = async (
+    action: "save-draft" | "submit",
+    completed: Operation,
+    options: { exitAfterSave?: boolean; exportFormat?: ExportFormat },
+    configUrl: string,
+    savedResponseId: string
+  ): Promise<void> => {
+    if (action === "submit") {
+      const submissionId = completed.result?.submissionId;
+      if (typeof submissionId !== "string") {
+        throw new TypeError("The submitted receipt is unavailable");
+      }
+      allowNavigationRef.current = true;
+      await navigate({
+        params: { submissionId },
+        to: "/receipt/$submissionId",
+      });
+      return;
+    }
+    await refreshNativeResponse(configUrl);
+    setSuccess(nativeSaveSuccessMessage(options.exportFormat));
+    if (options.exportFormat) {
+      await downloadArtifact(
+        `/api/responses/${savedResponseId}/draft/${options.exportFormat}`,
+        `response-${savedResponseId}.${options.exportFormat}`
+      );
+      setExportAfterSave(null);
+    }
+    if (options.exitAfterSave) {
+      await finishNativeSaveExit();
+    }
+  };
+
+  const nativeResponseSaveBlocked = (): boolean =>
+    nativeSaveGuardRef.current ||
+    operation?.status === "pending" ||
+    operation?.status === "processing" ||
+    Boolean(exportAfterSave) ||
+    saveBeforeExit ||
+    discardBusy;
+
   const saveNativeResponse = async (
     action: "save-draft" | "submit",
     options: { exitAfterSave?: boolean; exportFormat?: ExportFormat } = {}
-  ) => {
+  ): Promise<void> => {
     if (!activeResponseId || !nativeConfig || !editorConfigUrl) {
       return;
     }
-    if (
-      nativeSaveGuardRef.current ||
-      operation?.status === "pending" ||
-      operation?.status === "processing" ||
-      exportAfterSave ||
-      saveBeforeExit ||
-      discardBusy
-    ) {
+    if (nativeResponseSaveBlocked()) {
       return;
     }
     nativeSaveGuardRef.current = true;
@@ -441,116 +632,39 @@ const FillRoute = () => {
     setError(null);
     let saved = false;
     try {
-      const latestConfig = await apiGet<
-        NativeEditorConfig | { fillMethod: "onlyoffice" }
-      >(editorConfigUrl);
-      if (latestConfig.fillMethod !== "native") {
-        setForm((current) =>
-          current ? { ...current, fillMethod: "onlyoffice" } : current
-        );
-        setNativeConfig(null);
-        setNativeValues({});
-        throw new Error("The form Fill Method changed");
-      }
-      if (latestConfig.documentKey !== nativeConfig.documentKey) {
-        setNativeConfig(latestConfig);
-        if (!dirty) {
-          setNativeValues(nativeValuesFromConfig(latestConfig));
-        }
-        throw new Error("The saved response changed in another session");
-      }
-      setNativeConfig(latestConfig);
-      const endpoint = action === "save-draft" ? "draft" : "submit";
-      const { operationId } = await apiPost<{ operationId: string }>(
-        `/api/forms/${publicId}/${endpoint}`,
-        {
-          data: nativeValues,
-          documentKey: latestConfig.documentKey,
-          fillMethod: "native",
-          responseId: latestConfig.responseId,
-        },
-        latestConfig.capabilities[action]
+      const latestConfig = await loadLatestNativeConfig(
+        nativeConfig,
+        editorConfigUrl
       );
-      setOperation({ id: operationId, status: "pending" });
-      const completed = await waitForOperation(operationId, setOperation);
-      setOperation(completed);
+      const completed = await submitNativeResponse(action, latestConfig);
       saved = true;
-      setDirty(false);
       if (action === "submit") {
-        const submissionId = completed.result?.submissionId;
-        if (typeof submissionId !== "string") {
-          throw new Error("The submitted receipt is unavailable");
-        }
-        allowNavigationRef.current = true;
-        await navigate({
-          params: { submissionId },
-          to: "/receipt/$submissionId",
-        });
-        return;
+        setNativePictureFiles({});
+        setPictureInputKey((key) => key + 1);
+        setDirty(false);
       }
-      const refreshedConfig = await apiGet<
-        NativeEditorConfig | { fillMethod: "onlyoffice" }
-      >(editorConfigUrl);
-      setForm((current) =>
-        current
-          ? { ...current, fillMethod: refreshedConfig.fillMethod }
-          : current
+      await finishNativeResponse(
+        action,
+        completed,
+        options,
+        editorConfigUrl,
+        activeResponseId
       );
-      if (refreshedConfig.fillMethod === "native") {
-        setNativeConfig(refreshedConfig);
-        setNativeValues(nativeValuesFromConfig(refreshedConfig));
-      } else {
-        setNativeConfig(null);
-        setNativeValues({});
-      }
-      setOperationError(null);
-      setSuccess(
-        options.exportFormat
-          ? options.exportFormat === "docx"
-            ? "บันทึกและดาวน์โหลด DOCX แล้ว"
-            : "บันทึกและดาวน์โหลด PDF แล้ว"
-          : "บันทึกฉบับร่างคำตอบแล้ว"
-      );
-      if (options.exportFormat) {
-        await downloadArtifact(
-          `/api/responses/${activeResponseId}/draft/${options.exportFormat}`,
-          `response-${activeResponseId}.${options.exportFormat}`
-        );
-        setExportAfterSave(null);
-      }
-      if (options.exitAfterSave) {
-        const intent = exitIntent;
-        setSaveBeforeExit(false);
-        if (intent === "reauth") {
-          setExitIntent(null);
-          reauthResolverRef.current?.(true);
-          reauthResolverRef.current = null;
-        } else if (intent === "dashboard") {
-          allowNavigationRef.current = true;
-          setExitIntent(null);
-          await navigate({ to: "/dashboard" });
-        } else {
-          allowNavigationRef.current = true;
-          navigationBlockerRef.current?.proceed();
-          setExitIntent(null);
-        }
-      }
     } catch (caughtError) {
       setSaveBeforeExit(false);
       setExportAfterSave(null);
       setOperationError(
         formRequestError(
           caughtError,
-          action === "submit"
-            ? "ส่งแบบฟอร์มไม่สำเร็จ กรุณาลองใหม่"
-            : saved
-              ? options.exportFormat
-                ? "บันทึกแล้ว แต่ดาวน์โหลดไฟล์ไม่สำเร็จ กรุณาลองใหม่"
-                : "บันทึกแล้ว แต่โหลดคำตอบล่าสุดไม่สำเร็จ กรุณาโหลดแบบฟอร์มใหม่"
-              : "บันทึกฉบับร่างไม่สำเร็จ กรุณาลองใหม่"
+          nativeSaveErrorMessage(action, saved, options.exportFormat)
         )
       );
       setSuccess(null);
+      if (options.exitAfterSave && exitIntent === "reauth") {
+        setExitIntent(null);
+        reauthResolverRef.current?.(false);
+        reauthResolverRef.current = null;
+      }
     } finally {
       nativeSaveGuardRef.current = false;
       setNativeSaving(false);
@@ -752,7 +866,7 @@ const FillRoute = () => {
         </h2>
         <p className="mt-2 text-sm text-[var(--ink-soft)]">
           {exitIntent === "reauth"
-            ? "บันทึกฉบับร่างก่อนเข้าสู่ระบบใหม่ หรือทิ้งข้อมูลที่ยังไม่ได้บันทึกอย่างถาวร"
+            ? "บันทึกฉบับร่างก่อนเข้าสู่ระบบเดิม หรืออยู่ต่อเพื่อยกเลิก"
             : "บันทึกฉบับร่างก่อนออกจากแบบฟอร์ม หรือทิ้งฉบับร่างนี้อย่างถาวร"}
         </p>
         {operationError ? (
@@ -761,15 +875,17 @@ const FillRoute = () => {
           </div>
         ) : null}
         <div className="mt-6 flex flex-wrap justify-end gap-2">
-          <Button
-            variant="secondary"
-            type="button"
-            onClick={discardDraft}
-            disabled={discardBusy || saveFlowBusy}
-          >
-            {discardBusy ? <Spinner /> : null}
-            {discardBusy ? "กำลังลบ…" : "ทิ้งฉบับร่าง"}
-          </Button>
+          {exitIntent === "reauth" ? null : (
+            <Button
+              variant="secondary"
+              type="button"
+              onClick={discardDraft}
+              disabled={discardBusy || saveFlowBusy}
+            >
+              {discardBusy ? <Spinner /> : null}
+              {discardBusy ? "กำลังลบ…" : "ทิ้งฉบับร่าง"}
+            </Button>
+          )}
           <Button
             type="button"
             onClick={saveAndExit}
@@ -813,7 +929,14 @@ const FillRoute = () => {
             </span>
             Folio Forms
           </div>
-          <span className="text-xs text-[var(--ink-soft)]">{user.email}</span>
+          <div className="flex flex-wrap items-center justify-end gap-2">
+            <span className="max-w-40 truncate text-xs text-[var(--ink-soft)]">
+              {user.email}
+            </span>
+            {roleFor(user) === "user" ? (
+              <LegacySsoSwitchButton compact />
+            ) : null}
+          </div>
         </div>
       </header>
       <main className="mx-auto max-w-[1240px] px-5 py-8 lg:px-8 lg:py-10">
@@ -823,8 +946,7 @@ const FillRoute = () => {
               {form.title}
             </h1>
             <p className="mt-2 max-w-2xl text-[var(--ink-soft)]">
-              {form.description ||
-                "กรอกข้อมูลด้านล่าง แล้วบันทึกฉบับร่างหรือส่งแบบฟอร์ม"}
+              {form.description || "กรอกข้อมูลด้านล่าง แล้วบันทึกฉบับร่างหรือส่งแบบฟอร์ม"}
             </p>
           </div>
           {nativeConfig ? (
@@ -860,7 +982,7 @@ const FillRoute = () => {
             </Notice>
           </div>
         ) : null}
-        {(operationBusy || nativeSaving) ? (
+        {operationBusy || nativeSaving ? (
           <div className="mb-4">
             <Notice>
               <span className="inline-flex items-center gap-2">
@@ -878,7 +1000,7 @@ const FillRoute = () => {
           </div>
         </div>
         {nativeConfig ? (
-          <NativeTextForm
+          <NativeForm
             fields={nativeConfig.fields}
             lockedFields={nativeConfig.lockedFields}
             operationBusy={
@@ -888,21 +1010,38 @@ const FillRoute = () => {
               saveBeforeExit
             }
             values={nativeValues}
+            pictures={nativeConfig.pictures}
+            pictureFiles={nativePictureFiles}
+            pictureInputKey={pictureInputKey}
             onChange={(tag, value) => {
               setNativeValues((current) => ({ ...current, [tag]: value }));
               setDirty(true);
               setOperationError(null);
             }}
+            onPictureChange={(tag, file) => {
+              setNativePictureFiles((current) => {
+                if (file) {
+                  return { ...current, [tag]: file };
+                }
+                return Object.fromEntries(
+                  Object.entries(current).filter(
+                    ([currentTag]) => currentTag !== tag
+                  )
+                );
+              });
+              setDirty(true);
+              setOperationError(null);
+            }}
             onExportDocx={() => saveAndExport("docx")}
             onExportPdf={() => saveAndExport("pdf")}
-            onSave={() => void saveNativeResponse("save-draft")}
-            onSubmit={() => void saveNativeResponse("submit")}
+            onSave={() => saveNativeResponse("save-draft")}
+            onSubmit={() => saveNativeResponse("submit")}
           />
         ) : (
           <>
             <div className="mb-4 rounded-[10px] border border-[var(--accent)]/35 bg-[var(--accent-soft)] px-4 py-3 text-sm text-[var(--ink)]">
-              <strong>ใช้แท็บ Form ในตัวแก้ไขเอกสาร</strong> เพื่อเลือกบันทึกฉบับร่างหรือส่งคำตอบ
-              ระบบจะแสดงความคืบหน้าที่นี่
+              <strong>ใช้แท็บ Form ในตัวแก้ไขเอกสาร</strong>{" "}
+              เพื่อเลือกบันทึกฉบับร่างหรือส่งคำตอบ ระบบจะแสดงความคืบหน้าที่นี่
             </div>
             <div className="mb-4 flex flex-wrap items-center justify-end gap-3 rounded-[10px] border border-[var(--line)] bg-[var(--paper)] px-4 py-3">
               <Button

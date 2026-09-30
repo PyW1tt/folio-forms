@@ -124,9 +124,13 @@ let pluginInitialized = false;
  * outer plugin scope: ONLYOFFICE serializes this function before execution.
  */
 function extractFormDataCommand() {
+  const scope =
+    typeof Asc !== "undefined" && Asc.scope ? Asc.scope : {};
+  const tagAliases = scope.formBridgeTagAliases || {};
   const doc = Api.GetDocument();
   const controls = doc.GetAllContentControls();
   const data = {};
+  const canonicalDateFields = [];
   function isPictureControlInsideCommand(control) {
     if (typeof control.IsPicture === "function") {
       try {
@@ -197,7 +201,10 @@ function extractFormDataCommand() {
   }
 
   for (const control of controls) {
-    const tag = control.GetTag();
+    const receivedTag = control.GetTag();
+    const rawTag = typeof receivedTag === "string" ? receivedTag.trim() : "";
+    const tag =
+      typeof tagAliases[rawTag] === "string" ? tagAliases[rawTag] : rawTag;
 
     if (!tag) {
       continue;
@@ -208,12 +215,64 @@ function extractFormDataCommand() {
     }
 
     const classType = control.GetClassType();
+    if (classType !== "inlineLvlSdt" && classType !== "blockLvlSdt") {
+      continue;
+    }
+
 
     /**
-     * Rich Text
+     * Checkbox
      *
-     * ONLYOFFICE represents this as blockLvlSdt.
+     * Return a real boolean instead of "☒" / "☐".
      */
+    if (
+      typeof control.IsCheckBox === "function" &&
+      control.IsCheckBox()
+    ) {
+      data[tag] = Boolean(control.IsCheckBoxChecked());
+      continue;
+    }
+
+    /**
+     * Date picker
+     *
+     * Normalize to YYYY-MM-DD without changing the calendar date for local
+     * Date objects returned by the Office API.
+     */
+    if (
+      typeof control.IsDatePicker === "function" &&
+      control.IsDatePicker()
+    ) {
+      const dateValue = formatDateInsideCommand(control.GetDate());
+      data[tag] = dateValue;
+      if (
+        typeof dateValue === "string" &&
+        /^\d{4}-\d{2}-\d{2}$/u.test(dateValue)
+      ) {
+        const parsedDate = new Date(`${dateValue}T00:00:00.000Z`);
+        if (
+          !Number.isNaN(parsedDate.getTime()) &&
+          parsedDate.toISOString().slice(0, 10) === dateValue
+        ) {
+          canonicalDateFields.push(tag);
+        }
+      }
+      continue;
+    }
+
+    /**
+     * Dropdown / Combo box
+     *
+     * Send visible text so the server can resolve the published option label.
+     */
+    if (
+      (typeof control.IsDropDownList === "function" &&
+        control.IsDropDownList()) ||
+      (typeof control.IsComboBox === "function" && control.IsComboBox())
+    ) {
+      data[tag] = getInlineTextInsideCommand(control);
+      continue;
+    }
     if (classType === "blockLvlSdt") {
       data[tag] = control
         .GetContent()
@@ -227,58 +286,6 @@ function extractFormDataCommand() {
     }
 
     /**
-     * Everything below here is an inline content control.
-     */
-    if (classType !== "inlineLvlSdt") {
-      continue;
-    }
-
-    /**
-     * Checkbox
-     *
-     * Return a real boolean instead of "☒" / "☐".
-     */
-    if (control.IsCheckBox()) {
-      data[tag] = Boolean(control.IsCheckBoxChecked());
-      continue;
-    }
-
-    /**
-     * Date picker
-     *
-     * Normalize to YYYY-MM-DD without changing the calendar date for local
-     * Date objects returned by the Office API.
-     */
-    if (control.IsDatePicker()) {
-      data[tag] = formatDateInsideCommand(control.GetDate());
-      continue;
-    }
-
-    /**
-     * Dropdown / Combo box
-     *
-     * Keep the option value, rather than the human-readable display text.
-     */
-    if (control.IsDropDownList() || control.IsComboBox()) {
-      const displayText = getInlineTextInsideCommand(control);
-      const list = control.GetDropdownList();
-      const items = list.GetAllItems();
-
-      // Fallback to visible text if no matching option exists.
-      let value = displayText;
-
-      for (const item of items) {
-        if (item.GetText() === displayText) {
-          value = item.GetValue();
-          break;
-        }
-      }
-
-      data[tag] = value;
-      continue;
-    }
-
-    /**
      * Plain Text and other inline controls.
      */
     data[tag] = getInlineTextInsideCommand(control);
@@ -288,7 +295,7 @@ function extractFormDataCommand() {
    * callCommand() transports primitive/string data cleanly back to the
    * plugin iframe.
    */
-  return JSON.stringify(data);
+  return JSON.stringify({ canonicalDateFields, data });
 }
 
 /**
@@ -301,6 +308,12 @@ function applyPrefillCommand() {
     typeof Asc !== "undefined" && Asc.scope
       ? Asc.scope
       : { formBridgePrefill: null };
+  const tagAliases = scope.formBridgeTagAliases || {};
+  function normalizedFieldTag(control) {
+    const rawTag = control.GetTag();
+    const tag = typeof rawTag === "string" ? rawTag.trim() : "";
+    return typeof tagAliases[tag] === "string" ? tagAliases[tag] : tag;
+  }
   const payload = scope.formBridgePrefill || {};
   const values = payload.values || {};
   const policies = payload.policies || {};
@@ -498,7 +511,7 @@ function applyPrefillCommand() {
   }
 
   for (const control of controls) {
-    const tag = control.GetTag();
+    const tag = normalizedFieldTag(control);
 
     if (!tag) {
       continue;
@@ -765,6 +778,8 @@ function extractFormData(callback) {
   const done = typeof callback === "function" ? callback : () => {};
 
   try {
+    const scope = window.Asc.scope || (window.Asc.scope = {});
+    scope.formBridgeTagAliases = runtimeOptions.tagAliases;
     window.Asc.plugin.callCommand(
       extractFormDataCommand,
       false,
@@ -950,6 +965,7 @@ function applyPrefill(prefill) {
   });
   const scope = window.Asc.scope || (window.Asc.scope = {});
   scope.formBridgePrefill = normalizedPrefill;
+  scope.formBridgeTagAliases = runtimeOptions.tagAliases;
 
   return callCommandResult(applyPrefillCommand)
     .then((result) => parseCommandResult(result))
@@ -2524,6 +2540,7 @@ function normalizeRuntimeOptions() {
     operationId: firstString(options.operationId),
     parentOrigin: firstString(options.parentOrigin),
     prefill: normalizePrefill(options),
+    tagAliases: isRecord(options.tagAliases) ? options.tagAliases : {},
     publicId: firstString(options.publicId),
     responseId: firstString(options.responseId),
     targetId: firstString(options.targetId),
@@ -2679,7 +2696,8 @@ function actionRequest(action, data, reason) {
       requireOption(runtimeOptions.publicId, "publicId")
     );
     const body = {
-      data,
+      canonicalDateFields: data.canonicalDateFields,
+      data: data.data,
       documentKey,
     };
 
@@ -2701,7 +2719,7 @@ function actionRequest(action, data, reason) {
     );
     return {
       body: {
-        data,
+        data: data.data,
         documentKey,
         reason: requireOption(reason, "correction reason"),
       },

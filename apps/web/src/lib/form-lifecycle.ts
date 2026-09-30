@@ -44,3 +44,31 @@ export const createDeferred = <T>() => {
     resolve: resolveDeferred,
   };
 };
+
+interface EditorSaveRequest {
+  handled: boolean;
+  resolve: (allowed: boolean) => void;
+}
+
+export const requestEditorSave = (): Promise<boolean> => {
+  const result = createDeferred<boolean>();
+  const detail: EditorSaveRequest = {
+    handled: false,
+    resolve: result.resolve,
+  };
+  window.dispatchEvent(
+    new CustomEvent("folio:before-reauth", {
+      detail,
+    })
+  );
+  return detail.handled ? result.promise : Promise.resolve(true);
+};
+export const afterEditorSave = async (
+  continueAfterSave: () => void | Promise<void>
+): Promise<boolean> => {
+  if (!(await requestEditorSave())) {
+    return false;
+  }
+  await continueAfterSave();
+  return true;
+};

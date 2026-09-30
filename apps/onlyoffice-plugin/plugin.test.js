@@ -16,6 +16,7 @@ const createHarness = ({
   prefill,
   responses = [],
   selection,
+  tagAliases,
 } = {}) => {
   const parentOrigin = "https://web.example.test";
   const bridgeId = "bridge-test-1";
@@ -231,6 +232,7 @@ const createHarness = ({
         prefill,
         publicId: "public-id",
         responseId: "response-id",
+        tagAliases,
         targetId: "target-id",
       },
     },
@@ -437,6 +439,14 @@ test("clears dirty state after successful save and submit actions", async () => 
   const harness = createHarness({
     action: "draft",
     capabilityResponses: ["save-draft-capability", "submit-capability"],
+    controls: [
+      {
+        GetClassType: () => "inlineLvlSdt",
+        GetDate: () => new Date(2026, 8, 15),
+        GetTag: () => "start_date",
+        IsDatePicker: () => true,
+      },
+    ],
     responses: [{ ok: true }, { ok: true }],
   });
   acknowledgeBridge(harness);
@@ -455,6 +465,11 @@ test("clears dirty state after successful save and submit actions", async () => 
       .filter(({ message }) => message.type === "dirty-state")
       .map(({ message }) => message.dirty)
   ).toEqual([true, false, true, false]);
+  for (const request of harness.requests) {
+    const requestBody = JSON.parse(request.body);
+    expect(requestBody.data).toEqual({ start_date: "2026-09-15" });
+    expect(requestBody.canonicalDateFields).toEqual(["start_date"]);
+  }
 });
 
 test("accepts only authenticated parent dirty commands", async () => {
@@ -588,6 +603,7 @@ test("extracts scalar form values with plugin contract semantics", async () => {
   const control = ({
     checkbox = false,
     checked = false,
+    classType = "inlineLvlSdt",
     date = false,
     dateValue = null,
     dropdown = false,
@@ -598,18 +614,23 @@ test("extracts scalar form values with plugin contract semantics", async () => {
     tag,
     text,
   }) => ({
-    GetClassType: () => "inlineLvlSdt",
-    GetDate: () => dateValue,
+    GetClassType: () => classType,
+    GetContent: () => ({ GetText: () => text }),
     GetDropdownList: () => ({ GetAllItems: () => items }),
     GetFormType: () => formType,
     GetRange: () => ({ GetText: () => text }),
     GetTag: () => tag,
-    IsCheckBox: () => checkbox,
-    IsCheckBoxChecked: () => checked,
-    IsComboBox: () => combo,
-    IsDatePicker: () => date,
-    IsDropDownList: () => dropdown,
-    IsPicture: () => picture,
+    ...(classType === "inlineLvlSdt"
+      ? {
+          GetDate: () => dateValue,
+          IsCheckBox: () => checkbox,
+          IsCheckBoxChecked: () => checked,
+          IsComboBox: () => combo,
+          IsDatePicker: () => date,
+          IsDropDownList: () => dropdown,
+          IsPicture: () => picture,
+        }
+      : {}),
   });
 
   const harness = createHarness({
@@ -617,11 +638,37 @@ test("extracts scalar form values with plugin contract semantics", async () => {
     capabilityResponses: ["save-draft-capability"],
     controls: [
       control({ tag: "notes", text: "line one\nline two" }),
-      control({ checkbox: true, checked: true, tag: "accept_terms" }),
+      control({
+        classType: "blockLvlSdt",
+        tag: "accept_terms",
+        text: "✓",
+      }),
+      control({
+        classType: "blockLvlSdt",
+        tag: "start_date",
+        text: "15/09/2026",
+      }),
+      control({
+        classType: "blockLvlSdt",
+        tag: "department",
+        text: "Engineering",
+      }),
+      control({
+        classType: "blockLvlSdt",
+        tag: "custom",
+        text: "Custom value",
+      }),
+      control({
+        checkbox: true,
+        checked: true,
+        tag: "inline_checkbox",
+        text: "checked",
+      }),
       control({
         date: true,
         dateValue: new Date(2026, 8, 15),
-        tag: "start_date",
+        tag: "inline_date",
+        text: "date",
       }),
       control({
         dropdown: true,
@@ -631,19 +678,90 @@ test("extracts scalar form values with plugin contract semantics", async () => {
             GetValue: () => "engineering",
           },
         ],
-        tag: "department",
+        tag: "inline_department",
         text: "Engineering",
+      }),
+      control({
+        dropdown: true,
+        items: [
+          {
+            GetText: () => "Empty option label",
+            GetValue: () => "",
+          },
+          {
+            GetText: () => "Choice B",
+            GetValue: () => "Empty option label",
+          },
+        ],
+        tag: "selected_empty",
+        text: "Empty option label",
+      }),
+      control({
+        dropdown: true,
+        items: [
+          {
+            GetText: () => "Empty option label",
+            GetValue: () => "",
+          },
+          {
+            GetText: () => "Choice B",
+            GetValue: () => "Empty option label",
+          },
+        ],
+        tag: "selected_value_collision",
+        text: "Choice B",
+      }),
+      control({
+        dropdown: true,
+        items: [
+          {
+            GetText: () => "Empty option label",
+            GetValue: () => "",
+          },
+        ],
+        tag: "blank_empty",
+        text: "",
       }),
       control({
         combo: true,
         items: [
           {
-            GetText: () => "Known",
-            GetValue: () => "known",
+            GetText: () => "Empty combo label",
+            GetValue: () => "",
+          },
+          {
+            GetText: () => "Choice B",
+            GetValue: () => "Empty combo label",
           },
         ],
-        tag: "custom",
-        text: "Custom value",
+        tag: "selected_empty_combo",
+        text: "Empty combo label",
+      }),
+      control({
+        combo: true,
+        items: [
+          {
+            GetText: () => "Empty combo label",
+            GetValue: () => "",
+          },
+          {
+            GetText: () => "Choice B",
+            GetValue: () => "Empty combo label",
+          },
+        ],
+        tag: "selected_combo_value_collision",
+        text: "Choice B",
+      }),
+      control({
+        combo: true,
+        items: [
+          {
+            GetText: () => "Empty combo label",
+            GetValue: () => "",
+          },
+        ],
+        tag: "blank_empty_combo",
+        text: "",
       }),
       control({
         formType: "picture",
@@ -663,12 +781,22 @@ test("extracts scalar form values with plugin contract semantics", async () => {
   ).resolves.toMatchObject({ ok: true });
   const requestBody = JSON.parse(harness.requests[0].body);
   expect(requestBody.data).toEqual({
-    accept_terms: true,
+    accept_terms: "✓",
     custom: "Custom value",
-    department: "engineering",
+    department: "Engineering",
+    inline_checkbox: true,
+    inline_date: "2026-09-15",
+    inline_department: "Engineering",
     notes: "line one\nline two",
-    start_date: "2026-09-15",
+    start_date: "15/09/2026",
+    blank_empty: "",
+    blank_empty_combo: "",
+    selected_combo_value_collision: "Choice B",
+    selected_empty: "Empty option label",
+    selected_empty_combo: "Empty combo label",
+    selected_value_collision: "Choice B",
   });
+  expect(requestBody.canonicalDateFields).toEqual(["inline_date"]);
 });
 
 test("skips native picture controls during prefill without mutating them", async () => {
@@ -738,6 +866,61 @@ test("locks available Prefill and leaves missing values editable", async () => {
     { lock: "sdtContentLocked", text: "Trusted value" },
     { lock: undefined, text: "" },
   ]);
+});
+test("maps namespaced field tags during prefill and save", async () => {
+  let lock;
+  let text = "";
+  const control = {
+    AddText(value) {
+      text += value;
+    },
+    GetClassType: () => "inlineLvlSdt",
+    GetRange: () => ({ GetText: () => text }),
+    GetTag: () => "metadata",
+    IsCheckBox: () => false,
+    IsDatePicker: () => false,
+    IsDropDownList: () => false,
+    IsComboBox: () => false,
+    RemoveAllElements() {
+      text = "";
+    },
+    SetLock(value) {
+      lock = value;
+    },
+  };
+  const harness = createHarness({
+    action: "draft",
+    capabilityResponses: ["save-draft-capability"],
+    controls: [control],
+    responses: [
+      { operationCapability: "save-operation-capability", operationId: "save" },
+      completedOperation({ saved: true }),
+    ],
+    tagAliases: { metadata: "full_name" },
+  });
+  acknowledgeBridge(harness);
+
+  await expect(
+    harness.window.FormBridge.applyPrefill({
+      editableFields: { full_name: false },
+      values: { full_name: "Trusted value" },
+    })
+  ).resolves.toEqual({
+    applied: ["full_name"],
+    failed: [],
+    skipped: [],
+  });
+  await expect(
+    harness.window.FormBridge.runAction("save-draft")
+  ).resolves.toMatchObject({ ok: true });
+
+  expect(JSON.parse(harness.requests[0].body).data).toEqual({
+    full_name: "Trusted value",
+  });
+  expect({ lock, text }).toEqual({
+    lock: "sdtContentLocked",
+    text: "Trusted value",
+  });
 });
 test("applies a saved scalar response and reports Thai action status", async () => {
   const createMutableControl = ({ kind, tag, items = [] }) => {
@@ -830,7 +1013,7 @@ test("applies a saved scalar response and reports Thai action status", async () 
   expect(JSON.parse(harness.requests[0].body).data).toEqual({
     accept_terms: true,
     custom: "Custom value",
-    department: "engineering",
+    department: "Engineering",
     notes: "line one\nline two",
     start_date: "2026-09-15",
   });

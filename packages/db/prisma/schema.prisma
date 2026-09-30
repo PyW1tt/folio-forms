@@ -77,6 +77,13 @@ enum AuditOutcome {
   failure
 }
 
+enum LegacyAccountLinkStatus {
+  pending
+  approved
+  rejected
+  linked
+}
+
 model User {
   id                 String   @id
   name               String
@@ -91,6 +98,8 @@ model User {
 
   sessions          Session[]
   accounts          Account[]
+  legacyAccountLinkRequests LegacyAccountLinkRequest[] @relation("LegacyAccountLinkCandidate")
+  legacyAccountLinkReviews  LegacyAccountLinkRequest[] @relation("LegacyAccountLinkReviewer")
   formsCreated      Form[]            @relation("FormCreator")
   responses         Response[]        @relation("ResponseOwner")
   submissions       Submission[]      @relation("SubmissionOwner")
@@ -101,6 +110,28 @@ model User {
 
   @@index([role, enabled])
   @@map("user")
+}
+
+model LegacyAccountLinkRequest {
+  id           String                  @id @default(uuid()) @db.Uuid
+  providerId   String                  @map("provider_id")
+  subject      String
+  email        String
+  userId       String                  @map("user_id")
+  status       LegacyAccountLinkStatus @default(pending)
+  reviewedById       String?                 @map("reviewed_by_id")
+  reviewedGeneration BigInt?                @map("reviewed_generation")
+  reviewedAt         DateTime?               @map("reviewed_at") @db.Timestamptz(3)
+  createdAt    DateTime                @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt    DateTime                @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  user     User  @relation("LegacyAccountLinkCandidate", fields: [userId], references: [id], onDelete: Cascade)
+  reviewer User? @relation("LegacyAccountLinkReviewer", fields: [reviewedById], references: [id], onDelete: SetNull)
+
+  @@unique([providerId, subject])
+  @@index([status, id])
+  @@index([userId, status])
+  @@map("legacy_account_link_requests")
 }
 
 model Session {

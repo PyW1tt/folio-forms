@@ -15,6 +15,7 @@ import {
 } from "lucide-react";
 import { useState } from "react";
 
+import { LegacySsoSwitchButton } from "@/components/legacy-sso-switch-button";
 import { Button, Notice, Spinner } from "@/components/ui";
 import { ApiError } from "@/lib/api";
 import { roleFor, useAuth } from "@/lib/auth";
@@ -35,6 +36,7 @@ export const AppShell = ({ children }: { children: React.ReactNode }) => {
   const auditAreActive = location.pathname.startsWith("/admin/audit");
   const resultsAreActive = location.pathname.startsWith("/admin/results");
   const authoringIsActive = location.pathname.startsWith("/admin/ai-authoring");
+  const [legacySsoError, setLegacySsoError] = useState(false);
 
   const logout = async () => {
     if (loggingOut) {
@@ -178,6 +180,15 @@ export const AppShell = ({ children }: { children: React.ReactNode }) => {
                 My responses
               </Link>
             )}
+            {role === "user" ? (
+              <LegacySsoSwitchButton
+                onError={() => setLegacySsoError(true)}
+                onStart={() => {
+                  setOpen(false);
+                  setLegacySsoError(false);
+                }}
+              />
+            ) : null}
             <Link
               to="/change-password"
               search={{
@@ -222,6 +233,11 @@ export const AppShell = ({ children }: { children: React.ReactNode }) => {
               ? "ออกจากระบบแล้ว แต่การล้างข้อมูล AI ไม่สำเร็จ"
               : "ไม่สามารถออกจากระบบได้ กรุณาลองใหม่อีกครั้ง"}
           </Notice>
+        </div>
+      ) : null}
+      {legacySsoError ? (
+        <div className="mx-auto max-w-[1240px] px-5 pt-4 lg:px-8">
+          <Notice tone="danger">ไม่สามารถเชื่อมต่อบัญชีระบบเดิมได้ กรุณาลองอีกครั้ง</Notice>
         </div>
       ) : null}
       <main className="mx-auto max-w-[1240px] px-5 py-8 lg:px-8 lg:py-12">

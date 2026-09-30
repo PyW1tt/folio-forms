@@ -133,6 +133,7 @@ const DashboardRoute = () => {
       setDiscardingId(null);
     }
   };
+
   if (authLoading) {
     return <Centered message="กำลังตรวจสอบเซสชัน…" />;
   }

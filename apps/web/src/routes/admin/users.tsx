@@ -33,6 +33,9 @@ import {
   formatDate,
 } from "@/lib/api";
 import type {
+  AdminLegacyAccountLinkListResponse,
+  AdminLegacyAccountLinkMutationResponse,
+  AdminLegacyAccountLinkRequest,
   AdminUser,
   AdminUserCredentialResponse,
   AdminUserListResponse,
@@ -207,6 +210,23 @@ const AdminUsersRoute = () => {
   const [currentCursor, setCurrentCursor] = useState<string | null>(null);
   const [cursorHistory, setCursorHistory] = useState<(string | null)[]>([]);
   const [reloadVersion, setReloadVersion] = useState(0);
+  const [legacyAccountLinkRequests, setLegacyAccountLinkRequests] = useState<
+    AdminLegacyAccountLinkRequest[]
+  >([]);
+  const [legacyAccountLinkNextCursor, setLegacyAccountLinkNextCursor] =
+    useState<string | null>(null);
+  const [legacyAccountLinkLoading, setLegacyAccountLinkLoading] =
+    useState(true);
+  const [legacyAccountLinkError, setLegacyAccountLinkError] = useState<
+    string | null
+  >(null);
+  const [legacyAccountLinkFeedback, setLegacyAccountLinkFeedback] = useState<
+    string | null
+  >(null);
+  const [legacyAccountLinkAction, setLegacyAccountLinkAction] = useState<
+    string | null
+  >(null);
+  const legacyAccountLinksHeadingRef = useRef<HTMLHeadingElement | null>(null);
 
   const [draftEmailFilter, setDraftEmailFilter] = useState("");
   const [draftRoleFilter, setDraftRoleFilter] = useState<FilterRole>("all");
@@ -366,6 +386,45 @@ const AdminUsersRoute = () => {
       cancelled = true;
     };
   }, [currentCursor, emailFilter, enabledFilter, reloadVersion, roleFilter]);
+  useEffect(() => {
+    let cancelled = false;
+    const loadLegacyAccountLinks = async () => {
+      setLegacyAccountLinkLoading(true);
+      setLegacyAccountLinkError(null);
+      try {
+        const payload =
+          await apiGet<AdminLegacyAccountLinkListResponse>(
+            "/api/admin/account-links"
+          );
+        if (cancelled) {
+          return;
+        }
+        setLegacyAccountLinkRequests(payload.requests);
+        setLegacyAccountLinkNextCursor(payload.nextCursor);
+      } catch (caughtError) {
+        if (cancelled) {
+          return;
+        }
+        setLegacyAccountLinkRequests([]);
+        setLegacyAccountLinkNextCursor(null);
+        setLegacyAccountLinkError(
+          errorMessageFor(
+            caughtError,
+            "ไม่สามารถโหลดคำขอเชื่อมบัญชีได้ กรุณาลองใหม่อีกครั้ง"
+          )
+        );
+      } finally {
+        if (!cancelled) {
+          setLegacyAccountLinkLoading(false);
+        }
+      }
+    };
+
+    void loadLegacyAccountLinks();
+    return () => {
+      cancelled = true;
+    };
+  }, [reloadVersion]);
 
   useEffect(() => {
     if (confirmingAction) {
@@ -656,6 +715,69 @@ const AdminUsersRoute = () => {
     requestConfirmation(user, "email");
   };
 
+  const loadMoreLegacyAccountLinks = async () => {
+    const cursor = legacyAccountLinkNextCursor;
+    if (!cursor || legacyAccountLinkLoading || legacyAccountLinkAction) {
+      return;
+    }
+    setLegacyAccountLinkLoading(true);
+    setLegacyAccountLinkError(null);
+    try {
+      const payload = await apiGet<AdminLegacyAccountLinkListResponse>(
+        `/api/admin/account-links?cursor=${encodeURIComponent(cursor)}`
+      );
+      setLegacyAccountLinkRequests((current) => [
+        ...current,
+        ...payload.requests,
+      ]);
+      setLegacyAccountLinkNextCursor(payload.nextCursor);
+    } catch (caughtError) {
+      setLegacyAccountLinkError(
+        errorMessageFor(
+          caughtError,
+          "ไม่สามารถโหลดคำขอเพิ่มเติมได้ กรุณาลองใหม่อีกครั้ง"
+        )
+      );
+    } finally {
+      setLegacyAccountLinkLoading(false);
+    }
+  };
+
+  const reviewLegacyAccountLink = async (
+    request: AdminLegacyAccountLinkRequest,
+    decision: "approve" | "reject"
+  ) => {
+    const action = `${request.id}:${decision}`;
+    setLegacyAccountLinkAction(action);
+    setLegacyAccountLinkError(null);
+    setLegacyAccountLinkFeedback(null);
+    try {
+      await apiPost<AdminLegacyAccountLinkMutationResponse>(
+        `/api/admin/account-links/${encodeURIComponent(request.id)}/${decision}`
+      );
+      setLegacyAccountLinkRequests((current) =>
+        current.filter((currentRequest) => currentRequest.id !== request.id)
+      );
+      setLegacyAccountLinkFeedback(
+        decision === "approve"
+          ? "อนุมัติคำขอแล้ว ผู้ใช้ต้องเริ่มเข้าสู่ระบบผ่านระบบเดิมอีกครั้ง"
+          : "ปฏิเสธคำขอเชื่อมบัญชีแล้ว"
+      );
+      window.requestAnimationFrame(() => {
+        legacyAccountLinksHeadingRef.current?.focus();
+      });
+    } catch (caughtError) {
+      setLegacyAccountLinkError(
+        errorMessageFor(
+          caughtError,
+          "ไม่สามารถตรวจสอบคำขอเชื่อมบัญชีได้ กรุณาลองใหม่อีกครั้ง"
+        )
+      );
+    } finally {
+      setLegacyAccountLinkAction(null);
+    }
+  };
+
   return (
     <>
       <PageHeader
@@ -891,6 +1013,193 @@ const AdminUsersRoute = () => {
         </Card>
       </div>
 
+      <Card
+        className="mt-6 overflow-hidden"
+        aria-busy={legacyAccountLinkLoading}
+      >
+        <div className="border-b border-[var(--line)] px-5 py-4 sm:px-6">
+          <div className="flex items-start gap-3">
+            <span className="grid size-10 shrink-0 place-items-center rounded-[10px] bg-[var(--accent-soft)]">
+              <ShieldCheck size={19} />
+            </span>
+            <div>
+              <h2
+                ref={legacyAccountLinksHeadingRef}
+                tabIndex={-1}
+                className="text-xl font-bold tracking-[-0.03em]"
+              >
+                คำขอเชื่อมบัญชี Legacy
+              </h2>
+              <p className="mt-1 text-sm text-[var(--ink-soft)]">
+                ตรวจอีเมลที่ยืนยันกับบัญชี Folio Forms ก่อนอนุมัติ
+                ผู้ใช้ต้องเริ่มเข้าสู่ระบบผ่านระบบเดิมใหม่หลังอนุมัติ
+              </p>
+            </div>
+          </div>
+        </div>
+        {legacyAccountLinkFeedback ? (
+          <div className="px-5 pt-4 sm:px-6">
+            <Notice tone="success">{legacyAccountLinkFeedback}</Notice>
+          </div>
+        ) : null}
+        {legacyAccountLinkError ? (
+          <div className="px-5 pt-4 sm:px-6">
+            <Notice tone="danger">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <span>{legacyAccountLinkError}</span>
+                <Button
+                  type="button"
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => setReloadVersion((value) => value + 1)}
+                  disabled={legacyAccountLinkLoading}
+                >
+                  ลองใหม่
+                </Button>
+              </div>
+            </Notice>
+          </div>
+        ) : null}
+        {legacyAccountLinkLoading &&
+        legacyAccountLinkRequests.length === 0 ? (
+          <div className="grid min-h-32 place-items-center gap-3 p-6 text-sm text-[var(--ink-soft)]">
+            <Spinner />
+            <span>กำลังโหลดคำขอ…</span>
+          </div>
+        ) : null}
+        {!legacyAccountLinkLoading &&
+        legacyAccountLinkRequests.length === 0 &&
+        legacyAccountLinkError === null ? (
+          <p className="p-6 text-center text-sm text-[var(--ink-soft)]">
+            ไม่มีคำขอที่รออนุมัติ
+          </p>
+        ) : null}
+        {legacyAccountLinkRequests.length > 0 ? (
+          <ul className="divide-y divide-[var(--line)]">
+            {legacyAccountLinkRequests.map((request) => {
+              let ineligibleReason: string | null = null;
+              if (!request.user.enabled) {
+                ineligibleReason = "บัญชี Folio Forms ปิดใช้งานอยู่";
+              } else if (request.user.role !== "user") {
+                ineligibleReason = "ไม่สามารถเชื่อมบัญชีกับบัญชีผู้ดูแลระบบ";
+              } else if (request.user.email !== request.email) {
+                ineligibleReason = "อีเมลบัญชี Folio Forms เปลี่ยนไปแล้ว";
+              }
+              const actionIsPending =
+                legacyAccountLinkAction?.startsWith(`${request.id}:`) === true;
+              const actionDisabled =
+                legacyAccountLinkLoading || legacyAccountLinkAction !== null;
+              return (
+                <li key={request.id} className="space-y-4 p-5 sm:px-6">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <h3 className="font-semibold text-[var(--ink)]">
+                        {request.user.name}
+                      </h3>
+                      <p className="break-all text-sm text-[var(--ink-soft)]">
+                        {request.user.email}
+                      </p>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      <Badge tone={roleBadgeTones[request.user.role]}>
+                        {roleBadgeLabels[request.user.role]}
+                      </Badge>
+                      <Badge
+                        tone={request.user.enabled ? "neutral" : "warning"}
+                      >
+                        {request.user.enabled ? "เปิดใช้งาน" : "ปิดใช้งาน"}
+                      </Badge>
+                    </div>
+                  </div>
+                  <dl className="grid gap-3 text-sm sm:grid-cols-2">
+                    <div>
+                      <dt className="text-xs text-[var(--ink-soft)]">
+                        อีเมลที่ยืนยันจาก Legacy
+                      </dt>
+                      <dd className="break-all font-medium">{request.email}</dd>
+                    </div>
+                    <div>
+                      <dt className="text-xs text-[var(--ink-soft)]">
+                        วันที่ส่งคำขอ
+                      </dt>
+                      <dd>{formatDate(request.createdAt)}</dd>
+                    </div>
+                    <div>
+                      <dt className="text-xs text-[var(--ink-soft)]">
+                        Provider
+                      </dt>
+                      <dd className="break-all">{request.providerId}</dd>
+                    </div>
+                    <div>
+                      <dt className="text-xs text-[var(--ink-soft)]">
+                        Subject
+                      </dt>
+                      <dd className="break-all">{request.subject}</dd>
+                    </div>
+                  </dl>
+                  {ineligibleReason ? (
+                    <p className="text-sm text-[var(--danger)]">
+                      {ineligibleReason}
+                    </p>
+                  ) : null}
+                  <div className="flex flex-wrap gap-2">
+                    <Button
+                      type="button"
+                      size="sm"
+                      onClick={() =>
+                        void reviewLegacyAccountLink(request, "approve")
+                      }
+                      disabled={Boolean(ineligibleReason) || actionDisabled}
+                      aria-label={`อนุมัติการเชื่อมบัญชี ${request.email} กับ ${request.user.email}`}
+                    >
+                      {actionIsPending &&
+                      legacyAccountLinkAction === `${request.id}:approve` ? (
+                        <Spinner />
+                      ) : (
+                        <ShieldCheck size={15} />
+                      )}
+                      อนุมัติ
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="danger"
+                      size="sm"
+                      onClick={() =>
+                        void reviewLegacyAccountLink(request, "reject")
+                      }
+                      disabled={actionDisabled}
+                      aria-label={`ปฏิเสธคำขอเชื่อมบัญชี ${request.email}`}
+                    >
+                      {actionIsPending &&
+                      legacyAccountLinkAction === `${request.id}:reject` ? (
+                        <Spinner />
+                      ) : (
+                        <X size={15} />
+                      )}
+                      ปฏิเสธ
+                    </Button>
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        ) : null}
+        {legacyAccountLinkNextCursor ? (
+          <div className="flex justify-center border-t border-[var(--line)] p-4">
+            <Button
+              type="button"
+              variant="secondary"
+              size="sm"
+              onClick={() => void loadMoreLegacyAccountLinks()}
+              disabled={legacyAccountLinkLoading || legacyAccountLinkAction !== null}
+            >
+              {legacyAccountLinkLoading ? <Spinner /> : <ChevronRight size={15} />}
+              โหลดคำขอเพิ่มเติม
+            </Button>
+          </div>
+        ) : null}
+      </Card>
+
       <Card className="mt-6 overflow-hidden" aria-busy={listLoading}>
         <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[var(--line)] px-5 py-4 sm:px-6">
           <div>
@@ -914,7 +1223,11 @@ const AdminUsersRoute = () => {
               clearTransientState();
               setReloadVersion((value) => value + 1);
             }}
-            disabled={rowActionsDisabled}
+            disabled={
+              rowActionsDisabled ||
+              legacyAccountLinkLoading ||
+              legacyAccountLinkAction !== null
+            }
           >
             {listLoading ? <Spinner /> : <RefreshCw size={15} />}
             โหลดใหม่
@@ -931,7 +1244,11 @@ const AdminUsersRoute = () => {
                   variant="secondary"
                   size="sm"
                   onClick={() => setReloadVersion((value) => value + 1)}
-                  disabled={rowActionsDisabled}
+                  disabled={
+                    rowActionsDisabled ||
+                    legacyAccountLinkLoading ||
+                    legacyAccountLinkAction !== null
+                  }
                 >
                   ลองใหม่
                 </Button>

@@ -79,42 +79,36 @@ const CorrectionHistory = ({
 };
 
 const RevisionSelector = ({
-  hasOriginalRevision,
+  history,
   historyError,
   historyLoading,
-  latestRevision,
   setViewRevision,
   viewRevision,
 }: {
-  hasOriginalRevision: boolean;
+  history: ResponseRevision[];
   historyError: string | null;
   historyLoading: boolean;
-  latestRevision: number;
-  setViewRevision: (revision: "original" | "latest") => void;
-  viewRevision: "original" | "latest";
+  setViewRevision: (revision: number) => void;
+  viewRevision: number;
 }) => (
-  <div
-    className="flex w-full flex-wrap items-center gap-2"
-    aria-label="เลือกข้อมูลคำตอบ"
-  >
-    <span className="mr-1 text-sm font-semibold">ดูข้อมูล</span>
-    <Button
-      aria-pressed={viewRevision === "original"}
-      disabled={historyLoading || historyError !== null || !hasOriginalRevision}
-      onClick={() => setViewRevision("original")}
-      variant={viewRevision === "original" ? "primary" : "secondary"}
+  <label className="flex items-center gap-2 text-sm font-semibold">
+    <span>ดูข้อมูลรุ่น</span>
+    <select
+      aria-label="เลือก Revision"
+      className="min-h-10 rounded-[10px] border border-[var(--line-strong)] bg-[var(--paper)] px-3"
+      disabled={historyLoading || historyError !== null}
+      onChange={(event) => setViewRevision(Number(event.currentTarget.value))}
+      value={viewRevision}
     >
-      ข้อมูลเดิม
-    </Button>
-    <Button
-      aria-pressed={viewRevision === "latest"}
-      onClick={() => setViewRevision("latest")}
-      variant={viewRevision === "latest" ? "primary" : "secondary"}
-    >
-      ข้อมูลล่าสุด
-      {latestRevision > 0 ? ` (Correction ${latestRevision})` : ""}
-    </Button>
-  </div>
+      {history.map((revision) => (
+        <option key={revision.revision} value={revision.revision}>
+          {revision.revision === 0
+            ? "Submission เดิม"
+            : `Correction ${revision.revision}`}
+        </option>
+      ))}
+    </select>
+  </label>
 );
 
 const deletionErrorMessage = (caughtError: unknown) => {
@@ -133,13 +127,12 @@ const deletionErrorMessage = (caughtError: unknown) => {
 const AdminResultDetailRoute = () => {
   const { responseId } = useParams({ from: "/admin/results/$responseId/" });
   const [result, setResult] = useState<AdminResultDetail | null>(null);
-  const [viewRevision, setViewRevision] = useState<"original" | "latest">(
-    "latest"
-  );
+  const [viewRevision, setViewRevision] = useState<number | null>(null);
   const [history, setHistory] = useState<
     ResponseRevisionsResponse["revisions"]
   >([]);
   const [fields, setFields] = useState<ReceiptField[]>([]);
+  const [fieldsRevision, setFieldsRevision] = useState<number | null>(null);
   const [fieldsError, setFieldsError] = useState<string | null>(null);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyError, setHistoryError] = useState<string | null>(null);
@@ -184,40 +177,26 @@ const AdminResultDetailRoute = () => {
   }, [responseId]);
 
   useEffect(() => {
-    if (
-      !result ||
-      result.state !== "submitted" ||
-      !result.submissionId
-    ) {
+    if (!result || result.state !== "submitted" || !result.submissionId) {
       return;
     }
-    const submissionId = result.submissionId;
     let cancelled = false;
     setHistoryLoading(true);
     setHistoryError(null);
     setFieldsError(null);
     const loadHistory = async () => {
       try {
-        const [historyResult, submissionDataResult] = await Promise.allSettled([
-          apiGet<ResponseRevisionsResponse>(
-            `/api/responses/${responseId}/corrections`
-          ),
-          apiGet<{ fields: ReceiptField[] }>(
-            `/api/submissions/${submissionId}/data?revision=latest`
-          ),
-        ]);
+        const historyResult = await apiGet<ResponseRevisionsResponse>(
+          `/api/responses/${responseId}/corrections`
+        );
         if (!cancelled) {
-          if (historyResult.status === "fulfilled") {
-            setHistory(historyResult.value.revisions);
-          } else {
-            setHistory([]);
-            setHistoryError("โหลดประวัติ Correction ไม่สำเร็จ กรุณาลองใหม่");
-          }
-          if (submissionDataResult.status === "fulfilled") {
-            setFields(submissionDataResult.value.fields);
-          } else {
-            setFieldsError("ไม่สามารถโหลดข้อมูล Field ที่เผยแพร่ได้");
-          }
+          setHistory(historyResult.revisions);
+          setViewRevision(historyResult.latestRevision);
+        }
+      } catch {
+        if (!cancelled) {
+          setHistory([]);
+          setHistoryError("โหลดประวัติ Correction ไม่สำเร็จ กรุณาลองใหม่");
         }
       } finally {
         if (!cancelled) {
@@ -230,6 +209,35 @@ const AdminResultDetailRoute = () => {
       cancelled = true;
     };
   }, [responseId, result]);
+  useEffect(() => {
+    if (!result || result.state !== "submitted" || !result.submissionId) {
+      return;
+    }
+    const selectedRevision = viewRevision ?? result.latestCorrectionNumber ?? 0;
+    let cancelled = false;
+    setFields([]);
+    setFieldsRevision(null);
+    setFieldsError(null);
+    const loadFields = async () => {
+      try {
+        const payload = await apiGet<{ fields: ReceiptField[] }>(
+          `/api/submissions/${result.submissionId}/data?revision=${selectedRevision}`
+        );
+        if (!cancelled) {
+          setFields(payload.fields);
+          setFieldsRevision(selectedRevision);
+        }
+      } catch {
+        if (!cancelled) {
+          setFieldsError("ไม่สามารถโหลดข้อมูล Field ที่เผยแพร่ได้");
+        }
+      }
+    };
+    void loadFields();
+    return () => {
+      cancelled = true;
+    };
+  }, [result, viewRevision]);
   useEffect(() => {
     if (deleteConfirmation) {
       document
@@ -278,17 +286,14 @@ const AdminResultDetailRoute = () => {
     }
   };
 
-  const download = async (
-    format: "docx" | "pdf",
-    revision: "original" | "latest"
-  ) => {
+  const download = async (format: "docx" | "pdf", revision: number) => {
     if (!result?.submissionId || downloading) {
       return;
     }
     setDownloading(`${format}-${revision}`);
     setDownloadError(null);
     try {
-      const query = revision === "latest" ? "?revision=latest" : "";
+      const query = `?revision=${revision}`;
       await downloadArtifact(
         `/api/submissions/${result.submissionId}/${format}${query}`,
         `submission-${result.submissionId}-${revision}.${format}`
@@ -333,21 +338,36 @@ const AdminResultDetailRoute = () => {
   const isDraft = !isSubmitted;
   const latestRevision =
     history.at(-1)?.revision ?? result.latestCorrectionNumber ?? 0;
-  const hasOriginalRevision = history.some(
-    (revision) => revision.revision === 0
-  );
-  const selectedRevision = viewRevision === "latest" ? latestRevision : 0;
+  const selectedRevision = viewRevision ?? latestRevision;
   const selectedRevisionRecord = history.find(
     (revision) => revision.revision === selectedRevision
   );
-  const displayedData = selectedRevisionRecord?.data ?? result.data;
-  const selectedPictures = selectedRevisionRecord?.pictures ?? null;
-  const documentAvailable =
-    selectedRevisionRecord?.document.available ??
-    (viewRevision === "latest" && result.document.available);
+  let viewerConfigUrl: string | undefined;
+  if (isSubmitted && selectedRevisionRecord) {
+    viewerConfigUrl = `/api/admin/results/${responseId}/viewer-config?revision=${selectedRevision}`;
+  } else if (isDraft && result.document.available) {
+    viewerConfigUrl = `/api/admin/results/${responseId}/viewer-config`;
+  }
   let submittedDataLabel = "ข้อมูลต้นฉบับของ Submission";
-  if (viewRevision === "latest" && latestRevision > 0) {
-    submittedDataLabel = "ข้อมูลล่าสุดของ Correction";
+  if (selectedRevision > 0) {
+    submittedDataLabel = `ข้อมูล Correction ${selectedRevision}`;
+  }
+  let displayedData: Record<string, unknown>;
+  let displayedDocumentAvailable: boolean;
+  let displayedFields: ReceiptField[];
+  let displayedFieldsError: string | null = null;
+  let displayedPictures: Record<string, boolean> | null = null;
+  if (isDraft) {
+    displayedData = result.data;
+    displayedDocumentAvailable = result.document.available;
+    displayedFields = result.fields;
+  } else {
+    displayedData = selectedRevisionRecord?.data ?? {};
+    displayedDocumentAvailable =
+      selectedRevisionRecord?.document.available ?? false;
+    displayedFields = fieldsRevision === selectedRevision ? fields : [];
+    displayedFieldsError = fieldsError;
+    displayedPictures = selectedRevisionRecord?.pictures ?? null;
   }
   return (
     <>
@@ -436,12 +456,11 @@ const AdminResultDetailRoute = () => {
           ) : (
             <div className="mt-5 flex flex-wrap gap-2" aria-label="จัดการคำตอบ">
               <RevisionSelector
-                hasOriginalRevision={hasOriginalRevision}
+                history={history}
                 historyError={historyError}
                 historyLoading={historyLoading}
-                latestRevision={latestRevision}
                 setViewRevision={setViewRevision}
-                viewRevision={viewRevision}
+                viewRevision={selectedRevision}
               />
               <Link
                 search={{ form: undefined }}
@@ -451,36 +470,20 @@ const AdminResultDetailRoute = () => {
                 <Button variant="primary">เปิด Correction</Button>
               </Link>
               <Button
-                disabled={downloading !== null}
-                onClick={() => download("docx", "original")}
+                disabled={downloading !== null || !selectedRevisionRecord}
+                onClick={() => download("docx", selectedRevision)}
                 variant="secondary"
               >
                 <FileText size={16} />
-                DOCX เดิม
+                DOCX
               </Button>
               <Button
-                disabled={downloading !== null}
-                onClick={() => download("pdf", "original")}
+                disabled={downloading !== null || !selectedRevisionRecord}
+                onClick={() => download("pdf", selectedRevision)}
                 variant="secondary"
               >
                 <FileText size={16} />
-                PDF เดิม
-              </Button>
-              <Button
-                disabled={downloading !== null}
-                onClick={() => download("docx", "latest")}
-                variant="secondary"
-              >
-                <FileText size={16} />
-                DOCX ล่าสุด
-              </Button>
-              <Button
-                disabled={downloading !== null}
-                onClick={() => download("pdf", "latest")}
-                variant="secondary"
-              >
-                <FileText size={16} />
-                PDF ล่าสุด
+                PDF
               </Button>
             </div>
           )}
@@ -512,28 +515,19 @@ const AdminResultDetailRoute = () => {
             />
           </Card>
         ) : null}
-        {isSubmitted ? (
-          <Card>
-            <p className="mb-4 text-sm text-[var(--ink-soft)]">
-              {submittedDataLabel}
-            </p>
-            <SubmissionResultViewer
-              configUrl={`/api/admin/results/${responseId}/viewer-config?revision=${viewRevision}`}
-              data={displayedData}
-              documentAvailable={documentAvailable}
-              fields={fields}
-              fieldsError={fieldsError}
-              pictures={selectedPictures}
-            />
-          </Card>
-        ) : (
-          <Card>
-            <h2 className="font-semibold">ข้อมูลคำตอบ</h2>
-            <div className="mt-4">
-              <Notice>ข้อมูลฉบับร่างยังไม่แสดงในหน้าตรวจทานนี้</Notice>
-            </div>
-          </Card>
-        )}
+        <Card>
+          <p className="mb-4 text-sm text-[var(--ink-soft)]">
+            {isDraft ? "ข้อมูลฉบับร่าง" : submittedDataLabel}
+          </p>
+          <SubmissionResultViewer
+            configUrl={viewerConfigUrl}
+            data={displayedData}
+            documentAvailable={displayedDocumentAvailable}
+            fields={displayedFields}
+            fieldsError={displayedFieldsError}
+            pictures={displayedPictures}
+          />
+        </Card>
       </div>
     </>
   );

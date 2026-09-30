@@ -1,10 +1,17 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { Download, FileCheck2, WandSparkles } from "lucide-react";
 import type { ChangeEvent, FormEvent } from "react";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { PageHeader } from "@/components/app-shell";
-import { Button, Card, Input, Notice, Spinner, Textarea } from "@/components/ui";
+import {
+  Button,
+  Card,
+  Input,
+  Notice,
+  Spinner,
+  Textarea,
+} from "@/components/ui";
 import {
   ApiError,
   apiDelete,
@@ -13,8 +20,10 @@ import {
   apiPost,
   apiPostFormData,
   downloadArtifact,
+  getToken,
 } from "@/lib/api";
 import type { FormSummary } from "@/lib/api";
+import { useAuth } from "@/lib/auth";
 
 const docxContentType =
   "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
@@ -75,7 +84,7 @@ const authoringErrorMessage = (error: unknown): string => {
 const docxFilename = (title: string): string =>
   `${title.replaceAll(/[\\/:*?"<>|]/gu, "-").slice(0, 120) || "template"}.docx`;
 
-const AiAuthoringRoute = () => {
+const AiAuthoringWorkspace = ({ sessionToken }: { sessionToken: string }) => {
   const navigate = useNavigate();
   const [status, setStatus] = useState<AiAuthoringStatus | null>(null);
   const [prompt, setPrompt] = useState("");
@@ -84,36 +93,49 @@ const AiAuthoringRoute = () => {
   const [consent, setConsent] = useState(false);
   const [preview, setPreview] = useState<AuthoringPreview | null>(null);
   const [loading, setLoading] = useState(true);
-  const [busy, setBusy] = useState(false);
+  const [busyAction, setBusyAction] = useState<
+    "create" | "revision" | "download" | "upload" | "end" | null
+  >(null);
+  const busy = busyAction !== null;
   const [error, setError] = useState<string | null>(null);
+  const mounted = useRef(true);
   const sourcePdfInput = useRef<HTMLInputElement>(null);
+  const isCurrent = useCallback(
+    () => mounted.current && getToken() === sessionToken,
+    [sessionToken]
+  );
 
   useEffect(() => {
+    mounted.current = true;
     let active = true;
-    Promise.all([
-      apiGet<AiAuthoringStatus>("/api/admin/ai-authoring"),
-      apiGet<CurrentAuthoringResponse>("/api/admin/ai-authoring/sessions/current"),
-    ])
-      .then(([authoringStatus, current]) => {
-        if (active) {
+    const load = async () => {
+      try {
+        const [authoringStatus, current] = await Promise.all([
+          apiGet<AiAuthoringStatus>("/api/admin/ai-authoring"),
+          apiGet<CurrentAuthoringResponse>(
+            "/api/admin/ai-authoring/sessions/current"
+          ),
+        ]);
+        if (active && isCurrent()) {
           setStatus(authoringStatus);
           setPreview(current.session);
         }
-      })
-      .catch((caughtError: unknown) => {
-        if (active) {
+      } catch (caughtError) {
+        if (active && isCurrent()) {
           setError(authoringErrorMessage(caughtError));
         }
-      })
-      .finally(() => {
-        if (active) {
+      } finally {
+        if (active && isCurrent()) {
           setLoading(false);
         }
-      });
+      }
+    };
+    void load();
     return () => {
       active = false;
+      mounted.current = false;
     };
-  }, []);
+  }, [isCurrent]);
 
   const clearSourcePdf = () => {
     setSourcePdf(null);
@@ -137,10 +159,10 @@ const AiAuthoringRoute = () => {
   const createDocument = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const instruction = prompt.trim() || (sourcePdf ? pdfOnlyInstruction : "");
-    if (busy || !status?.enabled || !consent || !instruction) {
+    if (busy || !status?.enabled || !consent || !instruction || !isCurrent()) {
       return;
     }
-    setBusy(true);
+    setBusyAction("create");
     setError(null);
     try {
       let result: AuthoringStartResponse;
@@ -159,13 +181,19 @@ const AiAuthoringRoute = () => {
           { consent: true, prompt }
         );
       }
-      setPreview(result.session);
-      clearSourcePdf();
-      setPrompt("");
+      if (isCurrent()) {
+        setPreview(result.session);
+        setPrompt("");
+        clearSourcePdf();
+      }
     } catch (caughtError) {
-      setError(authoringErrorMessage(caughtError));
+      if (isCurrent()) {
+        setError(authoringErrorMessage(caughtError));
+      }
     } finally {
-      setBusy(false);
+      if (isCurrent()) {
+        setBusyAction(null);
+      }
     }
   };
 
@@ -176,53 +204,74 @@ const AiAuthoringRoute = () => {
       busy ||
       !status?.enabled ||
       !consent ||
-      !revisionPrompt.trim()
+      !revisionPrompt.trim() ||
+      !isCurrent()
     ) {
       return;
     }
-    setBusy(true);
+    setBusyAction("revision");
     setError(null);
     try {
       const result = await apiPost<AuthoringStartResponse>(
         `/api/admin/ai-authoring/sessions/${preview.sessionId}/revisions`,
         { consent: true, prompt: revisionPrompt }
       );
-      setPreview(result.session);
-      setRevisionPrompt("");
+      if (isCurrent()) {
+        setPreview(result.session);
+        setRevisionPrompt("");
+      }
     } catch (caughtError) {
-      if (caughtError instanceof ApiError && caughtError.status === 404) {
-        setPreview(null);
-        setError("This authoring session expired. Start a new document.");
-      } else {
-        setError(authoringErrorMessage(caughtError));
+      if (isCurrent()) {
+        if (caughtError instanceof ApiError && caughtError.status === 404) {
+          setPreview(null);
+          setError("This authoring session expired. Start a new document.");
+        } else {
+          setError(authoringErrorMessage(caughtError));
+        }
       }
     } finally {
-      setBusy(false);
+      if (isCurrent()) {
+        setBusyAction(null);
+      }
     }
   };
   const download = async () => {
-    if (!preview || busy) {
+    if (!preview || busy || !isCurrent()) {
       return;
     }
-    setBusy(true);
+    setBusyAction("download");
     setError(null);
     try {
       await downloadArtifact(preview.downloadUrl, docxFilename(preview.title));
     } catch (caughtError) {
-      setError(authoringErrorMessage(caughtError));
+      if (isCurrent()) {
+        if (caughtError instanceof ApiError && caughtError.status === 404) {
+          setPreview(null);
+          setError("This authoring session expired. Start a new document.");
+        } else {
+          setError(authoringErrorMessage(caughtError));
+        }
+      }
     } finally {
-      setBusy(false);
+      if (isCurrent()) {
+        setBusyAction(null);
+      }
     }
   };
 
   const uploadTemplateDraft = async () => {
-    if (!preview || busy) {
+    if (!preview || busy || !isCurrent()) {
       return;
     }
-    setBusy(true);
+    setBusyAction("upload");
     setError(null);
+    let downloadedDocx = false;
     try {
       const docx = await apiGetBlob(preview.downloadUrl);
+      downloadedDocx = true;
+      if (!isCurrent()) {
+        return;
+      }
       const formData = new FormData();
       formData.set("title", preview.title);
       formData.set("description", preview.description);
@@ -235,50 +284,74 @@ const AiAuthoringRoute = () => {
         "/api/admin/forms",
         formData
       );
-      await navigate({
-        params: { formId: result.form.publicId },
-        to: "/admin/forms/$formId",
-      });
+      if (isCurrent()) {
+        await navigate({
+          params: { formId: result.form.publicId },
+          to: "/admin/forms/$formId",
+        });
+      }
     } catch (caughtError) {
-      setError(authoringErrorMessage(caughtError));
-      setBusy(false);
+      if (isCurrent()) {
+        if (
+          !downloadedDocx &&
+          caughtError instanceof ApiError &&
+          caughtError.status === 404
+        ) {
+          setPreview(null);
+          setError("This authoring session expired. Start a new document.");
+        } else {
+          setError(authoringErrorMessage(caughtError));
+        }
+      }
+    } finally {
+      if (isCurrent()) {
+        setBusyAction(null);
+      }
     }
   };
 
   const endSession = async () => {
-    if (!preview || busy) {
+    if (!preview || busy || !isCurrent()) {
       return;
     }
-    setBusy(true);
+    setBusyAction("end");
     setError(null);
     try {
-      await apiDelete(
-        `/api/admin/ai-authoring/sessions/${preview.sessionId}`
-      );
-      setPreview(null);
-      clearSourcePdf();
-      setPrompt("");
-      setRevisionPrompt("");
-      setConsent(false);
-    } catch (caughtError) {
-      if (caughtError instanceof ApiError && caughtError.status === 404) {
+      await apiDelete(`/api/admin/ai-authoring/sessions/${preview.sessionId}`);
+      if (isCurrent()) {
         setPreview(null);
         clearSourcePdf();
         setPrompt("");
         setRevisionPrompt("");
         setConsent(false);
-      } else {
-        setError(authoringErrorMessage(caughtError));
+      }
+    } catch (caughtError) {
+      if (isCurrent()) {
+        if (caughtError instanceof ApiError && caughtError.status === 404) {
+          setPreview(null);
+          setPrompt("");
+          clearSourcePdf();
+          setRevisionPrompt("");
+          setConsent(false);
+        } else {
+          setError(authoringErrorMessage(caughtError));
+        }
       }
     } finally {
-      setBusy(false);
+      if (isCurrent()) {
+        setBusyAction(null);
+      }
     }
   };
 
   if (loading) {
     return (
-      <div className="grid min-h-[40vh] place-items-center">
+      <div
+        aria-busy="true"
+        className="grid min-h-[40vh] place-items-center gap-3 text-sm text-[var(--ink-soft)]"
+      >
         <Spinner />
+        <span>Loading your authoring session…</span>
       </div>
     );
   }
@@ -322,7 +395,7 @@ const AiAuthoringRoute = () => {
           <Card className="space-y-5 p-5 sm:p-7">
             <h2 className="text-xl font-bold">Refine this document</h2>
             <form
-              aria-busy={busy}
+              aria-busy={busyAction === "revision"}
               className="space-y-5"
               onSubmit={reviseDocument}
             >
@@ -366,16 +439,19 @@ const AiAuthoringRoute = () => {
                 }
                 type="submit"
               >
-                {busy ? (
+                {busyAction === "revision" ? (
                   <Spinner />
                 ) : (
                   <WandSparkles size={16} />
                 )}
-                {busy ? "Updating DOCX…" : "Update DOCX"}
+                {busyAction === "revision" ? "Updating DOCX…" : "Update DOCX"}
               </Button>
             </form>
           </Card>
-          <Card className="space-y-5 p-5 sm:p-7" aria-label="Read-only DOCX preview">
+          <Card
+            className="space-y-5 p-5 sm:p-7"
+            aria-label="Read-only DOCX preview"
+          >
             <div>
               <h2 className="text-2xl font-bold">{preview.title}</h2>
               {preview.description ? (
@@ -410,13 +486,22 @@ const AiAuthoringRoute = () => {
             </div>
           </Card>
           <div className="flex flex-wrap gap-3">
-            <Button disabled={busy} onClick={download} type="button" variant="secondary">
-              <Download size={16} />
-              Download DOCX
+            <Button
+              disabled={busy}
+              onClick={download}
+              type="button"
+              variant="secondary"
+            >
+              {busyAction === "download" ? <Spinner /> : <Download size={16} />}
+              {busyAction === "download"
+                ? "Downloading DOCX…"
+                : "Download DOCX"}
             </Button>
             <Button disabled={busy} onClick={uploadTemplateDraft} type="button">
-              {busy ? <Spinner /> : <FileCheck2 size={16} />}
-              Upload as Template Draft
+              {busyAction === "upload" ? <Spinner /> : <FileCheck2 size={16} />}
+              {busyAction === "upload"
+                ? "Uploading Template Draft…"
+                : "Upload as Template Draft"}
             </Button>
             <Button
               disabled={busy}
@@ -424,19 +509,25 @@ const AiAuthoringRoute = () => {
               type="button"
               variant="ghost"
             >
-              End session and delete Folio copy
+              {busyAction === "end"
+                ? "Ending session…"
+                : "End session and delete Folio copy"}
             </Button>
           </div>
         </div>
       ) : (
         <Card className="space-y-5 p-5 sm:p-7">
-          {!status?.enabled ? (
+          {status?.enabled === false ? (
             <Notice>
               AI Authoring is disabled. The server needs an OmniRoute endpoint,
               permitted service credential, and configured model alias.
             </Notice>
           ) : null}
-          <form className="space-y-5" onSubmit={createDocument}>
+          <form
+            aria-busy={busyAction === "create"}
+            className="space-y-5"
+            onSubmit={createDocument}
+          >
             <label className="block space-y-2">
               <span className="font-semibold">Describe your form</span>
               <Textarea
@@ -500,16 +591,36 @@ const AiAuthoringRoute = () => {
               </span>
             </label>
             <Button
-              disabled={!status?.enabled || busy || !consent || (!prompt.trim() && !sourcePdf)}
+              disabled={
+                !status?.enabled || busy || !consent || (!prompt.trim() && !sourcePdf)
+              }
               type="submit"
             >
-              {busy ? <Spinner /> : <WandSparkles size={16} />}
-              Generate DOCX
+              {busyAction === "create" ? (
+                <Spinner />
+              ) : (
+                <WandSparkles size={16} />
+              )}
+              {busyAction === "create" ? "Generating DOCX…" : "Generate DOCX"}
             </Button>
           </form>
         </Card>
       )}
     </div>
+  );
+};
+
+const AiAuthoringRoute = () => {
+  const { user } = useAuth();
+  const sessionToken = getToken();
+  if (!user || !sessionToken) {
+    return null;
+  }
+  return (
+    <AiAuthoringWorkspace
+      key={`${user.id}:${sessionToken}`}
+      sessionToken={sessionToken}
+    />
   );
 };
 

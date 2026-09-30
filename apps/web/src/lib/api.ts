@@ -71,6 +71,23 @@ export interface AdminUserCredentialResponse extends AdminUserMutationResponse {
   temporaryPassword: string;
 }
 
+export interface AdminLegacyAccountLinkRequest {
+  createdAt: string;
+  email: string;
+  id: string;
+  providerId: string;
+  status: "pending";
+  subject: string;
+  user: AdminUser;
+}
+export interface AdminLegacyAccountLinkListResponse {
+  nextCursor: string | null;
+  requests: AdminLegacyAccountLinkRequest[];
+}
+export interface AdminLegacyAccountLinkMutationResponse {
+  ok: true;
+}
+
 export type FormStatus = "draft" | "published" | "archived";
 export type FillMethod = "onlyoffice" | "native";
 export interface FormSummary {
@@ -180,6 +197,7 @@ export interface AdminResultDetail extends AdminResult {
     available: boolean;
     state: "draft" | "submission" | "correction";
   };
+  fields: ReceiptField[];
   revision: number | null;
 }
 export interface AdminResultDetailResponse {
@@ -332,6 +350,32 @@ export const safeReturnPath = (value: unknown): string | null => {
   }
   return `${pathname}${search}`;
 };
+export const legacySsoReturnPath = (
+  pathname: string,
+  search: string
+): string => {
+  const isFormPath = /^\/forms\/[0-9a-f]{32}\/fill$/u.test(pathname);
+  if (pathname !== "/dashboard" && !isFormPath) {
+    return "/dashboard";
+  }
+  if (pathname === "/dashboard") {
+    return "/dashboard";
+  }
+  if (!search) {
+    return pathname;
+  }
+  const query = new URLSearchParams(search);
+  const responseIds = query.getAll("responseId");
+  const isValidResponseId =
+    [...query.keys()].length === 1 &&
+    responseIds.length === 1 &&
+    /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/iu.test(
+      responseIds[0] ?? ""
+    );
+  return isValidResponseId
+    ? (safeReturnPath(`${pathname}${search}`) ?? pathname)
+    : pathname;
+};
 
 const request = async <T>(path: string, init: RequestInit = {}): Promise<T> => {
   const headers = new Headers(init.headers);
@@ -404,9 +448,16 @@ export const apiPost = <T>(
     method: "POST",
   });
 
-export const apiPostFormData = <T>(path: string, body: FormData) =>
+export const apiPostFormData = <T>(
+  path: string,
+  body: FormData,
+  editorCapability?: string
+) =>
   request<T>(path, {
     body,
+    headers: editorCapability
+      ? { "X-Editor-Capability": editorCapability }
+      : undefined,
     method: "POST",
   });
 export const apiPatch = <T>(path: string, body?: unknown) =>
@@ -436,11 +487,34 @@ export const downloadArtifact = async (path: string, filename: string) => {
 
 export const getSession = () => request<Session>("/api/session");
 export const legacySsoEnabled = async (): Promise<boolean> => {
-  const result = await request<{ enabled?: unknown }>(
-    "/api/legacy-sso/status"
-  );
+  const result = await request<{ enabled?: unknown }>("/api/legacy-sso/status");
   return result.enabled === true;
 };
+export interface LegacySsoSwitch {
+  confirmationFingerprint: string;
+  current: { name: string; email: string };
+  legacy: { name: string; email: string };
+  returnTo: string;
+  sameUser: boolean;
+}
+
+export const startLegacySso = (returnTo?: string) =>
+  apiPost<{ authorizationUrl: string }>("/api/legacy-sso/start", {
+    returnTo,
+  });
+
+export const getLegacySsoSwitch = () =>
+  apiGet<LegacySsoSwitch>("/api/legacy-sso/switch");
+
+export const confirmLegacySsoSwitch = (confirmationFingerprint: string) =>
+  apiPost<{ returnTo: string }>("/api/legacy-sso/switch/confirm", {
+    confirmationFingerprint,
+  });
+
+export const cancelLegacySsoSwitch = (confirmationFingerprint: string) =>
+  apiPost<{ cancelled: true }>("/api/legacy-sso/switch/cancel", {
+    confirmationFingerprint,
+  });
 
 export const claimLegacySsoSession = async (): Promise<string | null> => {
   const response = await fetch(`${API_ORIGIN}/api/legacy-sso/session`, {
@@ -464,7 +538,7 @@ export const claimLegacySsoSession = async (): Promise<string | null> => {
   ) {
     return null;
   }
-  const token = body.token;
+  const { token } = body;
   return typeof token === "string" && token.length > 0 ? token : null;
 };
 

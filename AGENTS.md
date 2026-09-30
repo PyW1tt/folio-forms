@@ -130,3 +130,17 @@ Most formatting and common issues are automatically fixed by Oxlint + Oxfmt. Run
 - For development servers only, use `herdr` persistent terminal sessions.
 - Do not start development servers in an assistant-owned terminal process.
 - Use `herdr` for development-server start, status, logs, and stop operations.
+
+## Agent skills
+
+### Issue tracker
+
+Track issues and specs as local Markdown under `.scratch/<feature>/`. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Use the five default status strings. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Use the single-context glossary and ADRs at the repo root. See `docs/agents/domain.md`.

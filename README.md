@@ -1,6 +1,6 @@
 # Folio Forms
 
-Production-oriented MMVP for designing, publishing, and completing DOCX forms through ONLYOFFICE or a single-page native text form.
+Production-oriented MMVP for designing, publishing, and completing DOCX forms through ONLYOFFICE or a native form.
 
 The application provides:
 
@@ -121,13 +121,15 @@ Create and publish a Form from the Admin interface, then use its generated opaqu
 Main screens:
 
 - `/login` — sign in.
+- `/legacy-sso/confirm` — review the Legacy identity and confirm or cancel an account switch.
 - `/dashboard` — user responses and draft resume links.
 - `/admin` — admin form list.
 - `/admin/users` — search, provision, and administer accounts.
 - `/admin/forms/new` — create a form.
 - `/admin/forms/:formId` — edit and publish a DOCX template.
 - `/admin/forms/:formId/submissions` — inspect submissions for a form.
-- `/receipt/:submissionId` — read-only receipt and artifact downloads.
+- `/receipt/:submissionId` — read-only receipt with original and every Correction selectable; field values, DOCX, and on-demand PDF use selected revision.
+- ONLYOFFICE editors and read-only viewers can expand in the page with the on-screen control; no browser fullscreen is used.
 
 ## Run modes
 
@@ -146,9 +148,13 @@ The liveness endpoint `/health` is shallow. The readiness endpoint `/ready` stay
 
 ### Account administration
 
-Every Admin has the same account authority. Use `/admin/users` to search by normalized email, filter by role or enabled state, provision an account, correct its email, enable or disable access, change its role, or reset its password. Creation and reset show a generated temporary password only in that response; copy it before leaving the result. The final enabled Admin cannot be disabled or demoted.
+Every Admin has the same account authority. Use `/admin/users` to search by normalized email, filter by role or enabled state, provision an account, correct its email, enable or disable access, change its role, or reset its password. Creation and reset show a generated temporary password only in that response; copy it before leaving the result. The final enabled Admin cannot be disabled or demoted. Legacy SSO email collisions create pending account-link requests without creating a Session. Admins can inspect the verified Legacy email, provider, subject, and candidate Folio account at `/admin/users`, then approve or reject the request. Approval applies only to a fresh Legacy SSO attempt; disabled and Admin accounts cannot be linked, and pending Users can still use their existing Folio password.
 
 Each privileged account attempt appends an immutable Audit Event with its actor, target, action, outcome, and safe metadata. Passwords, hashes, tokens, and other credential material are excluded.
+
+### Legacy SSO account switching
+
+An authenticated User can start Legacy SSO from the dashboard or Form fill page without replacing the current Session. Folio binds each switch challenge to the initiating User and Session. For a different User, Folio shows both identities and requires confirmation; for the same User, Folio explains the match and still requires confirmation. Cancel clears the pending challenge and preserves the current Session and Responses. Confirm creates a short-lived, one-use transfer; the browser claims the target Session only after confirmation. The switch returns to the original Form fill path or dashboard. Pending account links and failed exchanges show a status while preserving the current Session and safe return path. Confirmation URLs contain no provider code or target bearer. Challenges expire after five minutes.
 
 ### Admin workflow
 
@@ -162,7 +168,7 @@ Each privileged account attempt appends an immutable Audit Event with its actor,
 8. Copy the generated share link.
 9. Review submitted responses from the form's **View submissions** page or `/admin/results`.
 
-Submitted result details open the latest effective revision in separate read-only **Document** and **Fields** tabs. The Document tab uses ONLYOFFICE view mode; DOCX and PDF downloads remain available. Open **Correction** separately to edit a submitted response. Draft JSON is not shown in Admin result details.
+Submitted result details open the latest effective revision in separate read-only **Document** and **Fields** tabs. The Document tab uses ONLYOFFICE view mode; DOCX and PDF downloads remain available. Open **Correction** separately to edit a submitted response. Admin Draft details show saved values with published Field labels and open a saved Draft DOCX in the same read-only viewer; Drafts without a saved DOCX show an unavailable-document state. Draft details have no Correction revision picker, JSON download, or edit action. Inspection does not change saved response data or document.
 
 The Admin Form list shows lifecycle state plus active Draft and Submission counts without exposing database IDs or RustFS object keys. Only a never-published Draft with no Response data can be hard-deleted; deletion removes its Template Draft objects. Create, save, and delete outcomes append attributable, secret-free Form Audit Events. Published Forms keep the same opaque share ID, Published Template, Field Manifest, and Prefill Configuration when an Admin changes only the title or description. Structural or policy changes use **Duplicate Form** instead: the source DOCX and rules are copied into a new editable Draft with a new share ID, while Responses, Submissions, Operations, Leases, and source Audit Events remain with the source. The duplicate can be edited or deleted independently; a Published Form cannot be hard-deleted or returned to Draft.
 
@@ -177,11 +183,11 @@ Publishing:
 
 ### AI Authoring
 
-Admins can open `/admin/ai-authoring` to create a DOCX template from a text description or an attached PDF. The feature is disabled unless the server has `OMNIROUTE_BASE_URL`, `OMNIROUTE_API_KEY`, and `OMNIROUTE_MODEL` configured. Set these values in the root `.env` for Compose deployments or in the server environment for local runs; blank values keep the feature disabled. Use only a permitted service credential and a PDF-capable, server-managed OmniRoute route; Folio does not select an upstream provider.
+Admins open `/admin/ai-authoring` to create a DOCX template from a text description or an attached PDF, then refine it through repeated instructions in one authoring session. The current document, conversation, and source PDF remain available after a page refresh in the same Admin authentication session. Only one authoring session may be active per authentication session; ending it starts a new document. The feature is disabled unless the server has `OMNIROUTE_BASE_URL`, `OMNIROUTE_API_KEY`, and `OMNIROUTE_MODEL` configured. Set these values in the root `.env` for Compose deployments or in the server environment for local runs; blank values keep the feature disabled. Use only a permitted service credential and a PDF-capable, server-managed OmniRoute route; Folio does not select an upstream provider.
 
-Before sending a prompt, the Admin must consent to sending prompt, document content, and any attached PDF to OmniRoute and its configured provider. PDF uploads are limited to 10 MiB. Folio sends the original PDF bytes to the configured route on the initial request and again for each revision; it does not run local OCR or rely on a first-pass text summary. Folio keeps the prompt, original PDF, and generated DOCX in a temporary authoring session, then deletes its copies when the Admin ends the session, when its owning authentication session is revoked, or after two hours of inactivity. Upstream retention follows OmniRoute and its provider policies.
+The Admin must consent before each instruction sends the prompt, current document content, and any attached PDF to OmniRoute and its configured provider. PDF uploads are limited to 10 MiB. Folio sends the original PDF bytes to the configured route on the initial request and again for each revision; it does not run local OCR or rely on a first-pass text summary. Folio keeps the current generated DOCX, conversation, and original PDF in a temporary, process-local authoring session. It deletes its copies when the Admin ends the session, when its owning authentication session is revoked, or after two hours of inactivity. A server restart also ends the process-local session. Upstream retention follows OmniRoute and its provider policies.
 
-Each DOCX contains static text and tagged content controls. Folio validates the complete DOCX package and supported controls before preview or download. Python output must also match its declared title, description, static paragraphs, field labels, and placeholders; changing only the document bytes cannot bypass revision checks. The Admin can download the document and upload it as a normal Template Draft. When the isolated document worker is configured and reachable, Pi can use model-generated Python to produce a DOCX; otherwise it offers only the built-in structured document tool. Python runs in a disposable worker container with no network or shell access and bounded CPU, memory, and execution time. Never run generated Python in the API container or mount application data into the worker.
+Each DOCX contains static text and tagged content controls. Folio validates the complete DOCX package and supported controls before preview or download, and keeps the last valid DOCX if a revision fails. Python output must also match its declared title, description, static paragraphs, field labels, and placeholders; changing only the document bytes cannot bypass revision checks. The Admin can download the document and upload it as a normal Template Draft. When the isolated document worker is configured and reachable, Pi can use model-generated Python to produce a DOCX; otherwise it offers only the built-in structured document tool. Python runs in a disposable worker container with no network or shell access and bounded CPU, memory, and execution time. Never run generated Python in the API container or mount application data into the worker.
 
 For revisions, the model declares the exact existing paragraphs it intentionally rewrites or removes and the existing field tags it intentionally removes or changes. Folio rejects undeclared paragraph or control loss and declarations that do not reference the current document. Refinement does not require specific English edit keywords.
 
@@ -191,15 +197,17 @@ Compose starts a private Docker-in-Docker daemon and document-worker sidecar; th
 
 1. Open the share link.
 2. Sign in.
-3. Wait for the user-specific prefill to appear.
-4. Open the ONLYOFFICE **Form** tab.
+3. Wait for user-specific Prefill to appear.
+4. Complete fields in the Admin-selected Fill Method: ONLYOFFICE or native.
 5. Select **Save Draft** to persist a resumable response.
 6. Return through the dashboard to resume the same response.
 7. Select **Submit** to create the immutable receipt.
 
-The prefill is snapshotted when the response starts. Resuming a draft does not refresh the profile. Starting again after publication invalidates an old draft and creates a new snapshot for the new published version. The User dashboard lists the current User's Draft with the Form title and last-saved time. Save Draft is explicit: incomplete scalar and Picture values are allowed, but unknown tags, wrong types/options/dates, text over 10,000 characters, and response JSON over 256 KiB are rejected. Native Picture controls are never remote-prefilled or serialized into response JSON; submission requires a required Picture to contain one embedded JPEG/PNG within the published byte and dimension limits. Resume reopens the same Response and document under the owning User's Editor Lease; another User cannot access its data, Operation, editor configuration, or document.
+Native filling renders published text, checkbox, date, dropdown, combo, and Picture fields in document order. Picture controls use JPEG/PNG file inputs with published byte and dimension limits. Native date controls require absent or Gregorian calendars, absent or English (`en`/`en-*`) date languages, and formats limited to year, month, and day tokens; unsupported date settings and nested controls remain ONLYOFFICE-only. Native values and ONLYOFFICE values share server validation and the canonical DOCX; PDF remains an on-demand export.
 
-Static document images remain non-editable. Picture input uses ONLYOFFICE's native control; the canonical DOCX is authoritative, with no separate image upload or image object. Submission is complete only after the extracted field JSON and canonical filled DOCX are persisted. PDF is an on-demand export and is not durable submission state.
+The Prefill is snapshotted when the response starts. Resuming a Draft does not refresh the profile. Starting again after publication invalidates an old Draft and creates a new snapshot for the new published version. The User dashboard lists the current User's Draft with the Form title and last-saved time. Save Draft is explicit: incomplete scalar and Picture values are allowed, but unknown tags, wrong types/options/dates, text over 10,000 characters, and response JSON over 256 KiB are rejected. Native Picture controls are never remote-prefilled or serialized into response JSON; submission requires a required Picture to contain one embedded JPEG/PNG within the published byte and dimension limits. Resume reopens the same Response and document under the owning User's authorization.
+
+Static document images remain non-editable. Picture fields accept native file uploads or ONLYOFFICE's native control. Uploaded image bytes remain embedded only in the canonical DOCX, with no scalar Response JSON or separate image object. Saved Drafts and Submissions preserve images across resume, Fill Method changes, and authorized DOCX/PDF export.
 
 Saving may rewrite the DOCX ZIP container while preserving embedded image bytes and their document relationships. Corrections preserve the original Submission and save a separate revised document.
 
@@ -211,7 +219,7 @@ The response contains a 32-byte random, base64url one-time code and the `/prefil
 
 After authentication, the clean Form path redeems the claim once. Folio verifies the email, Form, published Prefill Configuration, and expiry inside one serializable transaction before creating the user's Response, copying the published DOCX, and snapshotting editable or `lock-when-available` Prefill values. A configured Form rejects an ordinary share-link start. Discarding its Draft invalidates the claim and requires a new external Handoff. Invalid, expired, replayed, or mismatched claims return an accessible Thai retry state, and Handoff Audit Events contain only safe target references. The same mock polls `POST /status` with only the External Reference; Folio returns only `pending`, `draft`, `submitted`, `deleted`, or `expired` plus lifecycle timestamps and latest Correction number. Status failures and unknown references are non-enumerating. Pending or reserved Handoffs are swept every 60 seconds after expiry: claim, code digest, Prefill, and normalized identity are purged while the lookup digest and timestamps remain.
 
-Receipts expose one keyboard-accessible Thai **กลับไปยังระบบต้นทาง** action using the deployment-configured `PREFILL_RETURN_URL`; the Handoff payload cannot override it. No webhook, email, SMS, or inbound callback is used.
+Receipts default to latest revision and let Users select the immutable Submission or any Correction. Field values, DOCX, and on-demand PDF follow the selected revision. The original Submission remains immutable. Receipts expose one keyboard-accessible Thai **กลับไปยังระบบต้นทาง** action using the deployment-configured `PREFILL_RETURN_URL`; the Handoff payload cannot override it. No webhook, email, SMS, or inbound callback is used.
 
 ## DOCX template requirements
 
@@ -219,7 +227,7 @@ Fields are ONLYOFFICE content controls. Their tags are the stable field keys use
 
 Each Form defines its own unique, non-empty tags. Supported controls include text, checkbox, date, dropdown, combo box, and picture fields. The Form Bridge panel uses the exact content-control tag as the Field identity. JSON Pointer tags such as `/person/name` are stored literally (RFC 6901 escaping applies to `/` and `~` inside a segment); the panel's external schema search returns pointer keys and scalar types only. Supported authoring controls are text, checkbox, date, dropdown, combo box, and Picture; publication remains the authority that validates their final types and options.
 
-Picture fields accept exactly one native ONLYOFFICE embedded JPEG or PNG up to 10 MiB and 4096×4096 pixels. Required Picture fields must contain an image. Picture bytes stay in the canonical Draft/Submission DOCX and are preserved by authorized DOCX/PDF export; they never appear in scalar Response JSON or as independent image objects.
+Picture fields accept exactly one JPEG or PNG up to 10 MiB and 4096×4096 pixels through native upload or ONLYOFFICE's native control. Required Picture fields must contain an image on submission. Picture bytes stay in the canonical Draft/Submission DOCX and are preserved by authorized DOCX/PDF export; they never appear in scalar Response JSON or as independent image objects.
 
 The plugin extracts:
 
@@ -309,6 +317,13 @@ X-Editor-Capability: <signed-action-or-operation-capability>
 | `POST` | `/api/auth/sign-out` | Revoke the current live Session. An AI cleanup error after revocation returns `sessionRevoked: true`; a revocation failure does not. |
 | `GET` | `/api/session` | Read the current live Session and absolute expiry |
 | `POST` | `/api/account/password` | Replace the authenticated account password and revoke its Sessions |
+| `GET` | `/api/legacy-sso/status` | Check whether Legacy SSO is configured |
+| `POST` | `/api/legacy-sso/start` | Start Legacy SSO, binding the current User Session when authenticated |
+| `GET` | `/api/legacy-sso/callback` | Complete provider callback and stage account confirmation |
+| `GET` | `/api/legacy-sso/switch` | Read owner-bound identities and safe return path |
+| `POST` | `/api/legacy-sso/switch/confirm` | Confirm account switch and create one-use Session transfer |
+| `POST` | `/api/legacy-sso/switch/cancel` | Cancel switch without replacing current Session |
+| `POST` | `/api/legacy-sso/session` | Claim a confirmed Session transfer |
 | `POST` | `/api/editor-leases/:id/renew` | Renew the current Session's active editor lease |
 | `DELETE` | `/api/editor-leases/:id` | Release the current Session's editor lease |
 | `GET` | `/health` | API health check |
@@ -355,9 +370,9 @@ X-Editor-Capability: <signed-action-or-operation-capability>
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/api/submissions/:id/data` | Read authorized submission JSON and metadata |
-| `GET` | `/api/submissions/:id/docx` | Download an authorized filled DOCX |
-| `GET` | `/api/submissions/:id/pdf` | Download an authorized PDF |
+| `GET` | `/api/submissions/:id/data?revision=` | Read selected authorized revision; defaults to latest. Accepts `latest`, `original`, or a revision number. |
+| `GET` | `/api/submissions/:id/docx?revision=` | Download DOCX for selected authorized revision; defaults to latest. |
+| `GET` | `/api/submissions/:id/pdf?revision=` | Convert selected authorized revision to PDF; defaults to latest. |
 
 ### ONLYOFFICE integration
 
@@ -374,7 +389,8 @@ X-Editor-Capability: <signed-action-or-operation-capability>
 | Route | Access | Purpose |
 | --- | --- | --- |
 | `/` | Authenticated | Redirect Admin to `/admin`, User to `/dashboard` |
-| `/login` | Public | Sign in and preserve a safe return path |
+| `/login` | Public | Sign in or resume after a Legacy SSO outcome |
+| `/legacy-sso/confirm` | Authenticated User | Confirm or cancel a Legacy SSO account switch |
 | `/dashboard` | User | View and resume responses |
 | `/admin` | Admin | View lifecycle state and Draft/Submission counts; remove eligible Draft forms |
 | `/admin/audit` | Admin | Read-only cursor-filtered immutable audit events |
@@ -385,7 +401,7 @@ X-Editor-Capability: <signed-action-or-operation-capability>
 | `/admin/results` | Admin | Review all responses and open latest read-only Document and Fields views |
 | `/admin/results/:responseId` | Admin | Read the latest effective revision; download original or latest DOCX/PDF; open Correction separately |
 | `/forms/:publicId/fill` | Authenticated | Fill, save, or submit a shared form |
-| `/receipt/:submissionId` | Authorized | Read a completed submission receipt |
+| `/receipt/:submissionId` | Authorized | Select original or any Correction; view fields and download matching DOCX/PDF |
 
 ONLYOFFICE is a desktop-oriented editor. The dashboard and administrative shell are responsive; the fill/editor screen displays a desktop recommendation.
 

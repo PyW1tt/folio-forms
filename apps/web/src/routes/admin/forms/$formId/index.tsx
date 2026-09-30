@@ -91,7 +91,7 @@ const detailErrorMessage = (caughtError: unknown, fallback: string): string => {
         return "เก็บถาวรหรือยกเลิกเก็บถาวรได้เฉพาะแบบฟอร์มที่เผยแพร่แล้ว";
       }
       case "native_fill_unsupported": {
-        return "Native ใช้ได้เมื่อ Field ที่เผยแพร่ทุกช่องเป็น Text";
+        return "Native ใช้ได้เมื่อ Field ที่เผยแพร่ทุกช่องเป็น Text, Checkbox, Date, Dropdown หรือ Combo และไม่มี Picture";
       }
       case "form_unavailable": {
         return "แบบฟอร์มนี้ยังไม่พร้อมรับคำตอบใหม่";
@@ -811,7 +811,7 @@ const FormEditorRoute = () => {
                 disabled={!loadedForm.nativeFillAvailable}
                 value="native"
               >
-                Native text form
+                Native form
               </option>
             </select>
             <p
@@ -822,7 +822,7 @@ const FormEditorRoute = () => {
                 ? "Fill Method can be changed after publishing."
                 : loadedForm.nativeFillAvailable
                   ? "This method applies to new and existing Draft responses."
-                  : "Native is available only when every published Field uses text."}
+                  : "Native supports text, checkbox, date, dropdown, and combo Fields; Pictures remain ONLYOFFICE-only."}
             </p>
             {metadataBusy === "fill-method" ? (
               <p className="inline-flex items-center gap-2 text-xs" role="status">

@@ -17,6 +17,7 @@ import {
   FillMethod,
   FormStatus,
   HandoffStatus,
+  LegacyAccountLinkStatus,
   OperationStatus,
   OperationTargetType,
   PrefillPolicy,
@@ -28,13 +29,13 @@ import { env } from "@onlyoffice/env/server";
 import { Elysia } from "elysia";
 import { strToU8, unzipSync, zipSync } from "fflate";
 import { SaxesParser } from "saxes";
+
 import {
   AiAuthoringSessions,
   authoringDisclosure,
 } from "./ai-authoring";
 import type { GeneratedTemplate, OmniRouteConfig } from "./ai-authoring";
 import { AiAuthoringError } from "./ai-authoring-error";
-
 import {
   callbackClaim,
   createCallbackUserdata,
@@ -161,8 +162,10 @@ const legacySsoSessionTransferLifetimeSeconds = 60;
 const legacySsoExchangeBodyMaximumBytes = 8 * 1024;
 const legacySsoCookieName = "__Host-folio-sso";
 const legacySsoSessionCookieName = "__Host-folio-sso-session";
+const legacySsoSwitchCookieName = "__Host-folio-sso-switch";
 const legacySsoTransactionIdentifier = "legacy-sso-transaction";
 const legacySsoSessionIdentifier = "legacy-sso-session";
+const legacySsoSwitchIdentifier = "legacy-sso-switch";
 
 const handoffExpirySweepBatchSize = 100;
 const handoffCodeMaximumLength = 256;
@@ -240,9 +243,19 @@ interface LegacySsoTransaction {
   callbackUrl: string;
   clientId: string;
   codeVerifier: string;
+  generation: string;
+  initiatingSessionId?: string;
+  initiatingUserId?: string;
   returnTo: string;
   state: string;
 }
+interface LegacySsoSwitchChallenge {
+  initiatingSessionId: string;
+  initiatingUserId: string;
+  returnTo: string;
+  targetUserId: string;
+}
+const legacySsoSwitchLifetimeSeconds = 5 * 60;
 interface LegacyIdentity {
   email: string;
   subject: string;
@@ -257,6 +270,13 @@ interface Identity {
   role: UserRole;
   sessionId: string;
 }
+type LegacySsoAccountUser = Pick<Identity, "id" | "role"> & {
+  enabled: boolean;
+};
+type LegacySsoAccountResolution =
+  | { kind: "failed" }
+  | { kind: "linked"; user: LegacySsoAccountUser }
+  | { kind: "pending" };
 type Actor = Pick<
   Identity,
   "email" | "id" | "mustChangePassword" | "name" | "role"
@@ -271,7 +291,9 @@ type AccountAuditAction =
   | "promote_user"
   | "demote_user"
   | "reset_user_password"
-  | "update_user";
+  | "update_user"
+  | "approve_legacy_account_link"
+  | "reject_legacy_account_link";
 const adminUserSelect = {
   createdAt: true,
   email: true,
@@ -582,11 +604,13 @@ interface OperationMetadata extends JsonRecord {
   action: OperationAction;
   baseDocumentKey?: string;
   baseRevision?: number;
+  callbackEmptyFieldTags?: string[];
   cleanupObjectKeys?: string[];
   correctionId?: string;
   data?: JsonRecord;
   finalObjectKey: string;
   formId: string;
+  nativeDocumentStaged?: boolean;
   nextDocumentKey?: string;
   publicId?: string;
   publishedKey?: string;
@@ -594,11 +618,12 @@ interface OperationMetadata extends JsonRecord {
   reason?: string;
   responseId?: string;
   result?: JsonRecord;
+  serverHeldFieldTags?: string[];
   stagedObjectKey: string;
   submissionDocumentKey?: string;
+  submissionId?: string;
   workspaceDocumentKey?: string;
   workspaceObjectKey?: string;
-  submissionId?: string;
 }
 
 interface OperationCompletion {
@@ -1020,11 +1045,7 @@ async function readFormMetadataInput(
       input.fillMethod !== FillMethod.native &&
       input.fillMethod !== FillMethod.onlyoffice
     ) {
-      fail(
-        400,
-        "invalid_request",
-        "fillMethod must be native or onlyoffice"
-      );
+      fail(400, "invalid_request", "fillMethod must be native or onlyoffice");
     }
     metadata.fillMethod = input.fillMethod;
   }
@@ -1042,9 +1063,12 @@ function operationMetadata(value: unknown): OperationMetadata {
   const metadata = asRecord(value, "Operation metadata is invalid");
   const {
     action,
+    callbackEmptyFieldTags,
     cleanupObjectKeys,
     finalObjectKey,
     formId,
+    nativeDocumentStaged,
+    serverHeldFieldTags,
     stagedObjectKey,
     workspaceDocumentKey,
     workspaceObjectKey,
@@ -1058,6 +1082,14 @@ function operationMetadata(value: unknown): OperationMetadata {
     typeof formId !== "string" ||
     typeof stagedObjectKey !== "string" ||
     typeof finalObjectKey !== "string" ||
+    (nativeDocumentStaged !== undefined &&
+      typeof nativeDocumentStaged !== "boolean") ||
+    (callbackEmptyFieldTags !== undefined &&
+      (!Array.isArray(callbackEmptyFieldTags) ||
+        callbackEmptyFieldTags.some((tag) => typeof tag !== "string"))) ||
+    (serverHeldFieldTags !== undefined &&
+      (!Array.isArray(serverHeldFieldTags) ||
+        serverHeldFieldTags.some((tag) => typeof tag !== "string"))) ||
     (cleanupObjectKeys !== undefined &&
       (!Array.isArray(cleanupObjectKeys) ||
         cleanupObjectKeys.some((key) => typeof key !== "string"))) ||
@@ -1377,7 +1409,9 @@ function legacySsoConfigurationFromEnv(): LegacySsoConfig | null {
     typeof exchangeUrl !== "string" ||
     typeof providerId !== "string"
   ) {
-    throw new Error("All six LEGACY_SSO settings must be configured together");
+    throw new TypeError(
+      "All six LEGACY_SSO settings must be configured together"
+    );
   }
   return validatedLegacySsoConfiguration({
     authorizeUrl,
@@ -1401,10 +1435,12 @@ function validatedLegacySsoConfiguration(
     }
     if (
       (url.protocol !== "https:" &&
-        !(url.protocol === "http:" &&
+        !(
+          url.protocol === "http:" &&
           (url.hostname === "localhost" ||
             url.hostname === "127.0.0.1" ||
-            url.hostname === "[::1]"))) ||
+            url.hostname === "[::1]")
+        )) ||
       url.username ||
       url.password ||
       url.hash
@@ -1417,14 +1453,8 @@ function validatedLegacySsoConfiguration(
     config.authorizeUrl,
     "LEGACY_SSO_AUTHORIZE_URL"
   );
-  const callback = parseEndpoint(
-    config.callbackUrl,
-    "LEGACY_SSO_CALLBACK_URL"
-  );
-  const exchange = parseEndpoint(
-    config.exchangeUrl,
-    "LEGACY_SSO_EXCHANGE_URL"
-  );
+  const callback = parseEndpoint(config.callbackUrl, "LEGACY_SSO_CALLBACK_URL");
+  const exchange = parseEndpoint(config.exchangeUrl, "LEGACY_SSO_EXCHANGE_URL");
   if (
     authorize.search ||
     exchange.search ||
@@ -1460,7 +1490,7 @@ function safeLegacyFormReturnPath(
     !value.startsWith("/") ||
     value.startsWith("//") ||
     value.includes("\\") ||
-    /[\u0000-\u001f\u007f]/u.test(value)
+    /[\u0000-\u001F\u007F]/u.test(value)
   ) {
     return null;
   }
@@ -1473,7 +1503,7 @@ function safeLegacyFormReturnPath(
   if (
     decoded.startsWith("//") ||
     decoded.includes("\\") ||
-    /[\u0000-\u001f\u007f]/u.test(decoded)
+    /[\u0000-\u001F\u007F]/u.test(decoded)
   ) {
     return null;
   }
@@ -1484,9 +1514,7 @@ function safeLegacyFormReturnPath(
   } catch {
     return null;
   }
-  const isFormPath = /^\/forms\/[0-9a-f]{32}\/fill$/u.test(
-    returnUrl.pathname
-  );
+  const isFormPath = /^\/forms\/[0-9a-f]{32}\/fill$/u.test(returnUrl.pathname);
   const isDashboardPath =
     returnUrl.pathname === "/dashboard" && !returnUrl.search;
   if (
@@ -1497,10 +1525,7 @@ function safeLegacyFormReturnPath(
     return null;
   }
   const queryKeys = [...returnUrl.searchParams.keys()];
-  if (
-    queryKeys.some((key) => key !== "responseId") ||
-    queryKeys.length > 1
-  ) {
+  if (queryKeys.some((key) => key !== "responseId") || queryKeys.length > 1) {
     return null;
   }
   const responseIds = returnUrl.searchParams.getAll("responseId");
@@ -1551,10 +1576,17 @@ function hostOnlySsoCookie(
   return `${name}=${value}; Path=/; Max-Age=${maxAge}; HttpOnly; Secure; SameSite=${sameSite}`;
 }
 
-function legacySsoFailureResponse(): globalThis.Response {
+function legacySsoRedirectResponse(
+  result: "failed" | "pending",
+  returnTo?: string
+): globalThis.Response {
+  const location = new URL(`/login?legacySso=${result}`, corsOrigin);
+  if (returnTo) {
+    location.searchParams.set("returnTo", returnTo);
+  }
   const headers = new Headers({
     "Cache-Control": "no-store",
-    Location: new URL("/login?legacySso=failed", corsOrigin).href,
+    Location: location.href,
     "Referrer-Policy": "no-referrer",
   });
   headers.append("Set-Cookie", hostOnlySsoCookie(legacySsoCookieName, "", 0));
@@ -1562,7 +1594,17 @@ function legacySsoFailureResponse(): globalThis.Response {
     "Set-Cookie",
     hostOnlySsoCookie(legacySsoSessionCookieName, "", 0, "None")
   );
+  headers.append(
+    "Set-Cookie",
+    hostOnlySsoCookie(legacySsoSwitchCookieName, "", 0, "None")
+  );
   return new Response(null, { headers, status: 303 });
+}
+function legacySsoFailureResponse(returnTo?: string): globalThis.Response {
+  return legacySsoRedirectResponse("failed", returnTo);
+}
+function legacySsoPendingResponse(returnTo?: string): globalThis.Response {
+  return legacySsoRedirectResponse("pending", returnTo);
 }
 
 function legacySsoTransaction(value: string): LegacySsoTransaction | null {
@@ -1580,10 +1622,18 @@ function legacySsoTransaction(value: string): LegacySsoTransaction | null {
     typeof transaction.callbackUrl !== "string" ||
     typeof transaction.clientId !== "string" ||
     typeof transaction.codeVerifier !== "string" ||
+    typeof transaction.generation !== "string" ||
+    !/^[1-9]\d*$/u.test(transaction.generation) ||
     typeof transaction.returnTo !== "string" ||
     typeof transaction.state !== "string" ||
     !/^[A-Za-z0-9._~-]{43,128}$/u.test(transaction.codeVerifier) ||
-    !/^[A-Za-z0-9_-]{43}$/u.test(transaction.state)
+    !/^[A-Za-z0-9_-]{43}$/u.test(transaction.state) ||
+    (transaction.initiatingUserId !== undefined &&
+      typeof transaction.initiatingUserId !== "string") ||
+    (transaction.initiatingSessionId !== undefined &&
+      typeof transaction.initiatingSessionId !== "string") ||
+    (typeof transaction.initiatingUserId === "string") !==
+      (typeof transaction.initiatingSessionId === "string")
   ) {
     return null;
   }
@@ -1591,6 +1641,9 @@ function legacySsoTransaction(value: string): LegacySsoTransaction | null {
     callbackUrl: transaction.callbackUrl,
     clientId: transaction.clientId,
     codeVerifier: transaction.codeVerifier,
+    generation: transaction.generation,
+    initiatingSessionId: transaction.initiatingSessionId as string | undefined,
+    initiatingUserId: transaction.initiatingUserId as string | undefined,
     returnTo: transaction.returnTo,
     state: transaction.state,
   };
@@ -1652,7 +1705,7 @@ async function readLegacyIdentityResponse(
     claims.sub.length === 0 ||
     claims.sub.length > 255 ||
     claims.sub.trim() !== claims.sub ||
-    /[\u0000-\u001f\u007f]/u.test(claims.sub) ||
+    /[\u0000-\u001F\u007F]/u.test(claims.sub) ||
     typeof claims.email !== "string" ||
     claims.email.length > accountEmailMaximumLength ||
     !accountEmailPattern.test(claims.email) ||
@@ -1696,6 +1749,245 @@ async function exchangeLegacyCode(
     return null;
   }
 }
+async function nextLegacySsoGeneration(
+  tx: Prisma.TransactionClient,
+  providerId: string
+): Promise<bigint> {
+  await tx.$executeRaw`
+    SELECT pg_advisory_xact_lock(
+      hashtext('legacy-sso-generation'),
+      hashtext(${providerId})
+    )
+  `;
+  const [row] = await tx.$queryRaw<{ generation: bigint }[]>(
+    Prisma.sql`SELECT nextval('"legacy_sso_generation_seq"') AS generation`
+  );
+  if (!row) {
+    throw new Error("Database did not return SSO generation");
+  }
+  return row.generation;
+}
+
+async function linkApprovedLegacyAccount(
+  config: LegacySsoConfig,
+  identity: LegacyIdentity,
+  requestId: string,
+  userId: string,
+  transactionGeneration: bigint
+): Promise<LegacySsoAccountUser | null> {
+  return prisma.$transaction(async (tx) => {
+    const [lockedUser] = await tx.$queryRaw<{ id: string }[]>(
+      Prisma.sql`SELECT "id" FROM "user" WHERE "id" = ${userId} FOR UPDATE`
+    );
+    if (!lockedUser) {
+      return null;
+    }
+    const [lockedRequest] = await tx.$queryRaw<{ id: string }[]>(
+      Prisma.sql`SELECT "id" FROM "legacy_account_link_requests" WHERE "id" = ${requestId}::uuid FOR UPDATE`
+    );
+    if (!lockedRequest) {
+      return null;
+    }
+    const linkRequest = await tx.legacyAccountLinkRequest.findUnique({
+      where: { id: requestId },
+    });
+    if (
+      !linkRequest ||
+      (linkRequest.status !== LegacyAccountLinkStatus.approved &&
+        linkRequest.status !== LegacyAccountLinkStatus.linked) ||
+      !linkRequest.reviewedGeneration ||
+      transactionGeneration <= linkRequest.reviewedGeneration ||
+      linkRequest.providerId !== config.providerId ||
+      linkRequest.subject !== identity.subject ||
+      linkRequest.email !== identity.email
+    ) {
+      return null;
+    }
+    const user = await tx.user.findUnique({
+      select: { email: true, enabled: true, id: true, role: true },
+      where: { id: userId },
+    });
+    if (
+      !user ||
+      !user.enabled ||
+      user.role !== "user" ||
+      user.email !== linkRequest.email
+    ) {
+      return null;
+    }
+    const account = await tx.account.findUnique({
+      select: { userId: true },
+      where: {
+        providerId_accountId: {
+          accountId: identity.subject,
+          providerId: config.providerId,
+        },
+      },
+    });
+    if (account && account.userId !== user.id) {
+      return null;
+    }
+    if (!account) {
+      await tx.account.create({
+        data: {
+          accountId: identity.subject,
+          id: crypto.randomUUID(),
+          issuer: config.providerId,
+          providerId: config.providerId,
+          userId: user.id,
+        },
+      });
+    }
+    if (linkRequest.status === LegacyAccountLinkStatus.approved) {
+      await tx.legacyAccountLinkRequest.update({
+        data: { status: LegacyAccountLinkStatus.linked },
+        where: { id: requestId },
+      });
+    }
+    return user;
+  });
+}
+
+async function resolveLegacySsoLinkRequest(
+  config: LegacySsoConfig,
+  identity: LegacyIdentity,
+  transactionGeneration: bigint
+): Promise<LegacySsoAccountResolution | null> {
+  const linkRequest = await prisma.legacyAccountLinkRequest.findUnique({
+    where: {
+      providerId_subject: {
+        providerId: config.providerId,
+        subject: identity.subject,
+      },
+    },
+  });
+  if (!linkRequest) {
+    return null;
+  }
+  if (linkRequest.email !== identity.email) {
+    return { kind: "failed" };
+  }
+  if (linkRequest.status === LegacyAccountLinkStatus.pending) {
+    return { kind: "pending" };
+  }
+  if (
+    linkRequest.status !== LegacyAccountLinkStatus.approved &&
+    linkRequest.status !== LegacyAccountLinkStatus.linked
+  ) {
+    return { kind: "failed" };
+  }
+  const user = await linkApprovedLegacyAccount(
+    config,
+    identity,
+    linkRequest.id,
+    linkRequest.userId,
+    transactionGeneration
+  );
+  return user ? { kind: "linked", user } : { kind: "failed" };
+}
+
+async function resolveLegacySsoAccount(
+  config: LegacySsoConfig,
+  identity: LegacyIdentity,
+  transactionGeneration: bigint
+): Promise<LegacySsoAccountResolution | null> {
+  const existingRequest = await resolveLegacySsoLinkRequest(
+    config,
+    identity,
+    transactionGeneration
+  );
+  if (existingRequest) {
+    return existingRequest;
+  }
+  const linkedAccountLookup = {
+    include: {
+      user: {
+        select: { enabled: true, id: true, role: true },
+      },
+    },
+    where: {
+      providerId_accountId: {
+        accountId: identity.subject,
+        providerId: config.providerId,
+      },
+    },
+  } as const;
+  const linkedAccount = await prisma.account.findUnique(linkedAccountLookup);
+  if (linkedAccount) {
+    const latestRequest = await resolveLegacySsoLinkRequest(
+      config,
+      identity,
+      transactionGeneration
+    );
+    return latestRequest ?? { kind: "linked", user: linkedAccount.user };
+  }
+  try {
+    const user = await prisma.user.create({
+      data: {
+        accounts: {
+          create: {
+            accountId: identity.subject,
+            id: crypto.randomUUID(),
+            issuer: config.providerId,
+            providerId: config.providerId,
+          },
+        },
+        email: identity.email,
+        emailVerified: true,
+        enabled: true,
+        id: crypto.randomUUID(),
+        mustChangePassword: false,
+        name: identity.email,
+        role: "user",
+      },
+      select: { enabled: true, id: true, role: true },
+    });
+    return { kind: "linked", user };
+  } catch (error) {
+    if (databaseErrorCode(error) !== "P2002") {
+      throw error;
+    }
+    const racedAccount = await prisma.account.findUnique(linkedAccountLookup);
+    if (racedAccount) {
+      const latestRequest = await resolveLegacySsoLinkRequest(
+        config,
+        identity,
+        transactionGeneration
+      );
+      return latestRequest ?? { kind: "linked", user: racedAccount.user };
+    }
+    const existingUser = await prisma.user.findUnique({
+      select: { id: true },
+      where: { email: identity.email },
+    });
+    if (!existingUser) {
+      return null;
+    }
+    try {
+      await prisma.legacyAccountLinkRequest.create({
+        data: {
+          email: identity.email,
+          providerId: config.providerId,
+          subject: identity.subject,
+          userId: existingUser.id,
+        },
+      });
+      return { kind: "pending" };
+    } catch (requestError) {
+      if (
+        databaseErrorCode(requestError) !== "P2002" &&
+        databaseErrorCode(requestError) !== "P2003"
+      ) {
+        throw requestError;
+      }
+      return resolveLegacySsoLinkRequest(
+        config,
+        identity,
+        transactionGeneration
+      );
+    }
+  }
+}
 
 async function createSsoSessionTransfer(
   userId: string,
@@ -1726,24 +2018,73 @@ async function createSsoSessionTransfer(
   }
   return transferId;
 }
+function legacySsoSwitchChallenge(
+  value: string
+): LegacySsoSwitchChallenge | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return null;
+  }
+  const challenge = parsed as Record<string, unknown>;
+  if (
+    typeof challenge.initiatingSessionId !== "string" ||
+    typeof challenge.initiatingUserId !== "string" ||
+    typeof challenge.returnTo !== "string" ||
+    typeof challenge.targetUserId !== "string"
+  ) {
+    return null;
+  }
+  return {
+    initiatingSessionId: challenge.initiatingSessionId,
+    initiatingUserId: challenge.initiatingUserId,
+    returnTo: challenge.returnTo,
+    targetUserId: challenge.targetUserId,
+  };
+}
+
+function legacySsoSwitchCookie(value: string, maxAge: number): string {
+  return hostOnlySsoCookie(legacySsoSwitchCookieName, value, maxAge, "None");
+}
+
+function legacySsoSwitchFailure(): globalThis.Response {
+  return Response.json(
+    { error: "unauthorized", message: "The account switch is unavailable" },
+    { headers: { "Cache-Control": "no-store" }, status: 401 }
+  );
+}
 
 async function startLegacySso(
   request: Request,
   config: LegacySsoConfig,
-  clock: () => Date
+  clock: () => Date,
+  identity: Identity | null
 ): Promise<globalThis.Response> {
-  const requestUrl = new URL(request.url);
-  const queryKeys = [...requestUrl.searchParams.keys()];
-  if (queryKeys.some((key) => key !== "returnTo")) {
+  if (identity && identity.role !== "user") {
+    fail(403, "legacy_sso_user_required", "Only Users can switch accounts");
+  }
+  if (new URL(request.url).search) {
+    fail(
+      400,
+      "invalid_return_path",
+      "Return path must be sent in the JSON body"
+    );
+  }
+  const input = await readJsonRecord(request, 8 * 1024);
+  if (
+    Object.keys(input).some((key) => key !== "returnTo") ||
+    (input.returnTo !== undefined && typeof input.returnTo !== "string")
+  ) {
     fail(400, "invalid_return_path", "Only a Form return path is accepted");
   }
-  const returnValues = requestUrl.searchParams.getAll("returnTo");
   const returnTo =
-    returnValues.length === 0
+    input.returnTo === undefined
       ? "/dashboard"
-      : returnValues.length === 1
-        ? safeLegacyFormReturnPath(returnValues[0], config.callbackUrl)
-        : null;
+      : safeLegacyFormReturnPath(input.returnTo, config.callbackUrl);
   if (!returnTo) {
     fail(400, "invalid_return_path", "The Form return path is unsafe");
   }
@@ -1761,23 +2102,33 @@ async function startLegacySso(
     where: {
       expiresAt: { lte: now },
       identifier: {
-        in: [legacySsoTransactionIdentifier, legacySsoSessionIdentifier],
+        in: [
+          legacySsoTransactionIdentifier,
+          legacySsoSessionIdentifier,
+          legacySsoSwitchIdentifier,
+        ],
       },
     },
   });
-  await prisma.verification.create({
-    data: {
-      expiresAt,
-      id: transactionId,
-      identifier: legacySsoTransactionIdentifier,
-      value: JSON.stringify({
-        callbackUrl: config.callbackUrl,
-        clientId: config.clientId,
-        codeVerifier,
-        returnTo,
-        state,
-      } satisfies LegacySsoTransaction),
-    },
+  await prisma.$transaction(async (tx) => {
+    const generation = await nextLegacySsoGeneration(tx, config.providerId);
+    await tx.verification.create({
+      data: {
+        expiresAt,
+        id: transactionId,
+        identifier: legacySsoTransactionIdentifier,
+        value: JSON.stringify({
+          callbackUrl: config.callbackUrl,
+          clientId: config.clientId,
+          codeVerifier,
+          generation: generation.toString(),
+          initiatingSessionId: identity?.sessionId,
+          initiatingUserId: identity?.id,
+          returnTo,
+          state,
+        } satisfies LegacySsoTransaction),
+      },
+    });
   });
   const authorizeUrl = new URL(config.authorizeUrl);
   authorizeUrl.searchParams.set("client_id", config.clientId);
@@ -1787,7 +2138,6 @@ async function startLegacySso(
   authorizeUrl.searchParams.set("code_challenge_method", "S256");
   const headers = new Headers({
     "Cache-Control": "no-store",
-    Location: authorizeUrl.href,
     "Referrer-Policy": "no-referrer",
   });
   headers.append(
@@ -1795,10 +2145,12 @@ async function startLegacySso(
     hostOnlySsoCookie(
       legacySsoCookieName,
       transactionId,
-      legacySsoTransactionLifetimeSeconds
+      legacySsoTransactionLifetimeSeconds,
+      "None"
     )
   );
-  return new Response(null, { headers, status: 303 });
+  headers.append("Set-Cookie", legacySsoSwitchCookie("", 0));
+  return Response.json({ authorizationUrl: authorizeUrl.href }, { headers });
 }
 
 async function completeLegacySso(
@@ -1827,11 +2179,7 @@ async function completeLegacySso(
   }
   const code = codeValues[0];
   const state = stateValues[0];
-  const transactionId = cookieValueFor(
-    request,
-    legacySsoCookieName,
-    43
-  );
+  const transactionId = cookieValueFor(request, legacySsoCookieName, 43);
   if (
     !code ||
     code.length > handoffCodeMaximumLength ||
@@ -1860,6 +2208,10 @@ async function completeLegacySso(
   ) {
     return legacySsoFailureResponse();
   }
+  const sessionReturnTo =
+    transaction.initiatingUserId && transaction.initiatingSessionId
+      ? transaction.returnTo
+      : undefined;
   const consumed = await prisma.verification.deleteMany({
     where: {
       expiresAt: { gt: now },
@@ -1876,29 +2228,74 @@ async function completeLegacySso(
     transaction.codeVerifier
   );
   if (!identity) {
-    return legacySsoFailureResponse();
+    return legacySsoFailureResponse(sessionReturnTo);
   }
-  const linkedAccount = await prisma.account.findUnique({
-    include: {
-      user: {
-        select: { email: true, enabled: true, id: true, role: true },
-      },
-    },
-    where: {
-      providerId_accountId: {
-        accountId: identity.subject,
-        providerId: config.providerId,
-      },
-    },
-  });
-  if (
-    !linkedAccount?.user.enabled ||
-    linkedAccount.user.role !== "user" ||
-    normalizeEmail(linkedAccount.user.email) !== identity.email
-  ) {
-    return legacySsoFailureResponse();
+  const accountResolution = await resolveLegacySsoAccount(
+    config,
+    identity,
+    BigInt(transaction.generation)
+  );
+  if (!accountResolution) {
+    return legacySsoFailureResponse(sessionReturnTo);
   }
-  const transferId = await createSsoSessionTransfer(linkedAccount.user.id, now);
+  if (accountResolution.kind === "pending") {
+    return legacySsoPendingResponse(sessionReturnTo);
+  }
+  if (accountResolution.kind === "failed") {
+    return legacySsoFailureResponse(sessionReturnTo);
+  }
+  const user = accountResolution.user;
+  if (!user.enabled || user.role !== "user") {
+    return legacySsoFailureResponse(sessionReturnTo);
+  }
+  if (transaction.initiatingUserId && transaction.initiatingSessionId) {
+    const initiatingSession = await prisma.session.findUnique({
+      select: { expiresAt: true, userId: true },
+      where: { id: transaction.initiatingSessionId },
+    });
+    if (
+      !initiatingSession ||
+      initiatingSession.userId !== transaction.initiatingUserId
+    ) {
+      return legacySsoFailureResponse(sessionReturnTo);
+    }
+    if (initiatingSession.expiresAt.getTime() > now.getTime()) {
+      const challengeId = randomBytes(32).toString("base64url");
+      await prisma.verification.create({
+        data: {
+          expiresAt: new Date(
+            now.getTime() + legacySsoSwitchLifetimeSeconds * 1000
+          ),
+          id: challengeId,
+          identifier: legacySsoSwitchIdentifier,
+          value: JSON.stringify({
+            initiatingSessionId: transaction.initiatingSessionId,
+            initiatingUserId: transaction.initiatingUserId,
+            returnTo: transaction.returnTo,
+            targetUserId: user.id,
+          } satisfies LegacySsoSwitchChallenge),
+        },
+      });
+      const headers = new Headers({
+        "Cache-Control": "no-store",
+        Location: new URL("/legacy-sso/confirm", corsOrigin).href,
+        "Referrer-Policy": "no-referrer",
+      });
+      headers.append(
+        "Set-Cookie",
+        hostOnlySsoCookie(legacySsoCookieName, "", 0)
+      );
+      headers.append(
+        "Set-Cookie",
+        legacySsoSwitchCookie(challengeId, legacySsoSwitchLifetimeSeconds)
+      );
+      return new Response(null, { headers, status: 303 });
+    }
+    if (user.id !== transaction.initiatingUserId) {
+      return legacySsoFailureResponse(sessionReturnTo);
+    }
+  }
+  const transferId = await createSsoSessionTransfer(user.id, now);
   const headers = new Headers({
     "Cache-Control": "no-store",
     Location: new URL(transaction.returnTo, corsOrigin).href,
@@ -1943,11 +2340,7 @@ async function claimLegacySsoSession(
     originOf(env.BETTER_AUTH_URL),
     config ? originOf(config.callbackUrl) : null,
   ];
-  if (
-    !config ||
-    !requestOrigin ||
-    !allowedOrigins.includes(requestOrigin)
-  ) {
+  if (!config || !requestOrigin || !allowedOrigins.includes(requestOrigin)) {
     return Response.json(
       {
         error: "forbidden",
@@ -1956,11 +2349,7 @@ async function claimLegacySsoSession(
       { headers: { "Cache-Control": "no-store" }, status: 403 }
     );
   }
-  const transferId = cookieValueFor(
-    request,
-    legacySsoSessionCookieName,
-    43
-  );
+  const transferId = cookieValueFor(request, legacySsoSessionCookieName, 43);
   if (!transferId) {
     return legacySsoSessionUnavailableResponse();
   }
@@ -1991,6 +2380,165 @@ async function claimLegacySsoSession(
     hostOnlySsoCookie(legacySsoSessionCookieName, "", 0, "None")
   );
   return Response.json({ token: transfer.value }, { headers });
+}
+interface LegacySsoSwitchContext {
+  challenge: LegacySsoSwitchChallenge;
+  challengeId: string;
+  confirmationFingerprint: string | null;
+  identity: Identity;
+  target: { email: string; id: string; name: string } | null;
+}
+
+function legacySsoConfirmationFingerprint(
+  identity: Identity,
+  challenge: LegacySsoSwitchChallenge,
+  target: { email: string; id: string; name: string }
+): string {
+  return createHash("sha256")
+    .update(
+      JSON.stringify([
+        identity.id,
+        identity.sessionId,
+        identity.email,
+        identity.name,
+        target.id,
+        target.email,
+        target.name,
+        challenge.returnTo,
+      ])
+    )
+    .digest("base64url");
+}
+
+async function legacySsoSwitchContext(
+  request: Request,
+  clock: () => Date,
+  config: LegacySsoConfig | null
+): Promise<LegacySsoSwitchContext | null> {
+  const requestOrigin = request.headers.get("origin");
+  const requestOriginAllowed =
+    requestOrigin === null
+      ? request.method === "GET"
+      : config !== null &&
+        [
+          corsOrigin,
+          originOf(env.BETTER_AUTH_URL),
+          originOf(config.callbackUrl),
+        ].includes(requestOrigin);
+  const identity = await identityFor(request);
+  const challengeId = cookieValueFor(request, legacySsoSwitchCookieName, 43);
+  if (
+    !config ||
+    !requestOriginAllowed ||
+    !identity ||
+    identity.role !== "user" ||
+    !challengeId
+  ) {
+    return null;
+  }
+  const now = clock();
+  const stored = await prisma.verification.findUnique({
+    where: { id: challengeId },
+  });
+  const challenge =
+    stored?.identifier === legacySsoSwitchIdentifier &&
+    stored.expiresAt.getTime() > now.getTime()
+      ? legacySsoSwitchChallenge(stored.value)
+      : null;
+  if (
+    !challenge ||
+    challenge.initiatingUserId !== identity.id ||
+    challenge.initiatingSessionId !== identity.sessionId ||
+    !safeLegacyFormReturnPath(challenge.returnTo, config.callbackUrl)
+  ) {
+    return null;
+  }
+  const target = await prisma.user.findUnique({
+    select: { email: true, enabled: true, id: true, name: true, role: true },
+    where: { id: challenge.targetUserId },
+  });
+  const switchTarget =
+    target?.enabled && target.role === "user"
+      ? { email: target.email, id: target.id, name: target.name }
+      : null;
+  return {
+    challenge,
+    challengeId,
+    confirmationFingerprint: switchTarget
+      ? legacySsoConfirmationFingerprint(identity, challenge, switchTarget)
+      : null,
+    identity,
+    target: switchTarget,
+  };
+}
+
+async function readLegacySsoSwitch(
+  request: Request,
+  clock: () => Date,
+  config: LegacySsoConfig | null
+): Promise<globalThis.Response> {
+  const context = await legacySsoSwitchContext(request, clock, config);
+  if (!context?.target || !context.confirmationFingerprint) {
+    return legacySsoSwitchFailure();
+  }
+  const currentIdentity = context.identity;
+  return Response.json(
+    {
+      confirmationFingerprint: context.confirmationFingerprint,
+      current: { email: currentIdentity.email, name: currentIdentity.name },
+      legacy: { email: context.target.email, name: context.target.name },
+      returnTo: context.challenge.returnTo,
+      sameUser: context.target.id === currentIdentity.id,
+    },
+    { headers: { "Cache-Control": "no-store" } }
+  );
+}
+
+async function consumeLegacySsoSwitch(
+  request: Request,
+  clock: () => Date,
+  config: LegacySsoConfig | null,
+  confirm: boolean
+): Promise<globalThis.Response> {
+  const context = await legacySsoSwitchContext(request, clock, config);
+  if (!context?.target || !context.confirmationFingerprint) {
+    return legacySsoSwitchFailure();
+  }
+  const input = await readJsonRecord(request, 1024);
+  if (
+    Object.keys(input).length !== 1 ||
+    typeof input.confirmationFingerprint !== "string" ||
+    input.confirmationFingerprint !== context.confirmationFingerprint
+  ) {
+    return legacySsoSwitchFailure();
+  }
+  const now = clock();
+  const consumed = await prisma.verification.deleteMany({
+    where: {
+      expiresAt: { gt: now },
+      id: context.challengeId,
+      identifier: legacySsoSwitchIdentifier,
+    },
+  });
+  if (consumed.count !== 1) {
+    return legacySsoSwitchFailure();
+  }
+  const headers = new Headers({ "Cache-Control": "no-store" });
+  headers.append("Set-Cookie", legacySsoSwitchCookie("", 0));
+  if (!confirm) {
+    return Response.json({ cancelled: true }, { headers });
+  }
+  const transferId = await createSsoSessionTransfer(context.target.id, now);
+  headers.append(
+    "Set-Cookie",
+    hostOnlySsoCookie(
+      legacySsoSessionCookieName,
+      transferId,
+      legacySsoSessionTransferLifetimeSeconds,
+      "None"
+    )
+  );
+  return Response.json({ returnTo: context.challenge.returnTo }, { headers });
 }
 
 function handoffUnavailable(): never {
@@ -2353,7 +2901,7 @@ async function endAiAuthoringSessions(
   await withAiAuthoringSessionsEnding(
     aiAuthoring,
     ownerSessionIds,
-    async () => undefined
+    async () => {}
   );
 }
 async function handleEmailSignIn(
@@ -2559,7 +3107,6 @@ function requireEditorScope(
     );
   }
 }
-
 
 function editorLeaseTargetType(
   targetType: EditorCapabilityTarget
@@ -3277,7 +3824,7 @@ async function createAccountFailureAudit({
 async function withAdminMutation<T>(
   request: Request,
   action: AccountAuditAction,
-  targetId: string | null,
+  targetId: string | null | (() => Promise<string | null>),
   operation: (
     identity: Identity,
     setAction: (action: AccountAuditAction) => void
@@ -3289,9 +3836,13 @@ async function withAdminMutation<T>(
   }
   requireAdmin(identity);
   let auditAction = action;
+  let auditTargetId = typeof targetId === "function" ? null : targetId;
   try {
     if (identity.mustChangePassword) {
       fail(403, "password_change_required", "Password replacement is required");
+    }
+    if (typeof targetId === "function") {
+      auditTargetId = await targetId();
     }
     return await operation(identity, (nextAction) => {
       auditAction = nextAction;
@@ -3306,13 +3857,120 @@ async function withAdminMutation<T>(
         action: auditAction,
         actorId: identity.id,
         error: normalizedError,
-        targetId,
+        targetId: auditTargetId,
       });
     } catch {
       // Preserve the route error if the failure audit cannot be persisted.
     }
     throw normalizedError;
   }
+}
+
+async function reviewLegacyAccountLink(
+  identity: Identity,
+  requestId: string,
+  decision: "approved" | "rejected"
+): Promise<{ ok: true }> {
+  const action =
+    decision === "approved"
+      ? "approve_legacy_account_link"
+      : "reject_legacy_account_link";
+  await accountTransaction(identity, async (tx) => {
+    const requestSnapshot = await tx.legacyAccountLinkRequest.findUnique({
+      select: { userId: true },
+      where: { id: requestId },
+    });
+    if (!requestSnapshot) {
+      fail(404, "not_found", "Account link request was not found");
+    }
+    const user = await lockAccountUser(tx, requestSnapshot.userId);
+    const [lockedRequest] = await tx.$queryRaw<{ id: string }[]>(
+      Prisma.sql`SELECT "id" FROM "legacy_account_link_requests" WHERE "id" = ${requestId}::uuid FOR UPDATE`
+    );
+    if (!lockedRequest) {
+      fail(404, "not_found", "Account link request was not found");
+    }
+    const linkRequest = await tx.legacyAccountLinkRequest.findUnique({
+      where: { id: requestId },
+    });
+    if (!linkRequest) {
+      fail(404, "not_found", "Account link request was not found");
+    }
+    const generation =
+      decision === "approved"
+        ? await nextLegacySsoGeneration(tx, linkRequest.providerId)
+        : null;
+    if (linkRequest.status !== LegacyAccountLinkStatus.pending) {
+      fail(
+        409,
+        "account_link_not_pending",
+        "Account link request is not pending"
+      );
+    }
+    if (decision === "approved") {
+      if (
+        !user.enabled ||
+        user.role !== "user" ||
+        user.email !== linkRequest.email
+      ) {
+        fail(
+          409,
+          "account_link_not_eligible",
+          "Candidate account is not eligible for linking"
+        );
+      }
+      const account = await tx.account.findUnique({
+        select: { userId: true },
+        where: {
+          providerId_accountId: {
+            accountId: linkRequest.subject,
+            providerId: linkRequest.providerId,
+          },
+        },
+      });
+      if (account) {
+        fail(
+          409,
+          "identity_already_linked",
+          "Legacy identity is already linked"
+        );
+      }
+    }
+    const [databaseTime] = await tx.$queryRaw<{ currentTime: Date }[]>(
+      Prisma.sql`SELECT CURRENT_TIMESTAMP AS "currentTime"`
+    );
+    if (!databaseTime) {
+      throw new Error("Database did not return current time");
+    }
+    const updated = await tx.legacyAccountLinkRequest.updateMany({
+      data: {
+        reviewedAt: databaseTime.currentTime,
+        reviewedById: identity.id,
+        reviewedGeneration: generation,
+        status:
+          decision === "approved"
+            ? LegacyAccountLinkStatus.approved
+            : LegacyAccountLinkStatus.rejected,
+        updatedAt: databaseTime.currentTime,
+      },
+      where: { id: requestId, status: LegacyAccountLinkStatus.pending },
+    });
+    if (updated.count !== 1) {
+      fail(
+        409,
+        "account_link_not_pending",
+        "Account link request is not pending"
+      );
+    }
+    await createAccountAudit(tx, {
+      action,
+      actorId: identity.id,
+      outcome: AuditOutcome.success,
+      safeMetadata: { change: decision },
+      targetId: user.id,
+    });
+  });
+  return { ok: true };
 }
 
 const formAuditErrorCodes: Record<string, true> = {
@@ -3322,13 +3980,12 @@ const formAuditErrorCodes: Record<string, true> = {
   callback_key_mismatch: true,
   callback_processing_failed: true,
   document_save_failed: true,
-  fill_method_changed: true,
-  native_fill_unsupported: true,
   document_unavailable: true,
   editor_capability_required: true,
   editor_capability_scope_mismatch: true,
   editor_in_use: true,
   editor_lease_inactive: true,
+  fill_method_changed: true,
   force_save_failed: true,
   form_has_responses: true,
   form_not_draft: true,
@@ -3338,6 +3995,7 @@ const formAuditErrorCodes: Record<string, true> = {
   invalid_file_type: true,
   invalid_request: true,
   invalid_template: true,
+  native_fill_unsupported: true,
   not_found: true,
   onlyoffice_document_error: true,
   operation_in_progress: true,
@@ -3881,22 +4539,18 @@ function formDto(
     activeDraftCount,
     createdAt: form.createdAt,
     description: form.description ?? "",
+    fillMethod: form.fillMethod,
     hasTemplateDraft: Boolean(form.templateDraft),
     publicId: form.publicId,
     status: form.status,
     submissionCount,
     title: form.title,
-    fillMethod: form.fillMethod,
     updatedAt: form.updatedAt,
     version: form.version,
   };
 }
-function supportsNativeTextFill(
-  fields: readonly { type: FieldType }[]
-): boolean {
-  return (
-    fields.length > 0 && fields.every(({ type }) => type === FieldType.text)
-  );
+function supportsNativeFill(fields: readonly { type: FieldType }[]): boolean {
+  return fields.length > 0;
 }
 
 interface ManifestDisplayField {
@@ -3946,24 +4600,56 @@ async function manifestFieldsWithDocumentMetadata<
   });
 }
 
-async function supportsNativeTextTemplate(
+async function supportsNativeTemplate(
   objectKey: string | null | undefined,
-  fields: readonly { type: FieldType }[],
+  fields: readonly { tag: string; type: FieldType }[],
   documentBytes?: Uint8Array
 ): Promise<boolean> {
-  if (!objectKey || !supportsNativeTextFill(fields)) {
+  if (!objectKey || !supportsNativeFill(fields)) {
     return false;
   }
   const { archive, xmlPaths } = safeTemplateArchive(
     documentBytes ?? (await readObject(objectKey))
   );
-  return !templatePartsHaveNestedControls(
-    archive,
-    reachableTemplateControlParts(archive, xmlPaths)
-  );
+  const controlParts = reachableTemplateControlParts(archive, xmlPaths);
+  if (
+    templatePartsHaveUnsupportedDateSettings(archive, controlParts) ||
+    templatePartsHaveNestedControls(archive, controlParts)
+  ) {
+    return false;
+  }
+  const fieldTags = new Set(fields.map(({ tag }) => tag));
+  for (const archivePath of controlParts) {
+    if (
+      !nativeFlattenAlternateFieldsXml(
+        templateArchiveText(archive, archivePath),
+        fieldTags,
+        true
+      ).supported
+    ) {
+      return false;
+    }
+  }
+  return true;
 }
-
-async function nativeTextFields(publishedTemplateId: string) {
+async function nativeFields(
+  publishedTemplateId: string,
+  responseDocumentBytes: Uint8Array
+): Promise<{
+  fields: {
+    label: string;
+    options: { displayText: string; value: string }[];
+    pictureMaxBytes: number | null;
+    pictureMaxHeight: number | null;
+    pictureMaxWidth: number | null;
+    placeholder: string | null;
+    position: number;
+    required: boolean;
+    tag: string;
+    type: FieldType;
+  }[];
+  pictures: Record<string, boolean>;
+}> {
   const [manifest, publishedTemplate] = await Promise.all([
     prisma.fieldManifest.findUnique({
       include: { fields: { orderBy: { position: "asc" } } },
@@ -3978,12 +4664,12 @@ async function nativeTextFields(publishedTemplateId: string) {
     fail(
       409,
       "native_fill_unsupported",
-      "Native filling requires a published text-only form"
+      "Native filling requires supported fields"
     );
   }
   const documentBytes = await readObject(publishedTemplate.objectKey);
   if (
-    !(await supportsNativeTextTemplate(
+    !(await supportsNativeTemplate(
       publishedTemplate.objectKey,
       manifest.fields,
       documentBytes
@@ -3992,7 +4678,7 @@ async function nativeTextFields(publishedTemplateId: string) {
     fail(
       409,
       "native_fill_unsupported",
-      "Native filling requires a published text-only form"
+      "Native filling requires supported fields"
     );
   }
   const fields = await manifestFieldsWithDocumentMetadata(
@@ -4001,14 +4687,43 @@ async function nativeTextFields(publishedTemplateId: string) {
     manifest.fields,
     documentBytes
   );
-  return fields.map(({ label, placeholder, position, required, tag }) => ({
-    label,
-    placeholder,
-    position,
-    required,
-    tag,
-    type: FieldType.text,
-  }));
+  return {
+    fields: fields.map((field) => ({
+      ...receiptField(field),
+      pictureMaxBytes: field.pictureMaxBytes,
+      pictureMaxHeight: field.pictureMaxHeight,
+      pictureMaxWidth: field.pictureMaxWidth,
+      required: field.required,
+    })),
+    pictures: responsePicturePresence(
+      responseDocumentBytes,
+      manifest.fields.filter(({ type }) => type === FieldType.picture)
+    ),
+  };
+}
+
+async function nativePictureManifestFields(
+  publishedTemplateId: string
+): Promise<ResponsePictureManifestField[]> {
+  const manifest = await prisma.fieldManifest.findUnique({
+    select: {
+      fields: {
+        select: {
+          pictureMaxBytes: true,
+          pictureMaxHeight: true,
+          pictureMaxWidth: true,
+          required: true,
+          tag: true,
+          type: true,
+        },
+      },
+    },
+    where: { publishedTemplateId },
+  });
+  if (!manifest) {
+    fail(500, "internal_error", "The published Field Manifest is unavailable");
+  }
+  return manifest.fields.filter(({ type }) => type === FieldType.picture);
 }
 
 function responseSummary(
@@ -4218,6 +4933,7 @@ const templateWord2012Namespace =
   "http://schemas.microsoft.com/office/word/2012/wordml";
 const templateMarkupCompatibilityNamespace =
   "http://schemas.openxmlformats.org/markup-compatibility/2006";
+const templateXmlnsNamespace = "http://www.w3.org/2000/xmlns/";
 const templateWordNamespaces = new Set([
   templateWordStrictNamespace,
   templateWordMainNamespace,
@@ -4813,6 +5529,7 @@ const templateControlMetadataProperties = new Set([
   "id",
   "lock",
   "placeholder",
+  "lid",
   "rPr",
   "showingPlcHdr",
   "tag",
@@ -5178,7 +5895,11 @@ function parseTemplateFields(
           (templateWordNamespaces.has(element.uri) &&
             templateControlMetadataProperties.has(element.local)) ||
           (element.uri === templateWord2012Namespace &&
-            element.local === "appearance");
+            element.local === "appearance") ||
+          (element.uri === templateCheckboxNamespace &&
+            ["checked", "checkedState", "uncheckedState"].includes(
+              element.local
+            ));
         const isWrongNamespaceSemantic =
           (element.local === "tag" && !isTag) ||
           (templateControlTypeLocals.has(element.local) &&
@@ -5330,6 +6051,186 @@ function parseTemplateFields(
   }
   return orderedFields;
 }
+function responseTextControlValues(bytes: Uint8Array): Map<string, string> {
+  const { archive, xmlPaths } = safeTemplateArchive(bytes);
+  const values = new Map<string, string>();
+  for (const archivePath of reachableTemplateControlParts(archive, xmlPaths)) {
+    const controls: {
+      contentDepth: number;
+      inPropertiesDepth: number;
+      paragraphCount: number;
+      showingPlaceholder: boolean;
+      tag: string | null;
+      text: string;
+    }[] = [];
+    let alternateFallbackDepth = 0;
+    let textDepth = 0;
+    parseTemplateXml(templateArchiveText(archive, archivePath), {
+      close: (element) => {
+        if (
+          element.local === "Fallback" &&
+          element.uri === templateMarkupCompatibilityNamespace
+        ) {
+          alternateFallbackDepth -= 1;
+          return;
+        }
+        if (alternateFallbackDepth > 0) {
+          return;
+        }
+        if (element.local === "t" && templateWordNamespaces.has(element.uri)) {
+          textDepth -= 1;
+          return;
+        }
+        const frame = controls.at(-1);
+        if (!frame) {
+          return;
+        }
+        if (
+          element.local === "sdtContent" &&
+          templateWordNamespaces.has(element.uri)
+        ) {
+          frame.contentDepth -= 1;
+          return;
+        }
+        if (
+          element.local === "sdtPr" &&
+          templateWordNamespaces.has(element.uri)
+        ) {
+          frame.inPropertiesDepth = 0;
+          return;
+        }
+        if (frame.inPropertiesDepth > 0) {
+          frame.inPropertiesDepth -= 1;
+          return;
+        }
+        if (
+          element.local === "sdt" &&
+          templateWordNamespaces.has(element.uri)
+        ) {
+          controls.pop();
+          if (frame.tag && !frame.showingPlaceholder) {
+            values.set(frame.tag, frame.text);
+          }
+        }
+      },
+      open: (element) => {
+        if (
+          element.local === "Fallback" &&
+          element.uri === templateMarkupCompatibilityNamespace
+        ) {
+          alternateFallbackDepth += 1;
+          return;
+        }
+        if (alternateFallbackDepth > 0) {
+          return;
+        }
+        if (element.local === "t" && templateWordNamespaces.has(element.uri)) {
+          textDepth += 1;
+          return;
+        }
+        if (
+          element.local === "sdt" &&
+          templateWordNamespaces.has(element.uri)
+        ) {
+          controls.push({
+            contentDepth: 0,
+            inPropertiesDepth: 0,
+            paragraphCount: 0,
+            showingPlaceholder: false,
+            tag: null,
+            text: "",
+          });
+          return;
+        }
+        const frame = controls.at(-1);
+        if (!frame) {
+          return;
+        }
+        if (element.local === "p" && templateWordNamespaces.has(element.uri)) {
+          for (const control of controls) {
+            if (
+              control.contentDepth === 0 ||
+              control.inPropertiesDepth > 0 ||
+              control.showingPlaceholder
+            ) {
+              continue;
+            }
+            if (control.paragraphCount > 0) {
+              control.text += "\n";
+            }
+            control.paragraphCount += 1;
+          }
+          return;
+        }
+        if (
+          (element.local === "tab" ||
+            element.local === "br" ||
+            element.local === "cr") &&
+          templateWordNamespaces.has(element.uri)
+        ) {
+          const separator = element.local === "tab" ? "\t" : "\n";
+          for (const control of controls) {
+            if (
+              control.contentDepth > 0 &&
+              control.inPropertiesDepth === 0 &&
+              !control.showingPlaceholder
+            ) {
+              control.text += separator;
+            }
+          }
+          return;
+        }
+        if (
+          element.local === "sdtPr" &&
+          templateWordNamespaces.has(element.uri)
+        ) {
+          frame.inPropertiesDepth = 1;
+          return;
+        }
+        if (
+          element.local === "sdtContent" &&
+          templateWordNamespaces.has(element.uri)
+        ) {
+          frame.contentDepth += 1;
+          return;
+        }
+        if (frame.inPropertiesDepth === 0) {
+          return;
+        }
+        if (
+          frame.inPropertiesDepth === 1 &&
+          element.local === "tag" &&
+          templateWordNamespaces.has(element.uri)
+        ) {
+          frame.tag = templateControlAttribute(element, "val") ?? null;
+        }
+        if (
+          frame.inPropertiesDepth === 1 &&
+          element.local === "showingPlcHdr" &&
+          templateWordNamespaces.has(element.uri)
+        ) {
+          const value = templateControlAttribute(element, "val")
+            ?.trim()
+            .toLowerCase();
+          frame.showingPlaceholder =
+            value === undefined || !["0", "false", "off"].includes(value);
+        }
+        frame.inPropertiesDepth += 1;
+      },
+      text: (value) => {
+        if (textDepth === 0) {
+          return;
+        }
+        for (const frame of controls) {
+          if (frame.contentDepth > 0 && !frame.showingPlaceholder) {
+            frame.text += value;
+          }
+        }
+      },
+    });
+  }
+  return values;
+}
 
 function validateTemplateControls(
   bytes: Uint8Array,
@@ -5395,6 +6296,120 @@ interface ResponsePictureDimensions {
   format: "jpeg" | "png";
   height: number;
   width: number;
+}
+
+interface NativePictureUpload {
+  bytes: Uint8Array;
+  dimensions: ResponsePictureDimensions;
+}
+interface NativeResponseUploadedFile {
+  arrayBuffer: () => Promise<ArrayBuffer>;
+  size: number;
+  type: string;
+}
+type NativeResponseMultipartEntry = string | NativeResponseUploadedFile;
+
+interface NativeResponseRequest {
+  input: JsonRecord;
+  pictures: Map<string, NativePictureUpload>;
+}
+
+async function nativeResponseRequest(
+  request: Request,
+  pictureFields: readonly ResponsePictureManifestField[]
+): Promise<NativeResponseRequest> {
+  const contentType = request.headers.get("content-type");
+  if (!contentType || !/^multipart\/form-data(?:\s*;|$)/iu.test(contentType)) {
+    return {
+      input: await readJsonRecord(
+        request,
+        maxNativePictureMultipartOverheadBytes
+      ),
+      pictures: new Map(),
+    };
+  }
+  const imageByteLimit = pictureFields.reduce(
+    (total, field) => total + (field.pictureMaxBytes ?? 0),
+    0
+  );
+  const maximumBodyBytes = Math.min(
+    maxTemplateArchiveExpandedBytes + maxNativePictureMultipartOverheadBytes,
+    imageByteLimit + maxNativePictureMultipartOverheadBytes
+  );
+  const requestBytes = await readRequestBytes(
+    request,
+    maximumBodyBytes,
+    "Multipart form data is required"
+  );
+  const multipartRequest = new Request(request.url, {
+    body: requestBytes,
+    headers: { "content-type": contentType },
+    method: "POST",
+  });
+  let entries: IterableIterator<[string, NativeResponseMultipartEntry]>;
+  try {
+    const multipartFields = await multipartRequest.formData();
+    entries = multipartFields.entries();
+  } catch {
+    fail(400, "invalid_request", "Multipart form data is invalid");
+  }
+  const fieldsByTag = new Map(pictureFields.map((field) => [field.tag, field]));
+  const pictures = new Map<string, NativePictureUpload>();
+  let input: JsonRecord | null = null;
+  for (const [key, value] of entries) {
+    if (key === "payload") {
+      if (input || typeof value !== "string") {
+        fail(400, "invalid_request", "payload must be provided once");
+      }
+      try {
+        input = asRecord(JSON.parse(value));
+      } catch {
+        fail(400, "invalid_request", "payload must be a valid JSON object");
+      }
+      continue;
+    }
+    if (!key.startsWith("picture:") || typeof value === "string") {
+      fail(
+        400,
+        "invalid_request",
+        "Only payload and picture files are accepted"
+      );
+    }
+    const tag = key.slice("picture:".length);
+    const field = fieldsByTag.get(tag);
+    if (!field || pictures.has(tag)) {
+      fail(400, "invalid_request", "Picture field is unknown or duplicated");
+    }
+    if (value.size > (field.pictureMaxBytes ?? 0)) {
+      fail(
+        413,
+        "payload_too_large",
+        `Picture field ${tag} exceeds its byte limit`
+      );
+    }
+    const fileType = value.type.trim().toLowerCase();
+    if (fileType && fileType !== "image/jpeg" && fileType !== "image/png") {
+      fail(
+        415,
+        "invalid_file_type",
+        `Picture field ${tag} must be JPEG or PNG`
+      );
+    }
+    const bytes = new Uint8Array(await value.arrayBuffer());
+    const dimensions = responsePictureImageDimensions(bytes);
+    if (
+      !dimensions ||
+      (fileType && fileType !== `image/${dimensions.format}`)
+    ) {
+      invalidResponsePicture(tag, "image must be a valid JPEG or PNG");
+    }
+    validateResponsePictureMediaBytes(tag, bytes, field, dimensions);
+    pictures.set(tag, { bytes, dimensions });
+  }
+  if (!input) {
+    fail(400, "invalid_request", "payload is required");
+  }
+  return { input, pictures };
 }
 
 function invalidResponsePicture(tag: string, message: string): never {
@@ -5514,7 +6529,8 @@ function responsePictureImageDimensions(
 function validateResponsePictureMediaBytes(
   tag: string,
   bytes: Uint8Array,
-  field: ResponsePictureManifestField
+  field: ResponsePictureManifestField,
+  dimensions = responsePictureImageDimensions(bytes)
 ): void {
   if (
     field.pictureMaxBytes !== null &&
@@ -5522,7 +6538,6 @@ function validateResponsePictureMediaBytes(
   ) {
     invalidResponsePicture(tag, "image bytes exceed the published limit");
   }
-  const dimensions = responsePictureImageDimensions(bytes);
   if (!dimensions) {
     invalidResponsePicture(tag, "image must be a valid JPEG or PNG");
   }
@@ -5775,6 +6790,532 @@ function responsePicturePresence(
     pictureFields.map(({ tag }) => [tag, presentTags.has(tag)])
   );
 }
+
+function appendTemplateXmlChild(
+  xml: string,
+  rootLocalName: string,
+  rootNamespace: string,
+  child: string
+): string {
+  const parser = new SaxesParser({ position: true, xmlns: true });
+  const rootNames: string[] = [];
+  const rootCloseStarts: number[] = [];
+  let depth = 0;
+  parser.on("doctype", () => {
+    fail(422, "invalid_template", "DOCX XML document types are not allowed");
+  });
+  parser.on("opentag", (tag) => {
+    if (depth === 0) {
+      if (
+        rootNames.length > 0 ||
+        tag.local !== rootLocalName ||
+        tag.uri !== rootNamespace
+      ) {
+        fail(422, "invalid_template", "The DOCX package XML root is invalid");
+      }
+      rootNames.push(tag.name);
+    }
+    if (!tag.isSelfClosing) {
+      depth += 1;
+    }
+  });
+  parser.on("closetag", (tag) => {
+    if (
+      depth === 1 &&
+      tag.local === rootLocalName &&
+      tag.uri === rootNamespace
+    ) {
+      rootCloseStarts.push(xml.lastIndexOf("</", parser.position - 1));
+    }
+    if (!tag.isSelfClosing) {
+      depth -= 1;
+    }
+  });
+  try {
+    parser.write(xml).close();
+  } catch {
+    fail(422, "invalid_template", "The DOCX package contains invalid XML");
+  }
+  const rootName = rootNames[0];
+  const rootCloseStart = rootCloseStarts[0];
+  if (!rootName || rootCloseStart === undefined) {
+    fail(422, "invalid_template", "The DOCX package XML root is invalid");
+  }
+  const prefix = rootName.includes(":")
+    ? `${rootName.slice(0, rootName.indexOf(":"))}:`
+    : "";
+  return `${xml.slice(0, rootCloseStart)}${child.replaceAll(
+    "{prefix}",
+    prefix
+  )}${xml.slice(rootCloseStart)}`;
+}
+
+function setNativePictureContentType(
+  archive: Record<string, Uint8Array>,
+  mediaPath: string,
+  contentType: string
+): void {
+  const xml = templateArchiveText(archive, "[Content_Types].xml");
+  const parser = new SaxesParser({ position: true, xmlns: true });
+  const overrides: {
+    contentType: string | undefined;
+    end: number;
+    start: number;
+  }[] = [];
+  parser.on("opentag", (tag) => {
+    if (
+      tag.local !== "Override" ||
+      tag.uri !== templatePackageContentTypesNamespace ||
+      templateAttribute(templateXmlElement(tag), "PartName") !== `/${mediaPath}`
+    ) {
+      return;
+    }
+    if (overrides.length > 0) {
+      fail(422, "invalid_template", "The DOCX content types are invalid");
+    }
+    overrides.push({
+      contentType: templateAttribute(templateXmlElement(tag), "ContentType"),
+      end: parser.position,
+      start: xml.lastIndexOf("<", parser.position - 1),
+    });
+  });
+  parser.on("doctype", () => {
+    fail(422, "invalid_template", "DOCX XML document types are not allowed");
+  });
+  try {
+    parser.write(xml).close();
+  } catch {
+    fail(422, "invalid_template", "The DOCX package contains invalid XML");
+  }
+  const override = overrides[0];
+  if (override) {
+    if (override.contentType === contentType) {
+      return;
+    }
+    const start = override.start;
+    const end = override.end;
+    const openingTag = xml.slice(start, end);
+    const updatedTag = openingTag.replace(
+      /(?<prefix>\sContentType\s*=\s*)(?<quote>["'])[^"']*\k<quote>/iu,
+      `$<prefix>"${contentType}"`
+    );
+    if (updatedTag === openingTag) {
+      fail(422, "invalid_template", "The DOCX content types are invalid");
+    }
+    archive["[Content_Types].xml"] = strToU8(
+      `${xml.slice(0, start)}${updatedTag}${xml.slice(end)}`.replace(
+        /encoding=(?<quote>["'])UTF-16(?:LE|BE)?\k<quote>/iu,
+        'encoding="UTF-8"'
+      )
+    );
+    return;
+  }
+  const updatedXml = appendTemplateXmlChild(
+    xml,
+    "Types",
+    templatePackageContentTypesNamespace,
+    `<{prefix}Override PartName="/${mediaPath}" ContentType="${contentType}"/>`
+  );
+  archive["[Content_Types].xml"] = strToU8(
+    updatedXml.replace(
+      /encoding=(?<quote>["'])UTF-16(?:LE|BE)?\k<quote>/iu,
+      'encoding="UTF-8"'
+    )
+  );
+}
+
+function pictureRelationshipReferenceCount(
+  xml: string,
+  relationshipId: string
+): number {
+  let count = 0;
+  parseTemplateXml(xml, {
+    open: (element) => {
+      if (responsePictureRelationshipId(element) === relationshipId) {
+        count += 1;
+      }
+    },
+  });
+  return count;
+}
+
+function addNativePicturePackageParts(
+  archive: Record<string, Uint8Array>,
+  sourcePath: string,
+  upload: NativePictureUpload,
+  existingRelationshipIds: readonly string[]
+): string {
+  const existingRelationships = responsePictureRelationships(
+    archive,
+    sourcePath
+  );
+  const existingRelationshipId =
+    existingRelationshipIds.length === 1 ? existingRelationshipIds[0] : null;
+  const existingMediaPath = existingRelationshipId
+    ? existingRelationships.get(existingRelationshipId)
+    : null;
+  if (
+    existingRelationshipId &&
+    existingMediaPath?.startsWith("word/media/picture-") &&
+    archive[existingMediaPath] &&
+    [...existingRelationships.values()].filter(
+      (target) => target === existingMediaPath
+    ).length === 1 &&
+    pictureRelationshipReferenceCount(
+      templateArchiveText(archive, sourcePath),
+      existingRelationshipId
+    ) === 1
+  ) {
+    archive[existingMediaPath] = upload.bytes;
+    setNativePictureContentType(
+      archive,
+      existingMediaPath,
+      upload.dimensions.format === "jpeg" ? "image/jpeg" : "image/png"
+    );
+    return existingRelationshipId;
+  }
+
+  const extension = upload.dimensions.format === "jpeg" ? "jpeg" : "png";
+  const mediaName = `picture-${crypto.randomUUID()}.${extension}`;
+  const mediaPath = `word/media/${mediaName}`;
+  const relationshipPath = templateRelationshipPartPath(sourcePath);
+  const relationshipId = (() => {
+    let suffix = 1;
+    while (existingRelationships.has(`rId${suffix}`)) {
+      suffix += 1;
+    }
+    return `rId${suffix}`;
+  })();
+  const target = path.posix.relative(path.posix.dirname(sourcePath), mediaPath);
+  const relationship = `<{prefix}Relationship Id="${relationshipId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="${target}"/>`;
+  const relationshipsXml = archive[relationshipPath]
+    ? appendTemplateXmlChild(
+        templateArchiveText(archive, relationshipPath),
+        "Relationships",
+        templatePackageRelationshipNamespace,
+        relationship
+      )
+    : `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="${templatePackageRelationshipNamespace}">${relationship.replaceAll("{prefix}", "")}</Relationships>`;
+  archive[relationshipPath] = strToU8(
+    relationshipsXml.replace(
+      /encoding=(?<quote>["'])UTF-16(?:LE|BE)?\k<quote>/iu,
+      'encoding="UTF-8"'
+    )
+  );
+  setNativePictureContentType(
+    archive,
+    mediaPath,
+    upload.dimensions.format === "jpeg" ? "image/jpeg" : "image/png"
+  );
+  archive[mediaPath] = upload.bytes;
+  return relationshipId;
+}
+
+function nativePictureDrawing(
+  tag: string,
+  block: boolean,
+  wordPrefix: string,
+  contentNamespace: string,
+  relationshipId: string,
+  drawingId: number,
+  dimensions: ResponsePictureDimensions
+): string {
+  const strict = contentNamespace === templateWordStrictNamespace;
+  const drawingNamespace = strict
+    ? "http://purl.oclc.org/ooxml/drawingml/main"
+    : "http://schemas.openxmlformats.org/drawingml/2006/main";
+  const wordDrawingNamespace = strict
+    ? "http://purl.oclc.org/ooxml/drawingml/wordprocessingDrawing"
+    : "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing";
+  const pictureNamespace = strict
+    ? "http://purl.oclc.org/ooxml/drawingml/picture"
+    : "http://schemas.openxmlformats.org/drawingml/2006/picture";
+  const relationshipNamespace = strict
+    ? "http://purl.oclc.org/ooxml/officeDocument/relationships"
+    : "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+  const cx = dimensions.width * 9525;
+  const cy = dimensions.height * 9525;
+  const drawing =
+    `<${wordPrefix}drawing xmlns:a="${drawingNamespace}" xmlns:pic="${pictureNamespace}" xmlns:wp="${wordDrawingNamespace}" xmlns:r="${relationshipNamespace}">` +
+    `<wp:inline distT="0" distB="0" distL="0" distR="0"><wp:extent cx="${cx}" cy="${cy}"/>` +
+    `<wp:docPr id="${drawingId}" name="Picture ${htmlEscape(tag)}"/>` +
+    `<wp:cNvGraphicFramePr><a:graphicFrameLocks noChangeAspect="1"/></wp:cNvGraphicFramePr>` +
+    `<a:graphic><a:graphicData uri="${pictureNamespace}"><pic:pic>` +
+    `<pic:nvPicPr><pic:cNvPr id="${drawingId}" name="Picture ${htmlEscape(tag)}"/><pic:cNvPicPr><a:picLocks noChangeAspect="1"/></pic:cNvPicPr></pic:nvPicPr>` +
+    `<pic:blipFill><a:blip r:embed="${relationshipId}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>` +
+    `<pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${cx}" cy="${cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr>` +
+    `</pic:pic></a:graphicData></a:graphic></wp:inline></${wordPrefix}drawing>`;
+  const run = `<${wordPrefix}r>${drawing}</${wordPrefix}r>`;
+  return block ? `<${wordPrefix}p>${run}</${wordPrefix}p>` : run;
+}
+
+function overlayNativeResponsePictures(
+  documentBytes: Uint8Array,
+  manifestFields: readonly ResponsePictureManifestField[],
+  pictures: ReadonlyMap<string, NativePictureUpload>
+): Uint8Array {
+  if (pictures.size === 0) {
+    return documentBytes;
+  }
+  const pictureFields = manifestFields.filter(
+    ({ type }) => type === FieldType.picture
+  );
+  const fieldsByTag = new Map(pictureFields.map((field) => [field.tag, field]));
+  const selectedTags = new Set(pictures.keys());
+  for (const tag of selectedTags) {
+    if (!fieldsByTag.has(tag)) {
+      invalidResponsePicture(tag, "field is not a published Picture");
+    }
+  }
+  const { archive, xmlPaths } = safeTemplateArchive(documentBytes);
+  const controlParts = reachableTemplateControlParts(archive, xmlPaths);
+  const fieldTags = new Set(manifestFields.map(({ tag }) => tag));
+  const drawingIds = new Set<number>();
+  for (const archivePath of xmlPaths) {
+    parseTemplateXml(templateArchiveText(archive, archivePath), {
+      open: (element) => {
+        if (element.local !== "docPr") {
+          return;
+        }
+        const id = Number(templateAttribute(element, "id"));
+        if (Number.isSafeInteger(id) && id > 0) {
+          drawingIds.add(id);
+        }
+      },
+    });
+  }
+  const placedTags = new Set<string>();
+  for (const archivePath of controlParts) {
+    const originalXml = templateArchiveText(archive, archivePath);
+    const flattened = nativeFlattenAlternateFieldsXml(originalXml, fieldTags);
+    if (!flattened.supported) {
+      fail(422, "invalid_template", "Native picture control is unsupported");
+    }
+    const xml = flattened.xml;
+    const controls: {
+      block: boolean;
+      contentEnd: number | null;
+      contentName: string | null;
+      contentNamespace: string;
+      contentPrefix: string;
+      contentSelfClosing: boolean;
+      contentStart: number | null;
+      contentTokenStart: number | null;
+      inPropertiesDepth: number;
+      picture: boolean;
+      relationshipIds: string[];
+      showingPlaceholderRanges: { end: number; start: number }[];
+      showingPlaceholderStarts: number[];
+      tag: string | null;
+    }[] = [];
+    const elements: { local: string; uri: string }[] = [];
+    const patches: { end: number; replacement: string; start: number }[] = [];
+    const parser = new SaxesParser({ position: true, xmlns: true });
+    parser.on("doctype", () => {
+      fail(422, "invalid_template", "DOCX XML document types are not allowed");
+    });
+    parser.on("opentag", (tag) => {
+      if (tag.local === "sdt" && templateWordNamespaces.has(tag.uri)) {
+        controls.push({
+          block: !elements.some(
+            (element) =>
+              element.local === "p" && templateWordNamespaces.has(element.uri)
+          ),
+          contentEnd: null,
+          contentName: null,
+          contentNamespace: "",
+          contentPrefix: "",
+          contentSelfClosing: false,
+          contentStart: null,
+          contentTokenStart: null,
+          inPropertiesDepth: 0,
+          picture: false,
+          relationshipIds: [],
+          showingPlaceholderRanges: [],
+          showingPlaceholderStarts: [],
+          tag: null,
+        });
+      } else {
+        const frame = controls.at(-1);
+        if (frame) {
+          if (tag.local === "sdtPr" && templateWordNamespaces.has(tag.uri)) {
+            frame.inPropertiesDepth = 1;
+          } else if (frame.inPropertiesDepth > 0) {
+            if (
+              frame.inPropertiesDepth === 1 &&
+              tag.local === "tag" &&
+              templateWordNamespaces.has(tag.uri)
+            ) {
+              frame.tag =
+                templateControlAttribute(templateXmlElement(tag), "val") ??
+                null;
+            }
+            if (
+              frame.inPropertiesDepth === 1 &&
+              tag.local === "picture" &&
+              templateWordNamespaces.has(tag.uri)
+            ) {
+              frame.picture = true;
+            }
+            if (
+              frame.inPropertiesDepth === 1 &&
+              tag.local === "showingPlcHdr" &&
+              templateWordNamespaces.has(tag.uri)
+            ) {
+              frame.showingPlaceholderStarts.push(
+                xml.lastIndexOf("<", parser.position - 1)
+              );
+            }
+            frame.inPropertiesDepth += 1;
+          } else if (
+            tag.local === "sdtContent" &&
+            templateWordNamespaces.has(tag.uri)
+          ) {
+            const start = xml.lastIndexOf("<", parser.position - 1);
+            frame.contentName = tag.name;
+            frame.contentNamespace = tag.uri;
+            frame.contentPrefix = tag.name.includes(":")
+              ? tag.name.slice(0, tag.name.indexOf(":") + 1)
+              : "";
+            frame.contentSelfClosing = tag.isSelfClosing;
+            frame.contentStart = tag.isSelfClosing ? null : parser.position;
+            frame.contentTokenStart = tag.isSelfClosing ? start : null;
+          } else if (frame.picture) {
+            const relationshipId = responsePictureRelationshipId(
+              templateXmlElement(tag)
+            );
+            if (relationshipId) {
+              frame.relationshipIds.push(relationshipId);
+            }
+          }
+        }
+      }
+      elements.push({ local: tag.local, uri: tag.uri });
+    });
+    parser.on("closetag", (tag) => {
+      const frame = controls.at(-1);
+      if (frame) {
+        if (tag.local === "sdtPr" && templateWordNamespaces.has(tag.uri)) {
+          frame.inPropertiesDepth = 0;
+        } else if (
+          frame.inPropertiesDepth === 2 &&
+          tag.local === "showingPlcHdr" &&
+          templateWordNamespaces.has(tag.uri)
+        ) {
+          const start = frame.showingPlaceholderStarts.pop();
+          if (start !== undefined) {
+            frame.showingPlaceholderRanges.push({
+              end: parser.position,
+              start,
+            });
+          }
+          frame.inPropertiesDepth -= 1;
+        } else if (frame.inPropertiesDepth > 0) {
+          frame.inPropertiesDepth -= 1;
+        } else if (
+          tag.local === "sdtContent" &&
+          templateWordNamespaces.has(tag.uri)
+        ) {
+          frame.contentEnd = frame.contentSelfClosing
+            ? parser.position
+            : xml.lastIndexOf("</", parser.position - 1);
+          const fieldTag = frame.tag?.trim();
+          const upload = fieldTag ? pictures.get(fieldTag) : undefined;
+          if (frame.picture && fieldTag && upload) {
+            if (placedTags.has(fieldTag)) {
+              invalidResponsePicture(fieldTag, "content control is duplicated");
+            }
+            placedTags.add(fieldTag);
+            for (const range of frame.showingPlaceholderRanges) {
+              patches.push({ ...range, replacement: "" });
+            }
+            let drawingId = 1;
+            while (drawingIds.has(drawingId)) {
+              drawingId += 1;
+            }
+            drawingIds.add(drawingId);
+            const relationshipId = addNativePicturePackageParts(
+              archive,
+              archivePath,
+              upload,
+              frame.relationshipIds
+            );
+            if (!frame.contentName) {
+              invalidResponsePicture(fieldTag, "content control is incomplete");
+            }
+            const content = nativePictureDrawing(
+              fieldTag,
+              frame.block,
+              frame.contentPrefix,
+              frame.contentNamespace,
+              relationshipId,
+              drawingId,
+              upload.dimensions
+            );
+            if (
+              frame.contentSelfClosing &&
+              frame.contentTokenStart !== null &&
+              frame.contentEnd !== null
+            ) {
+              const openingTag = xml.slice(
+                frame.contentTokenStart,
+                frame.contentEnd
+              );
+              patches.push({
+                end: frame.contentEnd,
+                replacement: `${openingTag.replace(/\/\s*>$/u, ">")}${content}</${frame.contentName}>`,
+                start: frame.contentTokenStart,
+              });
+            } else if (
+              frame.contentStart !== null &&
+              frame.contentEnd !== null
+            ) {
+              patches.push({
+                end: frame.contentEnd,
+                replacement: content,
+                start: frame.contentStart,
+              });
+            } else {
+              invalidResponsePicture(fieldTag, "content control is incomplete");
+            }
+          }
+        } else if (tag.local === "sdt" && templateWordNamespaces.has(tag.uri)) {
+          controls.pop();
+        }
+      }
+      elements.pop();
+    });
+    try {
+      parser.write(xml).close();
+    } catch {
+      fail(422, "invalid_template", "The DOCX package contains invalid XML");
+    }
+    let updatedXml = xml;
+    for (const patch of patches.toSorted(
+      (left, right) => right.start - left.start
+    )) {
+      updatedXml =
+        updatedXml.slice(0, patch.start) +
+        patch.replacement +
+        updatedXml.slice(patch.end);
+    }
+    if (updatedXml !== originalXml) {
+      archive[archivePath] = strToU8(
+        updatedXml.replace(
+          /encoding=(?<quote>["'])UTF-16(?:LE|BE)?\k<quote>/iu,
+          'encoding="UTF-8"'
+        )
+      );
+    }
+  }
+  for (const tag of selectedTags) {
+    if (!placedTags.has(tag)) {
+      invalidResponsePicture(tag, "content control is missing");
+    }
+  }
+  return zipSync(archive);
+}
+
 function manifestFieldValueMatches(
   field: { options: unknown; type: FieldType },
   value: unknown
@@ -5820,21 +7361,547 @@ function validatePrefillValuesAgainstManifest(
   }
 }
 
+interface OnlyOfficeFieldDisplayMetadata {
+  calendar: string | null;
+  checkedState: NativeCheckboxState | null;
+  dateFormat: string | null;
+  dateLanguage: string | null;
+  uncheckedState: NativeCheckboxState | null;
+}
+function onlyOfficeFieldDisplayMetadata(
+  documentBytes: Uint8Array
+): Map<string, OnlyOfficeFieldDisplayMetadata> {
+  const { archive, xmlPaths } = safeTemplateArchive(documentBytes);
+  const metadataByTag = new Map<string, OnlyOfficeFieldDisplayMetadata>();
+  for (const archivePath of reachableTemplateControlParts(archive, xmlPaths)) {
+    const controls: {
+      dateFormat: string | null;
+      dateLanguage: string | null;
+      calendar: string | null;
+      checkedState: NativeCheckboxState | null;
+      inPropertiesDepth: number;
+      tag: string | null;
+      uncheckedState: NativeCheckboxState | null;
+    }[] = [];
+    let alternateFallbackDepth = 0;
+    parseTemplateXml(templateArchiveText(archive, archivePath), {
+      close: (element) => {
+        if (
+          element.local === "Fallback" &&
+          element.uri === templateMarkupCompatibilityNamespace
+        ) {
+          alternateFallbackDepth -= 1;
+          return;
+        }
+        if (alternateFallbackDepth > 0) {
+          return;
+        }
+        const frame = controls.at(-1);
+        if (!frame) {
+          return;
+        }
+        if (
+          element.local === "sdtPr" &&
+          templateWordNamespaces.has(element.uri)
+        ) {
+          frame.inPropertiesDepth = 0;
+        } else if (frame.inPropertiesDepth > 0) {
+          frame.inPropertiesDepth -= 1;
+        } else if (
+          element.local === "sdt" &&
+          templateWordNamespaces.has(element.uri)
+        ) {
+          controls.pop();
+          if (frame.tag) {
+            metadataByTag.set(frame.tag, {
+              calendar: frame.calendar,
+              checkedState: frame.checkedState,
+              dateFormat: frame.dateFormat,
+              dateLanguage: frame.dateLanguage,
+              uncheckedState: frame.uncheckedState,
+            });
+          }
+        }
+      },
+      open: (element) => {
+        if (
+          element.local === "Fallback" &&
+          element.uri === templateMarkupCompatibilityNamespace
+        ) {
+          alternateFallbackDepth += 1;
+          return;
+        }
+        if (alternateFallbackDepth > 0) {
+          return;
+        }
+        if (
+          element.local === "sdt" &&
+          templateWordNamespaces.has(element.uri)
+        ) {
+          controls.push({
+            calendar: null,
+            checkedState: null,
+            dateFormat: null,
+            dateLanguage: null,
+            inPropertiesDepth: 0,
+            tag: null,
+            uncheckedState: null,
+          });
+          return;
+        }
+        const frame = controls.at(-1);
+        if (!frame) {
+          return;
+        }
+        if (
+          element.local === "sdtPr" &&
+          templateWordNamespaces.has(element.uri)
+        ) {
+          frame.inPropertiesDepth = 1;
+          return;
+        }
+        if (frame.inPropertiesDepth === 0) {
+          return;
+        }
+        if (
+          frame.inPropertiesDepth === 1 &&
+          element.local === "tag" &&
+          templateWordNamespaces.has(element.uri)
+        ) {
+          frame.tag = templateControlAttribute(element, "val")?.trim() ?? null;
+        } else if (
+          element.local === "checkedState" &&
+          element.uri === templateCheckboxNamespace
+        ) {
+          frame.checkedState = nativeCheckboxState(element);
+        } else if (
+          element.local === "uncheckedState" &&
+          element.uri === templateCheckboxNamespace
+        ) {
+          frame.uncheckedState = nativeCheckboxState(element);
+        } else if (
+          element.local === "dateFormat" &&
+          templateWordNamespaces.has(element.uri)
+        ) {
+          frame.dateFormat = templateControlAttribute(element, "val") ?? null;
+        } else if (
+          element.local === "lid" &&
+          templateWordNamespaces.has(element.uri)
+        ) {
+          frame.dateLanguage = templateControlAttribute(element, "val") ?? null;
+        } else if (
+          element.local === "calendar" &&
+          templateWordNamespaces.has(element.uri)
+        ) {
+          frame.calendar = templateControlAttribute(element, "val") ?? null;
+        }
+        frame.inPropertiesDepth += 1;
+      },
+    });
+  }
+  return metadataByTag;
+}
+function onlyOfficeFieldTagAliases(
+  documentBytes: Uint8Array
+): Record<string, string> {
+  const { archive, xmlPaths } = safeTemplateArchive(documentBytes);
+  const aliases = new Map<string, string>();
+  const ambiguousAliases = new Set<string>();
+  const fieldTags = new Set<string>();
+
+  for (const archivePath of reachableTemplateControlParts(archive, xmlPaths)) {
+    let controlDepth = 0;
+    let propertiesDepth = 0;
+    parseTemplateXml(templateArchiveText(archive, archivePath), {
+      close: (element) => {
+        if (
+          element.local === "sdtPr" &&
+          templateWordNamespaces.has(element.uri)
+        ) {
+          propertiesDepth = 0;
+          return;
+        }
+        if (propertiesDepth > 0) {
+          propertiesDepth -= 1;
+        }
+        if (
+          element.local === "sdt" &&
+          templateWordNamespaces.has(element.uri)
+        ) {
+          controlDepth -= 1;
+        }
+      },
+      open: (element) => {
+        if (
+          element.local === "sdt" &&
+          templateWordNamespaces.has(element.uri)
+        ) {
+          controlDepth += 1;
+          return;
+        }
+        if (controlDepth === 0) {
+          return;
+        }
+        if (
+          element.local === "sdtPr" &&
+          templateWordNamespaces.has(element.uri)
+        ) {
+          propertiesDepth = 1;
+          return;
+        }
+        if (propertiesDepth === 0) {
+          return;
+        }
+        if (
+          propertiesDepth === 1 &&
+          element.local === "tag" &&
+          templateWordNamespaces.has(element.uri)
+        ) {
+          const fieldTag = templateControlAttribute(element, "val")?.trim();
+          if (fieldTag) {
+            fieldTags.add(fieldTag);
+            for (const attribute of element.attributes) {
+              if (attribute.local !== "val" || attribute.uri === element.uri) {
+                continue;
+              }
+              const alias = attribute.value.trim();
+              if (!alias || alias === fieldTag) {
+                continue;
+              }
+              const previous = aliases.get(alias);
+              if (previous && previous !== fieldTag) {
+                aliases.delete(alias);
+                ambiguousAliases.add(alias);
+              } else if (!ambiguousAliases.has(alias)) {
+                aliases.set(alias, fieldTag);
+              }
+            }
+          }
+        }
+        propertiesDepth += 1;
+      },
+    });
+  }
+
+  return Object.fromEntries(
+    [...aliases].filter(
+      ([alias]) => !fieldTags.has(alias) && !ambiguousAliases.has(alias)
+    )
+  );
+}
+interface OnlyOfficeDateNames {
+  monthsLong: string[];
+  monthsShort: string[];
+  weekdaysLong: string[];
+  weekdaysShort: string[];
+}
+const onlyOfficeDateNames = new Map<string, OnlyOfficeDateNames>();
+function onlyOfficeDateNamesFor(locale: string): OnlyOfficeDateNames | null {
+  const cached = onlyOfficeDateNames.get(locale);
+  if (cached) {
+    return cached;
+  }
+  try {
+    const date = (year: number, month: number, day: number) =>
+      new Date(Date.UTC(year, month, day));
+    const names = {
+      monthsLong: Array.from({ length: 12 }, (_, month) =>
+        new Intl.DateTimeFormat(locale, {
+          month: "long",
+          timeZone: "UTC",
+        }).format(date(2024, month, 1))
+      ),
+      monthsShort: Array.from({ length: 12 }, (_, month) =>
+        new Intl.DateTimeFormat(locale, {
+          month: "short",
+          timeZone: "UTC",
+        }).format(date(2024, month, 1))
+      ),
+      weekdaysLong: Array.from({ length: 7 }, (_, day) =>
+        new Intl.DateTimeFormat(locale, {
+          timeZone: "UTC",
+          weekday: "long",
+        }).format(date(2024, 0, 7 + day))
+      ),
+      weekdaysShort: Array.from({ length: 7 }, (_, day) =>
+        new Intl.DateTimeFormat(locale, {
+          timeZone: "UTC",
+          weekday: "short",
+        }).format(date(2024, 0, 7 + day))
+      ),
+    };
+    onlyOfficeDateNames.set(locale, names);
+    return names;
+  } catch {
+    return null;
+  }
+}
+function escapeDateMaskLiteral(value: string): string {
+  return value.replaceAll(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+}
+function onlyOfficeDateDisplayValue(
+  value: string,
+  metadata: OnlyOfficeFieldDisplayMetadata | undefined
+): string | null {
+  const format = metadata?.dateFormat;
+  const calendar = metadata?.calendar;
+  if (
+    !format ||
+    /(^|[^y])yy([^y]|$)/u.test(format.replaceAll(/'[^']*'|"[^"]*"/gu, "")) ||
+    (calendar !== null &&
+      calendar !== undefined &&
+      calendar !== "gregorian" &&
+      calendar !== "thai")
+  ) {
+    return null;
+  }
+  const locale = metadata?.dateLanguage?.split(/[-_]/u)[0] || "en";
+  const names = onlyOfficeDateNamesFor(locale);
+  if (!names) {
+    return null;
+  }
+  const captures: string[] = [];
+  const tokenPattern = /'[^']*'|"[^"]*"|dddd|ddd|yyyy|MMMM|MMM|yy|MM|dd|M|d/gu;
+  let pattern = "^";
+  let offset = 0;
+  for (const match of format.matchAll(tokenPattern)) {
+    const index = match.index ?? 0;
+    pattern += escapeDateMaskLiteral(format.slice(offset, index));
+    const token = match[0];
+    offset = index + token.length;
+    if (token.startsWith("'") || token.startsWith('"')) {
+      pattern += escapeDateMaskLiteral(token.slice(1, -1));
+      continue;
+    }
+    if (
+      token === "yyyy" ||
+      token === "yy" ||
+      token === "dd" ||
+      token === "d" ||
+      token === "MM" ||
+      token === "M"
+    ) {
+      captures.push(token);
+      pattern +=
+        token === "yyyy"
+          ? "(\\d{4})"
+          : token === "yy"
+            ? "(\\d{2})"
+            : token === "dd" || token === "MM"
+              ? "(\\d{2})"
+              : "(\\d{1,2})";
+      continue;
+    }
+    const tokenNames =
+      token === "MMMM"
+        ? names.monthsLong
+        : token === "MMM"
+          ? names.monthsShort
+          : token === "dddd"
+            ? names.weekdaysLong
+            : token === "ddd"
+              ? names.weekdaysShort
+              : [];
+    if (tokenNames.length > 0) {
+      captures.push(token);
+      pattern += `(${[...tokenNames]
+        .sort((left, right) => right.length - left.length)
+        .map(escapeDateMaskLiteral)
+        .join("|")})`;
+    } else {
+      pattern += escapeDateMaskLiteral(token);
+    }
+  }
+  pattern += `${escapeDateMaskLiteral(format.slice(offset))}$`;
+  const result = new RegExp(pattern, "iu").exec(value);
+  if (!result) {
+    return null;
+  }
+  let year: number | null = null;
+  let month: number | null = null;
+  let day: number | null = null;
+  const weekdayValues: { token: string; value: string }[] = [];
+  for (const [index, token] of captures.entries()) {
+    const capture = result[index + 1];
+    if (capture === undefined) {
+      return null;
+    }
+    if (token === "yyyy") {
+      year = Number(capture);
+    } else if (token === "yy") {
+      year = 2000 + Number(capture);
+    } else if (token === "MM" || token === "M") {
+      month = Number(capture);
+    } else if (token === "dd" || token === "d") {
+      day = Number(capture);
+    } else if (token === "MMMM" || token === "MMM") {
+      const monthNames =
+        token === "MMMM" ? names.monthsLong : names.monthsShort;
+      month =
+        monthNames.findIndex(
+          (name) => name.toLowerCase() === capture.toLowerCase()
+        ) + 1;
+    } else {
+      weekdayValues.push({ token, value: capture });
+    }
+  }
+  if (year === null || month === null || day === null) {
+    return null;
+  }
+  if (calendar === "thai") {
+    year -= 543;
+  }
+  const isoValue = `${String(year).padStart(4, "0")}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+  if (!isValidDateFieldValue(isoValue)) {
+    return null;
+  }
+  if (weekdayValues.length > 0) {
+    const weekday = new Date(`${isoValue}T00:00:00Z`).getUTCDay();
+    if (
+      weekdayValues.some(({ token, value: actual }) => {
+        const weekdays =
+          token === "dddd" ? names.weekdaysLong : names.weekdaysShort;
+        return weekdays[weekday]?.toLowerCase() !== actual.toLowerCase();
+      })
+    ) {
+      return null;
+    }
+  }
+  return isoValue;
+}
+function onlyOfficeFieldValueNeedsMetadata(
+  field: { options: unknown; tag: string; type: FieldType },
+  value: unknown
+): boolean {
+  if (typeof value !== "string") {
+    return false;
+  }
+  if (field.type === FieldType.checkbox) {
+    return true;
+  }
+  if (field.type === FieldType.date) {
+    return true;
+  }
+  if (field.type !== FieldType.dropdown && field.type !== FieldType.combo) {
+    return false;
+  }
+  const options = Array.isArray(field.options)
+    ? field.options.flatMap((option) => {
+        if (!option || typeof option !== "object" || Array.isArray(option)) {
+          return [];
+        }
+        const record = option as Record<string, unknown>;
+        return typeof record.displayText === "string" &&
+          typeof record.value === "string"
+          ? [{ displayText: record.displayText, value: record.value }]
+          : [];
+      })
+    : [];
+  return (
+    options.some(
+      (option) => option.displayText === value && option.value !== value
+    ) || value === ""
+  );
+}
+function normalizeOnlyOfficeDisplayValue(
+  field: { options: unknown; tag: string; type: FieldType },
+  value: unknown,
+  metadata: OnlyOfficeFieldDisplayMetadata | undefined
+): unknown {
+  if (typeof value !== "string") {
+    return value;
+  }
+  if (field.type === FieldType.checkbox) {
+    if (value === "") {
+      return false;
+    }
+    const checkedGlyph = metadata?.checkedState?.glyph ?? "☒";
+    const uncheckedGlyph = metadata?.uncheckedState?.glyph ?? "☐";
+    if (checkedGlyph !== uncheckedGlyph) {
+      if (value === checkedGlyph) {
+        return true;
+      }
+      if (value === uncheckedGlyph) {
+        return false;
+      }
+    }
+    return value;
+  }
+  if (field.type === FieldType.date) {
+    if (value === "") {
+      return null;
+    }
+    return onlyOfficeDateDisplayValue(value, metadata) ?? value;
+  }
+  if (field.type !== FieldType.dropdown && field.type !== FieldType.combo) {
+    return value;
+  }
+  const options = Array.isArray(field.options)
+    ? field.options.flatMap((option) => {
+        if (!option || typeof option !== "object" || Array.isArray(option)) {
+          return [];
+        }
+        const record = option as Record<string, unknown>;
+        return typeof record.displayText === "string" &&
+          typeof record.value === "string"
+          ? [{ displayText: record.displayText, value: record.value }]
+          : [];
+      })
+    : [];
+  if (value === "") {
+    return null;
+  }
+  const selectedOption = options.find((option) => option.displayText === value);
+  return selectedOption?.value ?? value;
+}
+function callbackFieldMetadata(
+  data: JsonRecord,
+  suppliedData: unknown,
+  snapshot: PrefillSnapshot | null
+): Pick<OperationMetadata, "callbackEmptyFieldTags" | "serverHeldFieldTags"> {
+  const suppliedFields = jsonRecord(suppliedData);
+  const lockedFields = jsonRecord(snapshot?.lockedFields);
+  const tags = Object.keys(data);
+  return {
+    callbackEmptyFieldTags: tags.filter((tag) => suppliedFields[tag] === ""),
+    serverHeldFieldTags: tags.filter(
+      (tag) => lockedFields[tag] === true || !Object.hasOwn(suppliedFields, tag)
+    ),
+  };
+}
+
 async function normalizeResponseData(
   form: FormWithDocuments,
   response: ResponseWithSnapshot,
   inputData: unknown,
-  requireRequired = false
+  requireRequired = false,
+  onlyOfficeCompatibility = false,
+  canonicalDateFieldsInput: unknown = undefined
 ): Promise<JsonRecord> {
-  let data: JsonRecord = { ...jsonRecord(inputData) };
-  const snapshot = response.prefillSnapshot;
-  if (snapshot) {
-    const snapshotData = jsonRecord(snapshot.values);
-    const lockedFields = jsonRecord(snapshot.lockedFields);
-    for (const [field, value] of Object.entries(snapshotData)) {
-      if (lockedFields[field] === true) {
-        data[field] = value;
+  const suppliedData = { ...jsonRecord(inputData) };
+  const canonicalDateFields = new Set<string>();
+  if (canonicalDateFieldsInput !== undefined) {
+    if (
+      !Array.isArray(canonicalDateFieldsInput) ||
+      !canonicalDateFieldsInput.every(
+        (field): field is string => typeof field === "string"
+      )
+    ) {
+      fail(
+        400,
+        "invalid_request",
+        "canonicalDateFields must be an array of field tags"
+      );
+    }
+    for (const field of canonicalDateFieldsInput as string[]) {
+      if (canonicalDateFields.has(field)) {
+        fail(
+          400,
+          "invalid_request",
+          "canonicalDateFields must not contain duplicates"
+        );
       }
+      canonicalDateFields.add(field);
     }
   }
   const publishedTemplate = form.publishedTemplate;
@@ -5851,7 +7918,23 @@ async function normalizeResponseData(
   const fieldsByTag = new Map(
     manifest.fields.map((field) => [field.tag, field])
   );
-  const unknownFields = Object.keys(data).filter(
+  for (const field of canonicalDateFields) {
+    const definition = fieldsByTag.get(field);
+    if (
+      !definition ||
+      definition.type !== FieldType.date ||
+      !Object.hasOwn(suppliedData, field) ||
+      typeof suppliedData[field] !== "string" ||
+      !isValidDateFieldValue(suppliedData[field] as string)
+    ) {
+      fail(
+        422,
+        "invalid_response_data",
+        `${field} is not a supplied canonical date field`
+      );
+    }
+  }
+  const unknownFields = Object.keys(suppliedData).filter(
     (field) => !fieldsByTag.has(field)
   );
   if (unknownFields.length > 0) {
@@ -5860,6 +7943,47 @@ async function normalizeResponseData(
       "invalid_response_data",
       `Unknown form field(s): ${unknownFields.join(", ")}`
     );
+  }
+  let onlyOfficeMetadataByTag = new Map<
+    string,
+    OnlyOfficeFieldDisplayMetadata
+  >();
+  if (onlyOfficeCompatibility) {
+    const fieldsNeedingMetadata = manifest.fields.filter(
+      (field) =>
+        !canonicalDateFields.has(field.tag) &&
+        onlyOfficeFieldValueNeedsMetadata(field, suppliedData[field.tag])
+    );
+    if (fieldsNeedingMetadata.length > 0) {
+      onlyOfficeMetadataByTag = onlyOfficeFieldDisplayMetadata(
+        await readObject(publishedTemplate.objectKey)
+      );
+      for (const field of manifest.fields) {
+        if (
+          Object.hasOwn(suppliedData, field.tag) &&
+          !canonicalDateFields.has(field.tag)
+        ) {
+          suppliedData[field.tag] = normalizeOnlyOfficeDisplayValue(
+            field,
+            suppliedData[field.tag],
+            onlyOfficeMetadataByTag.get(field.tag)
+          );
+        }
+      }
+    }
+  }
+  let data = onlyOfficeCompatibility
+    ? { ...jsonRecord(response.draftData ?? {}), ...suppliedData }
+    : { ...suppliedData };
+  const snapshot = response.prefillSnapshot;
+  if (snapshot) {
+    const snapshotData = jsonRecord(snapshot.values);
+    const lockedFields = jsonRecord(snapshot.lockedFields);
+    for (const [field, value] of Object.entries(snapshotData)) {
+      if (lockedFields[field] === true) {
+        data[field] = value;
+      }
+    }
   }
   const pictureTags = new Set(
     manifest.fields
@@ -5890,11 +8014,25 @@ async function normalizeResponseData(
         continue;
       }
       const value = data[field.tag];
+      const blankOptionSelected =
+        typeof value === "string" &&
+        value.trim().length === 0 &&
+        (field.type === FieldType.dropdown || field.type === FieldType.combo) &&
+        Array.isArray(field.options) &&
+        field.options.some(
+          (option) =>
+            option !== null &&
+            typeof option === "object" &&
+            !Array.isArray(option) &&
+            (option as Record<string, unknown>).value === value
+        );
       if (
         field.required &&
         (!Object.hasOwn(data, field.tag) ||
           value === null ||
-          (typeof value === "string" && value.trim().length === 0) ||
+          (typeof value === "string" &&
+            value.trim().length === 0 &&
+            !blankOptionSelected) ||
           (field.type === FieldType.checkbox && value !== true))
       ) {
         fail(
@@ -5902,6 +8040,18 @@ async function normalizeResponseData(
           "invalid_response_data",
           `${field.tag} is required by the published Field Manifest`
         );
+      }
+    }
+  }
+  if (snapshot) {
+    const snapshotData = jsonRecord(snapshot.values);
+    const lockedFields = jsonRecord(snapshot.lockedFields);
+    for (const [field, value] of Object.entries(snapshotData)) {
+      if (lockedFields[field] === true && Object.hasOwn(suppliedData, field)) {
+        const suppliedValue = suppliedData[field];
+        if (suppliedValue !== value) {
+          fail(422, "invalid_response_data", `${field} is locked by Prefill`);
+        }
       }
     }
   }
@@ -5990,10 +8140,12 @@ async function createOperation(input: {
 }): Promise<Operation> {
   try {
     return await prisma.$transaction(async (tx) => {
-      const [lockedForm] = await tx.$queryRaw<{
-        fillMethod: FillMethod;
-        id: string;
-      }[]>(
+      const [lockedForm] = await tx.$queryRaw<
+        {
+          fillMethod: FillMethod;
+          id: string;
+        }[]
+      >(
         Prisma.sql`
           SELECT "id", "fill_method" AS "fillMethod"
           FROM "forms"
@@ -6860,9 +9012,20 @@ function templatePartsHaveNestedControls(
 ): boolean {
   for (const archivePath of controlParts) {
     let controlDepth = 0;
+    let alternateFallbackDepth = 0;
     let nested = false;
     const parser = new SaxesParser({ xmlns: true });
     parser.on("opentag", (tag) => {
+      if (
+        tag.local === "Fallback" &&
+        tag.uri === templateMarkupCompatibilityNamespace
+      ) {
+        alternateFallbackDepth += 1;
+        return;
+      }
+      if (alternateFallbackDepth > 0) {
+        return;
+      }
       if (tag.local === "sdt" && templateWordNamespaces.has(tag.uri)) {
         nested ||= controlDepth > 0;
         controlDepth += 1;
@@ -6870,6 +9033,14 @@ function templatePartsHaveNestedControls(
     });
     parser.on("closetag", (tag) => {
       if (
+        tag.local === "Fallback" &&
+        tag.uri === templateMarkupCompatibilityNamespace
+      ) {
+        alternateFallbackDepth -= 1;
+        return;
+      }
+      if (
+        alternateFallbackDepth === 0 &&
         tag.local === "sdt" &&
         templateWordNamespaces.has(tag.uri) &&
         controlDepth > 0
@@ -6885,52 +9056,1134 @@ function templatePartsHaveNestedControls(
   return false;
 }
 
-interface NativeTextControlFrame {
+function hasUnsupportedNativeDateFormatTokens(format: string): boolean {
+  const unquoted = format.replaceAll(/'[^']*'|"[^"]*"/gu, "");
+  const unrecognized = unquoted.replaceAll(
+    /dddd|ddd|yyyy|MMMM|MMM|yy|MM|dd|M|d/gu,
+    ""
+  );
+  return /[A-Za-z]/u.test(unrecognized);
+}
+
+function templatePartsHaveUnsupportedDateSettings(
+  archive: Record<string, Uint8Array>,
+  controlParts: ReadonlySet<string>
+): boolean {
+  for (const archivePath of controlParts) {
+    let alternateFallbackDepth = 0;
+    let inDateControl = false;
+    let propertiesDepth = 0;
+    let unsupportedDateSettings = false;
+    const parser = new SaxesParser({ xmlns: true });
+    parser.on("opentag", (tag) => {
+      if (
+        tag.local === "Fallback" &&
+        tag.uri === templateMarkupCompatibilityNamespace
+      ) {
+        alternateFallbackDepth += 1;
+        return;
+      }
+      if (alternateFallbackDepth > 0) {
+        return;
+      }
+      if (tag.local === "sdtPr" && templateWordNamespaces.has(tag.uri)) {
+        propertiesDepth = 1;
+        inDateControl = false;
+        return;
+      }
+      if (propertiesDepth === 0) {
+        return;
+      }
+      if (
+        propertiesDepth === 1 &&
+        tag.local === "date" &&
+        templateWordNamespaces.has(tag.uri)
+      ) {
+        inDateControl = true;
+      } else if (
+        inDateControl &&
+        tag.local === "calendar" &&
+        templateWordNamespaces.has(tag.uri)
+      ) {
+        const calendar = templateControlAttribute(
+          templateXmlElement(tag),
+          "val"
+        );
+        unsupportedDateSettings ||=
+          calendar !== undefined && calendar !== "gregorian";
+      } else if (
+        inDateControl &&
+        tag.local === "dateFormat" &&
+        templateWordNamespaces.has(tag.uri)
+      ) {
+        const format = templateControlAttribute(templateXmlElement(tag), "val");
+        unsupportedDateSettings ||=
+          format !== undefined && hasUnsupportedNativeDateFormatTokens(format);
+      } else if (
+        inDateControl &&
+        tag.local === "lid" &&
+        templateWordNamespaces.has(tag.uri)
+      ) {
+        const language = templateControlAttribute(
+          templateXmlElement(tag),
+          "val"
+        );
+        unsupportedDateSettings ||=
+          language !== undefined && !/^en(?:-|$)/iu.test(language);
+      }
+      propertiesDepth += 1;
+    });
+    parser.on("closetag", (tag) => {
+      if (
+        tag.local === "Fallback" &&
+        tag.uri === templateMarkupCompatibilityNamespace
+      ) {
+        alternateFallbackDepth -= 1;
+        return;
+      }
+      if (alternateFallbackDepth > 0) {
+        return;
+      }
+      if (tag.local === "sdtPr" && templateWordNamespaces.has(tag.uri)) {
+        propertiesDepth = 0;
+        inDateControl = false;
+      } else if (propertiesDepth > 0) {
+        if (tag.local === "date" && templateWordNamespaces.has(tag.uri)) {
+          inDateControl = false;
+        }
+        propertiesDepth -= 1;
+      }
+    });
+    parser.write(templateArchiveText(archive, archivePath)).close();
+    if (unsupportedDateSettings) {
+      return true;
+    }
+  }
+  return false;
+}
+
+interface NativeFontAttributeNames {
+  ascii: string | null;
+  asciiTheme: string | null;
+  elementName: string;
+  hAnsi: string | null;
+  hAnsiTheme: string | null;
+}
+interface NativeFieldControlFrame {
   block: boolean;
+  checkboxElement: {
+    attributeDeclaration: string;
+    attributeName: string;
+    end: number;
+    name: string;
+    prefix: string;
+    start: number;
+  } | null;
+  checkboxHasChecked: boolean;
+  checkedState: NativeCheckboxState | null;
   contentEnd: number | null;
   contentName: string | null;
   contentPrefix: string;
+  contentNamespace: string;
   contentSelfClosing: boolean;
   contentStart: number | null;
   contentTokenStart: number | null;
+  paragraphProperties: string | null;
+  paragraphPropertiesStart: number | null;
+  runProperties: string | null;
+  runPropertiesStart: number | null;
+  contentFontAttributeNames: (NativeFontAttributeNames | null)[];
+  runPropertiesFontAttributeNames: NativeFontAttributeNames | null | undefined;
   inPropertiesDepth: number;
+  dateFormat: string | null;
   tag: string | null;
+  uncheckedState: NativeCheckboxState | null;
+}
+interface NativeCheckboxState {
+  font: string | null;
+  glyph: string | null;
+}
+function nativeCheckboxState(element: TemplateXmlElement): NativeCheckboxState {
+  const value = templateControlAttribute(element, "val");
+  const codePoint =
+    value && /^[\da-f]{1,6}$/iu.test(value)
+      ? Number.parseInt(value, 16)
+      : Number.NaN;
+  return {
+    font: templateControlAttribute(element, "font") ?? null,
+    glyph:
+      Number.isInteger(codePoint) &&
+      codePoint <= 0x10_ff_ff &&
+      !(codePoint >= 0xd8_00 && codePoint <= 0xdf_ff)
+        ? String.fromCodePoint(codePoint)
+        : null,
+  };
+}
+function nativeNamespacedAttribute(
+  elementName: string,
+  namespaceBindings: ReadonlyMap<string, string>,
+  namespaceUri: string,
+  localName: string,
+  openingTag: string
+): { declaration: string; name: string } {
+  let prefix = elementName.includes(":")
+    ? elementName.slice(0, elementName.indexOf(":"))
+    : [...namespaceBindings].find(
+        ([candidate, uri]) => candidate && uri === namespaceUri
+      )?.[0];
+  if (!prefix) {
+    prefix = "word";
+    for (
+      let suffix = 1;
+      namespaceBindings.has(prefix) || openingTag.includes(`${prefix}:`);
+      suffix += 1
+    ) {
+      prefix = `word${suffix}`;
+    }
+    return {
+      declaration: ` xmlns:${prefix}="${namespaceUri}"`,
+      name: `${prefix}:${localName}`,
+    };
+  }
+  return { declaration: "", name: `${prefix}:${localName}` };
+}
+function nativeRunPropertiesXml(
+  runProperties: string | null,
+  contentPrefix: string,
+  font: string | null,
+  fontAttributeNames: NativeFontAttributeNames | null | undefined = undefined,
+  wordNamespace = templateWordMainNamespace
+): string {
+  if (!font) {
+    return runProperties ?? "";
+  }
+  const fontXml =
+    contentPrefix.length > 0
+      ? `<${contentPrefix}rFonts ${contentPrefix}ascii="${htmlEscape(font)}" ${contentPrefix}hAnsi="${htmlEscape(font)}"/>`
+      : `<rFonts xmlns:word="${wordNamespace}" word:ascii="${htmlEscape(font)}" word:hAnsi="${htmlEscape(font)}"/>`;
+  if (!runProperties) {
+    return `<${contentPrefix}rPr>${fontXml}</${contentPrefix}rPr>`;
+  }
+  let fontElementStart: number | null = null;
+  let fontElementOpenEnd: number | null = null;
+  let fontElementEnd: number | null = null;
+  let fontElementName: string | null = null;
+  let fontOpeningTag = "";
+  const parser = new SaxesParser({ position: true, xmlns: false });
+  parser.on("opentag", (tag) => {
+    const localName = tag.name.slice(tag.name.lastIndexOf(":") + 1);
+    if (
+      fontElementStart !== null ||
+      localName !== "rFonts" ||
+      fontAttributeNames === null ||
+      (fontAttributeNames && tag.name !== fontAttributeNames.elementName)
+    ) {
+      return;
+    }
+    fontElementStart = runProperties.lastIndexOf("<", parser.position - 1);
+    if (fontElementStart < 0) {
+      return;
+    }
+    fontElementOpenEnd = parser.position;
+    fontElementName = tag.name;
+    const prefix = tag.name.includes(":")
+      ? tag.name.slice(0, tag.name.lastIndexOf(":") + 1)
+      : "";
+    const setAttribute = (
+      openingTag: string,
+      attributeName: string
+    ): string => {
+      let replaced = false;
+      const updated = openingTag.replaceAll(
+        /(\s)([^\s="'<>/]+)(\s*=\s*)(["'])[\s\S]*?\4/gu,
+        (
+          match,
+          whitespace: string,
+          name: string,
+          assignment: string,
+          quote: string
+        ) => {
+          if (name !== attributeName) {
+            return match;
+          }
+          replaced = true;
+          return `${whitespace}${name}${assignment}${quote}${htmlEscape(font)}${quote}`;
+        }
+      );
+      return replaced
+        ? updated
+        : updated.replace(
+            /(\/?)>$/u,
+            ` ${attributeName}="${htmlEscape(font)}"$1>`
+          );
+    };
+    const removeAttribute = (
+      openingTag: string,
+      attributeName: string
+    ): string =>
+      openingTag.replaceAll(
+        /(\s)([^\s="'<>/]+)(\s*=\s*)(["'])[\s\S]*?\4/gu,
+        (match, _whitespace: string, name: string) =>
+          name === attributeName ? "" : match
+      );
+    fontOpeningTag = runProperties.slice(fontElementStart, fontElementOpenEnd);
+    let fontAttributePrefix =
+      fontAttributeNames?.ascii?.slice(
+        0,
+        fontAttributeNames.ascii.lastIndexOf(":") + 1
+      ) ??
+      fontAttributeNames?.hAnsi?.slice(
+        0,
+        fontAttributeNames.hAnsi.lastIndexOf(":") + 1
+      ) ??
+      "";
+    if (!fontAttributePrefix) {
+      let prefix = "word";
+      for (let suffix = 1; fontOpeningTag.includes(`${prefix}:`); suffix += 1) {
+        prefix = `word${suffix}`;
+      }
+      fontAttributePrefix = `${prefix}:`;
+      fontOpeningTag = fontOpeningTag.replace(
+        /(\/?)>$/u,
+        ` xmlns:${prefix}="${wordNamespace}"$1>`
+      );
+    }
+    fontOpeningTag = setAttribute(
+      fontOpeningTag,
+      fontAttributeNames?.ascii ?? `${fontAttributePrefix}ascii`
+    );
+    fontOpeningTag = setAttribute(
+      fontOpeningTag,
+      fontAttributeNames?.hAnsi ?? `${fontAttributePrefix}hAnsi`
+    );
+    if (fontAttributeNames) {
+      for (const attributeName of [
+        fontAttributeNames.asciiTheme,
+        fontAttributeNames.hAnsiTheme,
+      ]) {
+        if (attributeName) {
+          fontOpeningTag = removeAttribute(fontOpeningTag, attributeName);
+        }
+      }
+    } else if (fontAttributeNames === undefined) {
+      fontOpeningTag = removeAttribute(fontOpeningTag, `${prefix}asciiTheme`);
+      fontOpeningTag = removeAttribute(fontOpeningTag, `${prefix}hAnsiTheme`);
+    }
+    if (tag.isSelfClosing) {
+      fontElementEnd = parser.position;
+    }
+  });
+  parser.on("closetag", (tag) => {
+    if (
+      fontElementStart !== null &&
+      fontElementEnd === null &&
+      tag.name === fontElementName
+    ) {
+      fontElementEnd = parser.position;
+    }
+  });
+  try {
+    parser.write(runProperties).close();
+  } catch {
+    fail(422, "invalid_template", "DOCX XML is malformed");
+  }
+  if (
+    fontElementStart !== null &&
+    fontElementOpenEnd !== null &&
+    fontElementEnd !== null
+  ) {
+    return (
+      runProperties.slice(0, fontElementStart) +
+      fontOpeningTag +
+      runProperties.slice(fontElementOpenEnd, fontElementEnd) +
+      runProperties.slice(fontElementEnd)
+    );
+  }
+  if (/\/\s*>$/u.test(runProperties)) {
+    const propertiesName = runProperties.match(/^<([^\s/>]+)/u)?.[1];
+    if (propertiesName) {
+      return `${runProperties.replace(/\/\s*>$/u, ">")}${fontXml}</${propertiesName}>`;
+    }
+  }
+  const closingTagStart = runProperties.lastIndexOf("</");
+  if (closingTagStart === -1) {
+    return runProperties;
+  }
+  return `${runProperties.slice(0, closingTagStart)}${fontXml}${runProperties.slice(closingTagStart)}`;
 }
 
-function nativeTextControlXml(xml: string, data: JsonRecord): string {
-  const controls: NativeTextControlFrame[] = [];
-  const elements: { local: string; uri: string }[] = [];
+function nativeApplyTextControlFontXml(
+  xml: string,
+  font: string,
+  fontAttributeNamesByElement: readonly (NativeFontAttributeNames | null)[],
+  wordNamespace = templateWordMainNamespace
+): string {
+  interface RunFrame {
+    fontAttributeNames: NativeFontAttributeNames | null | undefined;
+    hasText: boolean;
+    name: string;
+    openingEnd: number;
+    propertiesEnd: number | null;
+    propertiesName: string | null;
+    propertiesStart: number | null;
+  }
+  const runStack: RunFrame[] = [];
   const patches: { end: number; replacement: string; start: number }[] = [];
+  const parser = new SaxesParser({
+    fragment: true,
+    position: true,
+    xmlns: false,
+  });
+  let fontElementIndex = 0;
+  parser.on("opentag", (tag) => {
+    const localName = tag.name.slice(tag.name.lastIndexOf(":") + 1);
+    if (localName === "rFonts") {
+      const fontAttributeNames =
+        fontAttributeNamesByElement[fontElementIndex] ?? null;
+      fontElementIndex += 1;
+      const run = runStack.at(-1);
+      if (run && run.fontAttributeNames === undefined) {
+        run.fontAttributeNames = fontAttributeNames;
+      }
+    } else if (localName === "r") {
+      runStack.push({
+        fontAttributeNames: undefined,
+        hasText: false,
+        name: tag.name,
+        openingEnd: parser.position,
+        propertiesEnd: null,
+        propertiesName: null,
+        propertiesStart: null,
+      });
+    } else if (localName === "rPr" && runStack.length > 0) {
+      const run = runStack.at(-1);
+      if (run && run.propertiesStart === null) {
+        run.propertiesName = tag.name;
+        run.propertiesStart = xml.lastIndexOf("<", parser.position - 1);
+        run.propertiesEnd = tag.isSelfClosing ? parser.position : null;
+      }
+    } else if (localName === "t" && runStack.length > 0) {
+      const run = runStack.at(-1);
+      if (run) {
+        run.hasText = true;
+      }
+    }
+  });
+  parser.on("closetag", (tag) => {
+    const localName = tag.name.slice(tag.name.lastIndexOf(":") + 1);
+    if (localName === "rPr") {
+      const run = runStack.at(-1);
+      if (run?.propertiesName === tag.name && run.propertiesEnd === null) {
+        run.propertiesEnd = parser.position;
+      }
+    } else if (localName === "r" && runStack.at(-1)?.name === tag.name) {
+      const run = runStack.pop();
+      if (!run?.hasText) {
+        return;
+      }
+      if (
+        run.propertiesStart !== null &&
+        run.propertiesEnd !== null &&
+        run.propertiesName
+      ) {
+        const properties = xml.slice(run.propertiesStart, run.propertiesEnd);
+        const prefix = run.propertiesName.includes(":")
+          ? run.propertiesName.slice(0, run.propertiesName.lastIndexOf(":") + 1)
+          : "";
+        const replacement = nativeRunPropertiesXml(
+          properties,
+          prefix,
+          font,
+          run.fontAttributeNames,
+          wordNamespace
+        );
+        if (replacement !== properties) {
+          patches.push({
+            end: run.propertiesEnd,
+            replacement,
+            start: run.propertiesStart,
+          });
+        }
+        return;
+      }
+      const prefix = run.name.includes(":")
+        ? run.name.slice(0, run.name.lastIndexOf(":") + 1)
+        : "";
+      patches.push({
+        end: run.openingEnd,
+        replacement: nativeRunPropertiesXml(
+          null,
+          prefix,
+          font,
+          undefined,
+          wordNamespace
+        ),
+        start: run.openingEnd,
+      });
+    }
+  });
+  parser.on("doctype", () => {
+    fail(422, "invalid_template", "DOCX XML document types are not allowed");
+  });
+  try {
+    parser.write(xml).close();
+  } catch {
+    fail(422, "invalid_template", "DOCX XML is malformed");
+  }
+  let updated = xml;
+  for (const patch of patches.sort((left, right) => right.start - left.start)) {
+    updated =
+      updated.slice(0, patch.start) +
+      patch.replacement +
+      updated.slice(patch.end);
+  }
+  return updated;
+}
+
+const nativeDateMonths = [
+  "January",
+  "February",
+  "March",
+  "April",
+  "May",
+  "June",
+  "July",
+  "August",
+  "September",
+  "October",
+  "November",
+  "December",
+] as const;
+const nativeDateWeekdays = [
+  "Sunday",
+  "Monday",
+  "Tuesday",
+  "Wednesday",
+  "Thursday",
+  "Friday",
+  "Saturday",
+] as const;
+function nativeDateDisplayValue(value: string, format: string | null): string {
+  if (!format) {
+    return value;
+  }
+  const [yearText, monthText, dayText] = value.split("-");
+  const year = Number(yearText);
+  const month = Number(monthText);
+  const day = Number(dayText);
+  if (
+    !yearText ||
+    !monthText ||
+    !dayText ||
+    !Number.isInteger(year) ||
+    !Number.isInteger(month) ||
+    !Number.isInteger(day)
+  ) {
+    return value;
+  }
+  const monthName = nativeDateMonths[month - 1];
+  const weekday =
+    nativeDateWeekdays[new Date(`${value}T00:00:00Z`).getUTCDay()];
+  if (!monthName || !weekday) {
+    return value;
+  }
+  const monthNumber = String(month);
+  const dayNumber = String(day);
+  return format.replaceAll(
+    /'[^']*'|"[^"]*"|dddd|ddd|yyyy|MMMM|MMM|yy|MM|dd|M|d/gu,
+    (token) => {
+      if (token.startsWith("'") || token.startsWith('"')) {
+        return token.slice(1, -1);
+      }
+      switch (token) {
+        case "yyyy": {
+          return yearText;
+        }
+        case "yy": {
+          return yearText.slice(-2);
+        }
+        case "dddd": {
+          return weekday;
+        }
+        case "ddd": {
+          return weekday.slice(0, 3);
+        }
+        case "MMMM": {
+          return monthName;
+        }
+        case "MMM": {
+          return monthName.slice(0, 3);
+        }
+        case "MM": {
+          return monthNumber.padStart(2, "0");
+        }
+        case "M": {
+          return monthNumber;
+        }
+        case "dd": {
+          return dayNumber.padStart(2, "0");
+        }
+        case "d": {
+          return dayNumber;
+        }
+        default: {
+          return token;
+        }
+      }
+    }
+  );
+}
+
+function nativeRewriteTextControlContentXml(
+  xml: string,
+  value: string
+): string | null {
+  interface TextNode {
+    contentEnd: number;
+    line: number;
+    name: string;
+    openingStart: number;
+    openingTag: string;
+    paragraph: number;
+    selfClosing: boolean;
+    start: number;
+    tagEnd: number;
+    text: string;
+  }
+  interface TabNode {
+    end: number;
+    line: number;
+    name: string;
+    paragraph: number;
+    start: number;
+  }
+  interface Paragraph {
+    end: number;
+    index: number;
+    start: number;
+    startLine: number;
+  }
+  interface LineBreak {
+    end: number;
+    line: number;
+    name: string;
+    paragraph: number;
+    start: number;
+  }
+  const textNodes: TextNode[] = [];
+  const tabNodes: TabNode[] = [];
+  const paragraphs: Paragraph[] = [];
+  const lineBreaks: LineBreak[] = [];
+  const paragraphStack: Omit<Paragraph, "end">[] = [];
+  const breakStack: Omit<LineBreak, "end">[] = [];
+  const tabStack: Omit<TabNode, "end">[] = [];
+  let activeTextNode: Omit<TextNode, "contentEnd" | "tagEnd"> | null = null;
+  let currentLine = 0;
+  let currentParagraph = -1;
+  let visibleText = "";
+  const parser = new SaxesParser({
+    fragment: true,
+    position: true,
+    xmlns: false,
+  });
+  parser.on("doctype", () => {
+    fail(422, "invalid_template", "DOCX XML document types are not allowed");
+  });
+  parser.on("opentag", (tag) => {
+    const localName = tag.name.slice(tag.name.lastIndexOf(":") + 1);
+    if (localName === "p") {
+      if (currentParagraph >= 0) {
+        currentLine += 1;
+        visibleText += "\n";
+      }
+      currentParagraph += 1;
+      paragraphStack.push({
+        index: currentParagraph,
+        start: xml.lastIndexOf("<", parser.position - 1),
+        startLine: currentLine,
+      });
+    } else if (localName === "br" || localName === "cr") {
+      const lineBreak = {
+        line: currentLine,
+        name: tag.name,
+        paragraph: currentParagraph,
+        start: xml.lastIndexOf("<", parser.position - 1),
+      };
+      if (tag.isSelfClosing) {
+        lineBreaks.push({ ...lineBreak, end: parser.position });
+      } else {
+        breakStack.push(lineBreak);
+      }
+      currentLine += 1;
+      visibleText += "\n";
+    } else if (localName === "tab") {
+      const tab = {
+        line: currentLine,
+        name: tag.name,
+        paragraph: currentParagraph,
+        start: xml.lastIndexOf("<", parser.position - 1),
+      };
+      if (tag.isSelfClosing) {
+        tabNodes.push({ ...tab, end: parser.position });
+      } else {
+        tabStack.push(tab);
+      }
+      visibleText += "\t";
+    } else if (localName === "t") {
+      const openingStart = xml.lastIndexOf("<", parser.position - 1);
+      const textNode = {
+        line: currentLine,
+        name: tag.name,
+        openingStart,
+        openingTag: xml.slice(openingStart, parser.position),
+        paragraph: currentParagraph,
+        selfClosing: tag.isSelfClosing,
+        start: parser.position,
+        text: "",
+      };
+      if (tag.isSelfClosing) {
+        textNodes.push({
+          ...textNode,
+          contentEnd: parser.position,
+          tagEnd: parser.position,
+        });
+      } else {
+        activeTextNode = textNode;
+      }
+    }
+  });
+  parser.on("text", (text) => {
+    if (activeTextNode) {
+      activeTextNode.text += text;
+      visibleText += text;
+    }
+  });
+  parser.on("closetag", (tag) => {
+    const localName = tag.name.slice(tag.name.lastIndexOf(":") + 1);
+    if (localName === "t" && activeTextNode?.name === tag.name) {
+      const contentEnd = xml.lastIndexOf("</", parser.position - 1);
+      textNodes.push({
+        ...activeTextNode,
+        contentEnd,
+        tagEnd: parser.position,
+      });
+      activeTextNode = null;
+    } else if (
+      (localName === "br" || localName === "cr") &&
+      breakStack.at(-1)?.name === tag.name
+    ) {
+      const lineBreak = breakStack.pop();
+      if (lineBreak) {
+        lineBreaks.push({ ...lineBreak, end: parser.position });
+      }
+    } else if (localName === "tab" && tabStack.at(-1)?.name === tag.name) {
+      const tab = tabStack.pop();
+      if (tab) {
+        tabNodes.push({ ...tab, end: parser.position });
+      }
+    } else if (localName === "p") {
+      const paragraph = paragraphStack.pop();
+      if (paragraph) {
+        paragraphs.push({ ...paragraph, end: parser.position });
+      }
+    }
+  });
+  try {
+    parser.write(xml).close();
+  } catch {
+    fail(422, "invalid_template", "DOCX XML is malformed");
+  }
+  if (textNodes.length === 0 || visibleText === value) {
+    return textNodes.length === 0 ? null : xml;
+  }
+  const lines = value.split(/\r\n|\r|\n/u);
+  const existingLineCount = currentLine + 1;
+  const removedParagraphs = new Set(
+    lines.length < existingLineCount
+      ? paragraphs
+          .filter(({ startLine }) => startLine >= lines.length)
+          .map(({ index }) => index)
+      : []
+  );
+  const removedParagraphRanges = paragraphs.filter(({ index }) =>
+    removedParagraphs.has(index)
+  );
+  const keptTextNodes = textNodes.filter(
+    ({ paragraph }) => !removedParagraphs.has(paragraph)
+  );
+  const keptTabNodes = tabNodes.filter(
+    ({ paragraph }) => !removedParagraphs.has(paragraph)
+  );
+  type ContentSegment =
+    | { kind: "text"; node: TextNode }
+    | { kind: "tab"; node: TabNode };
+  const segmentsByLine = new Map<number, ContentSegment[]>();
+  for (const node of keptTextNodes) {
+    const segments = segmentsByLine.get(node.line) ?? [];
+    segments.push({ kind: "text", node });
+    segmentsByLine.set(node.line, segments);
+  }
+  for (const node of keptTabNodes) {
+    const segments = segmentsByLine.get(node.line) ?? [];
+    segments.push({ kind: "tab", node });
+    segmentsByLine.set(node.line, segments);
+  }
+  for (const segments of segmentsByLine.values()) {
+    segments.sort((left, right) => {
+      const leftStart =
+        left.kind === "text" ? left.node.openingStart : left.node.start;
+      const rightStart =
+        right.kind === "text" ? right.node.openingStart : right.node.start;
+      return leftStart - rightStart;
+    });
+  }
+  for (
+    let line = 0;
+    line < Math.min(lines.length, existingLineCount);
+    line += 1
+  ) {
+    if (lines[line] && !segmentsByLine.has(line)) {
+      return null;
+    }
+  }
+  const extraLines = lines.slice(existingLineCount);
+  const appendSegment = extraLines.length
+    ? segmentsByLine.get(existingLineCount - 1)?.at(-1)
+    : undefined;
+  if (extraLines.length > 0 && !appendSegment) {
+    return null;
+  }
+  const assignments = new Map<TextNode, string>();
+  const tabAssignments = new Map<TabNode, string>();
+  for (const [line, segments] of segmentsByLine) {
+    const characters = [...(lines[line] ?? "")];
+    const originalLengths = segments.map((segment) =>
+      segment.kind === "text" ? [...segment.node.text].length : 1
+    );
+    const originalLength = originalLengths.reduce(
+      (total, length) => total + length,
+      0
+    );
+    const assign = (segment: ContentSegment, text: string): void => {
+      if (segment.kind === "text") {
+        assignments.set(segment.node, text);
+      } else {
+        tabAssignments.set(segment.node, text);
+      }
+    };
+    if (originalLength === 0) {
+      const [first, ...rest] = segments;
+      if (first) {
+        assign(first, characters.join(""));
+      }
+      for (const segment of rest) {
+        assign(segment, "");
+      }
+      continue;
+    }
+    let offset = 0;
+    for (const [index, segment] of segments.entries()) {
+      const end =
+        index === segments.length - 1
+          ? characters.length
+          : Math.min(characters.length, offset + (originalLengths[index] ?? 0));
+      assign(segment, characters.slice(offset, end).join(""));
+      offset = end;
+    }
+  }
+  const textOpeningTag = (openingTag: string, text: string): string => {
+    const opening = openingTag.replace(/\/\s*>$/u, ">");
+    return text.trim() === text || /\bxml:space\s*=/u.test(opening)
+      ? opening
+      : opening.replace(/>$/u, ' xml:space="preserve">');
+  };
+  const textContentXml = (
+    name: string,
+    openingTag: string,
+    text: string
+  ): string => {
+    const prefix = name.includes(":")
+      ? name.slice(0, name.lastIndexOf(":") + 1)
+      : "";
+    const [firstPart = "", ...tabParts] = text.split("\t");
+    let replacement = htmlEscape(firstPart);
+    for (const part of tabParts) {
+      replacement += `</${name}><${prefix}tab/>${textOpeningTag(openingTag, part)}${htmlEscape(part)}`;
+    }
+    return replacement;
+  };
+  const patches: { end: number; replacement: string; start: number }[] = [];
+  for (const paragraph of removedParagraphRanges) {
+    patches.push({
+      end: paragraph.end,
+      replacement: "",
+      start: paragraph.start,
+    });
+  }
+  if (lines.length < existingLineCount) {
+    for (const lineBreak of lineBreaks) {
+      if (
+        lineBreak.line >= lines.length - 1 &&
+        !removedParagraphs.has(lineBreak.paragraph)
+      ) {
+        patches.push({
+          end: lineBreak.end,
+          replacement: "",
+          start: lineBreak.start,
+        });
+      }
+    }
+  }
+  for (const node of keptTextNodes) {
+    const assigned = assignments.get(node) ?? "";
+    const appended =
+      appendSegment?.kind === "text" && node === appendSegment.node
+        ? extraLines
+        : [];
+    if (node.selfClosing && !assigned && appended.length === 0) {
+      continue;
+    }
+    const opening = textOpeningTag(node.openingTag, assigned);
+    const prefix = node.name.includes(":")
+      ? node.name.slice(0, node.name.lastIndexOf(":") + 1)
+      : "";
+    let replacement = textContentXml(node.name, opening, assigned);
+    for (const line of appended) {
+      replacement += `</${node.name}><${prefix}br/>${textOpeningTag(node.openingTag, line)}${textContentXml(node.name, opening, line)}`;
+    }
+    if (node.selfClosing) {
+      patches.push({
+        end: node.tagEnd,
+        replacement: `${opening}${replacement}</${node.name}>`,
+        start: node.openingStart,
+      });
+    } else {
+      if (opening !== node.openingTag) {
+        patches.push({
+          end: node.start,
+          replacement: opening,
+          start: node.openingStart,
+        });
+      }
+      if (replacement !== xml.slice(node.start, node.contentEnd)) {
+        patches.push({
+          end: node.contentEnd,
+          replacement,
+          start: node.start,
+        });
+      }
+    }
+  }
+  for (const node of keptTabNodes) {
+    const assigned = tabAssignments.get(node) ?? "";
+    const appended =
+      appendSegment?.kind === "tab" && node === appendSegment.node
+        ? extraLines
+        : [];
+    if (assigned === "\t" && appended.length === 0) {
+      continue;
+    }
+    const prefix = node.name.includes(":")
+      ? node.name.slice(0, node.name.lastIndexOf(":") + 1)
+      : "";
+    if (!assigned && appended.length === 0) {
+      patches.push({ end: node.end, replacement: "", start: node.start });
+      continue;
+    }
+    const name = `${prefix}t`;
+    const opening = textOpeningTag(`<${name} xml:space="preserve">`, assigned);
+    let replacement = `${opening}${textContentXml(name, opening, assigned)}</${name}>`;
+    for (const line of appended) {
+      const lineOpening = textOpeningTag(opening, line);
+      replacement += `<${prefix}br/>${lineOpening}${textContentXml(name, lineOpening, line)}</${name}>`;
+    }
+    patches.push({ end: node.end, replacement, start: node.start });
+  }
+  let updated = xml;
+  for (const patch of patches.sort((left, right) => right.start - left.start)) {
+    updated =
+      updated.slice(0, patch.start) +
+      patch.replacement +
+      updated.slice(patch.end);
+  }
+  return updated;
+}
+
+function nativeFieldControlXml(
+  xml: string,
+  data: JsonRecord,
+  fieldsByTag: Map<string, { options: unknown; type: FieldType }>,
+  selectedTags?: ReadonlySet<string>
+): string {
+  const controlTags: (string | null)[] = [];
+  let alternateTagFallbackDepth = 0;
+  let controlTag: string | null = null;
+  let inControlProperties = false;
+  const tagParser = new SaxesParser({ xmlns: true });
+  tagParser.on("doctype", () => {
+    fail(422, "invalid_template", "DOCX XML document types are not allowed");
+  });
+  tagParser.on("opentag", (tag) => {
+    if (
+      tag.local === "Fallback" &&
+      tag.uri === templateMarkupCompatibilityNamespace
+    ) {
+      alternateTagFallbackDepth += 1;
+      return;
+    }
+    if (alternateTagFallbackDepth > 0) {
+      return;
+    }
+    if (tag.local === "sdt" && templateWordNamespaces.has(tag.uri)) {
+      controlTag = null;
+    } else if (tag.local === "sdtPr" && templateWordNamespaces.has(tag.uri)) {
+      inControlProperties = true;
+    } else if (
+      inControlProperties &&
+      tag.local === "tag" &&
+      templateWordNamespaces.has(tag.uri)
+    ) {
+      controlTag =
+        templateControlAttribute(templateXmlElement(tag), "val") ?? null;
+    }
+  });
+  tagParser.on("closetag", (tag) => {
+    if (
+      tag.local === "Fallback" &&
+      tag.uri === templateMarkupCompatibilityNamespace
+    ) {
+      alternateTagFallbackDepth -= 1;
+      return;
+    }
+    if (alternateTagFallbackDepth > 0) {
+      return;
+    }
+    if (tag.local === "sdtPr" && templateWordNamespaces.has(tag.uri)) {
+      inControlProperties = false;
+    } else if (tag.local === "sdt" && templateWordNamespaces.has(tag.uri)) {
+      controlTags.push(controlTag?.trim() ?? null);
+    }
+  });
+  try {
+    tagParser.write(xml).close();
+  } catch {
+    fail(422, "invalid_template", "DOCX XML is malformed");
+  }
+  let controlIndex = 0;
+  const controls: NativeFieldControlFrame[] = [];
+  const elements: {
+    local: string;
+    namespaces: Map<string, string>;
+    uri: string;
+  }[] = [];
+  const patches: { end: number; replacement: string; start: number }[] = [];
+  const showingPlcHdrStarts: { remove: boolean; start: number }[] = [];
+  let alternateFallbackDepth = 0;
   const parser = new SaxesParser({ position: true, xmlns: true });
   parser.on("doctype", () => {
     fail(422, "invalid_template", "DOCX XML document types are not allowed");
   });
   parser.on("opentag", (tag) => {
+    const namespaceBindings = new Map(elements.at(-1)?.namespaces);
+    for (const [attributeName, attribute] of Object.entries(tag.attributes)) {
+      if (attribute.uri === templateXmlnsNamespace) {
+        namespaceBindings.set(
+          attributeName === "xmlns"
+            ? ""
+            : attributeName.slice(attributeName.indexOf(":") + 1),
+          attribute.value
+        );
+      }
+    }
+    const element = {
+      local: tag.local,
+      namespaces: namespaceBindings,
+      uri: tag.uri,
+    };
+    if (
+      tag.local === "Fallback" &&
+      tag.uri === templateMarkupCompatibilityNamespace
+    ) {
+      alternateFallbackDepth += 1;
+      elements.push(element);
+      return;
+    }
+    if (alternateFallbackDepth > 0) {
+      elements.push(element);
+      return;
+    }
     if (tag.local === "sdt" && templateWordNamespaces.has(tag.uri)) {
       if (controls.length > 0) {
-        fail(
-          422,
-          "invalid_template",
-          "Nested Native text fields are unsupported"
-        );
+        fail(422, "invalid_template", "Nested native fields are unsupported");
       }
       controls.push({
         block: !elements.some(
           (element) =>
             element.local === "p" && templateWordNamespaces.has(element.uri)
         ),
+        checkboxElement: null,
+        checkboxHasChecked: false,
+        checkedState: null,
         contentEnd: null,
+        contentFontAttributeNames: [],
         contentName: null,
+        contentNamespace: "",
         contentPrefix: "",
         contentSelfClosing: false,
         contentStart: null,
         contentTokenStart: null,
+        dateFormat: null,
         inPropertiesDepth: 0,
-        tag: null,
+        paragraphProperties: null,
+        paragraphPropertiesStart: null,
+        runProperties: null,
+        runPropertiesFontAttributeNames: undefined,
+        runPropertiesStart: null,
+        tag: controlTags[controlIndex++] ?? null,
+        uncheckedState: null,
       });
     } else {
       const frame = controls.at(-1);
       if (frame) {
+        if (
+          tag.local === "rFonts" &&
+          frame.contentStart !== null &&
+          frame.contentEnd === null
+        ) {
+          let fontAttributeNames: NativeFontAttributeNames | null = null;
+          if (templateWordNamespaces.has(tag.uri)) {
+            fontAttributeNames = {
+              ascii: null,
+              asciiTheme: null,
+              elementName: tag.name,
+              hAnsi: null,
+              hAnsiTheme: null,
+            };
+            for (const [attributeName, attribute] of Object.entries(
+              tag.attributes
+            )) {
+              if (attribute.uri !== tag.uri) {
+                continue;
+              }
+              if (attribute.local === "ascii") {
+                fontAttributeNames.ascii = attributeName;
+              } else if (attribute.local === "hAnsi") {
+                fontAttributeNames.hAnsi = attributeName;
+              } else if (attribute.local === "asciiTheme") {
+                fontAttributeNames.asciiTheme = attributeName;
+              } else if (attribute.local === "hAnsiTheme") {
+                fontAttributeNames.hAnsiTheme = attributeName;
+              }
+            }
+          }
+          frame.contentFontAttributeNames.push(fontAttributeNames);
+          if (
+            frame.runPropertiesStart !== null &&
+            frame.runPropertiesFontAttributeNames === undefined
+          ) {
+            frame.runPropertiesFontAttributeNames = fontAttributeNames;
+          }
+        }
         if (tag.local === "sdtPr" && templateWordNamespaces.has(tag.uri)) {
           frame.inPropertiesDepth = 1;
         } else if (frame.inPropertiesDepth > 0) {
@@ -6939,49 +10192,352 @@ function nativeTextControlXml(xml: string, data: JsonRecord): string {
             tag.local === "tag" &&
             templateWordNamespaces.has(tag.uri)
           ) {
-            frame.tag = templateControlAttribute(
-              templateXmlElement(tag),
-              "val"
-            ) ?? null;
+            const start = xml.lastIndexOf("<", parser.position - 1);
+            frame.tag =
+              templateControlAttribute(templateXmlElement(tag), "val") ?? null;
+            if (
+              start !== -1 &&
+              frame.tag !== null &&
+              (!selectedTags || selectedTags.has(frame.tag.trim()))
+            ) {
+              const openingTag = xml.slice(start, parser.position);
+              const normalizedTag = frame.tag.trim();
+              if (normalizedTag !== frame.tag) {
+                const tagValueAttributeName = Object.entries(
+                  tag.attributes
+                ).find(
+                  ([, attribute]) =>
+                    attribute.local === "val" && attribute.uri === tag.uri
+                )?.[0];
+                if (tagValueAttributeName) {
+                  patches.push({
+                    end: parser.position,
+                    replacement: openingTag.replaceAll(
+                      /(\s)([^\s="'<>/]+)(\s*=\s*)(["'])[\s\S]*?\4/gu,
+                      (match, whitespace, attributeName, assignment, quote) =>
+                        attributeName === tagValueAttributeName
+                          ? `${whitespace}${attributeName}${assignment}${quote}${htmlEscape(normalizedTag)}${quote}`
+                          : match
+                    ),
+                    start,
+                  });
+                }
+              }
+            }
+          }
+          if (
+            tag.local === "dateFormat" &&
+            templateWordNamespaces.has(tag.uri)
+          ) {
+            frame.dateFormat =
+              templateControlAttribute(templateXmlElement(tag), "val") ?? null;
           }
           if (
             tag.local === "showingPlcHdr" &&
             templateWordNamespaces.has(tag.uri)
           ) {
             const start = xml.lastIndexOf("<", parser.position - 1);
-            if (start >= 0) {
+            const remove =
+              !selectedTags || selectedTags.has(frame.tag?.trim() ?? "");
+            if (tag.isSelfClosing && remove && start !== -1) {
+              patches.push({ end: parser.position, replacement: "", start });
+            }
+            showingPlcHdrStarts.push({
+              remove: remove && !tag.isSelfClosing,
+              start,
+            });
+          }
+          const field = frame.tag
+            ? fieldsByTag.get(frame.tag.trim())
+            : undefined;
+          const propertyName =
+            tag.local === "date" && field?.type === FieldType.date
+              ? "fullDate"
+              : (tag.local === "dropDownList" &&
+                    field?.type === FieldType.dropdown) ||
+                  (tag.local === "comboBox" && field?.type === FieldType.combo)
+                ? "lastValue"
+                : null;
+          if (propertyName) {
+            const start = xml.lastIndexOf("<", parser.position - 1);
+            const openingTag =
+              start === -1 ? "" : xml.slice(start, parser.position);
+            const propertyAttributeName = Object.entries(tag.attributes).find(
+              ([, attribute]) =>
+                attribute.local === propertyName && attribute.uri === tag.uri
+            )?.[0];
+            const storedValue = frame.tag ? data[frame.tag.trim()] : undefined;
+            const replacementValue =
+              typeof storedValue === "string" &&
+              !(propertyName === "fullDate" && storedValue === "")
+                ? propertyName === "fullDate"
+                  ? `${storedValue}T00:00:00Z`
+                  : storedValue
+                : null;
+            if (
+              start !== -1 &&
+              (propertyAttributeName || replacementValue !== null)
+            ) {
+              let replacement: string;
+              if (propertyAttributeName) {
+                replacement = openingTag.replaceAll(
+                  /(\s)([^\s="'<>/]+)(\s*=\s*)(["'])[\s\S]*?\4/gu,
+                  (match, whitespace, name, assignment, quote) =>
+                    name === propertyAttributeName
+                      ? replacementValue === null
+                        ? ""
+                        : `${whitespace}${name}${assignment}${quote}${htmlEscape(replacementValue)}${quote}`
+                      : match
+                );
+              } else {
+                let prefix = tag.name.includes(":")
+                  ? tag.name.slice(0, tag.name.indexOf(":") + 1)
+                  : (Object.entries(tag.attributes)
+                      .find(
+                        ([name, attribute]) =>
+                          name.includes(":") && attribute.uri === tag.uri
+                      )?.[0]
+                      .replace(/[^:]+$/u, ":") ?? "");
+                let namespaceDeclaration = "";
+                if (!prefix) {
+                  let localPrefix = "word";
+                  for (
+                    let suffix = 1;
+                    openingTag.includes(`${localPrefix}:`);
+                    suffix += 1
+                  ) {
+                    localPrefix = `word${suffix}`;
+                  }
+                  prefix = `${localPrefix}:`;
+                  namespaceDeclaration = ` xmlns:${localPrefix}="${tag.uri}"`;
+                }
+                replacement = openingTag.replace(
+                  /(\/?)>$/u,
+                  ` ${prefix}${propertyName}="${htmlEscape(replacementValue ?? "")}"${namespaceDeclaration}$1>`
+                );
+              }
               patches.push({
                 end: parser.position,
-                replacement: "",
+                replacement,
+                start,
+              });
+            }
+          }
+          if (
+            tag.local === "checkbox" &&
+            tag.uri === templateCheckboxNamespace &&
+            frame.tag &&
+            fieldsByTag.get(frame.tag.trim())?.type === FieldType.checkbox
+          ) {
+            const start = xml.lastIndexOf("<", parser.position - 1);
+            const openingTag =
+              start === -1 ? "" : xml.slice(start, parser.position);
+            const prefix = tag.name.includes(":")
+              ? tag.name.slice(0, tag.name.indexOf(":") + 1)
+              : "";
+            const valueAttribute = nativeNamespacedAttribute(
+              tag.name,
+              namespaceBindings,
+              tag.uri,
+              "val",
+              openingTag
+            );
+            const checkedValue = data[frame.tag.trim()] === true ? "1" : "0";
+            if (/\/\s*>$/u.test(openingTag)) {
+              patches.push({
+                end: parser.position,
+                replacement: `${openingTag.replace(/\/\s*>$/u, ">")}<${prefix}checked ${valueAttribute.name}="${checkedValue}"${valueAttribute.declaration}/></${tag.name}>`,
+                start,
+              });
+            } else {
+              frame.checkboxElement = {
+                attributeDeclaration: valueAttribute.declaration,
+                attributeName: valueAttribute.name,
+                end: parser.position,
+                name: tag.name,
+                prefix,
+                start,
+              };
+              frame.checkboxHasChecked = false;
+            }
+          }
+          if (
+            tag.local === "checkedState" &&
+            tag.uri === templateCheckboxNamespace &&
+            frame.tag &&
+            fieldsByTag.get(frame.tag.trim())?.type === FieldType.checkbox
+          ) {
+            frame.checkedState = nativeCheckboxState(templateXmlElement(tag));
+          }
+          if (
+            tag.local === "uncheckedState" &&
+            tag.uri === templateCheckboxNamespace &&
+            frame.tag &&
+            fieldsByTag.get(frame.tag.trim())?.type === FieldType.checkbox
+          ) {
+            frame.uncheckedState = nativeCheckboxState(templateXmlElement(tag));
+          }
+          if (
+            tag.local === "checked" &&
+            tag.uri === templateCheckboxNamespace &&
+            frame.tag &&
+            fieldsByTag.get(frame.tag.trim())?.type === FieldType.checkbox
+          ) {
+            frame.checkboxHasChecked = true;
+            const start = xml.lastIndexOf("<", parser.position - 1);
+            const checkedAttributeName = Object.entries(tag.attributes).find(
+              ([, attribute]) =>
+                attribute.local === "val" && attribute.uri === tag.uri
+            )?.[0];
+            const unqualifiedValueName = Object.entries(tag.attributes).find(
+              ([, attribute]) =>
+                attribute.local === "val" && attribute.uri === ""
+            )?.[0];
+            if (start !== -1) {
+              const openingTag = xml.slice(start, parser.position);
+              const checkedValue = data[frame.tag.trim()] === true ? "1" : "0";
+              const qualifiedAttribute = checkedAttributeName
+                ? { declaration: "", name: checkedAttributeName }
+                : nativeNamespacedAttribute(
+                    tag.name,
+                    namespaceBindings,
+                    tag.uri,
+                    "val",
+                    openingTag
+                  );
+              const replacement =
+                checkedAttributeName || unqualifiedValueName
+                  ? openingTag.replaceAll(
+                      /(\s)([^\s="'<>/]+)(\s*=\s*)(["'])[\s\S]*?\4/gu,
+                      (match, whitespace, name, assignment, quote) =>
+                        name === checkedAttributeName ||
+                        name === unqualifiedValueName
+                          ? `${whitespace}${qualifiedAttribute.name}${assignment}${quote}${checkedValue}${quote}${qualifiedAttribute.declaration}`
+                          : match
+                    )
+                  : openingTag.replace(
+                      /(\/?)>$/u,
+                      ` ${qualifiedAttribute.name}="${checkedValue}"${qualifiedAttribute.declaration}$1>`
+                    );
+              patches.push({
+                end: parser.position,
+                replacement,
                 start,
               });
             }
           }
           frame.inPropertiesDepth += 1;
         } else if (
+          frame.contentStart !== null &&
+          frame.inPropertiesDepth === 0 &&
+          tag.local === "pPr" &&
+          templateWordNamespaces.has(tag.uri) &&
+          frame.paragraphProperties === null &&
+          frame.paragraphPropertiesStart === null
+        ) {
+          frame.paragraphPropertiesStart = xml.lastIndexOf(
+            "<",
+            parser.position - 1
+          );
+        } else if (
+          frame.contentStart !== null &&
+          frame.inPropertiesDepth === 0 &&
+          tag.local === "rPr" &&
+          templateWordNamespaces.has(tag.uri) &&
+          frame.runProperties === null &&
+          frame.runPropertiesStart === null
+        ) {
+          frame.runPropertiesStart = xml.lastIndexOf("<", parser.position - 1);
+        } else if (
           tag.local === "sdtContent" &&
           templateWordNamespaces.has(tag.uri)
         ) {
           const start = xml.lastIndexOf("<", parser.position - 1);
-          const openingTag = start < 0 ? "" : xml.slice(start, parser.position);
+          const openingTag =
+            start === -1 ? "" : xml.slice(start, parser.position);
+          frame.contentNamespace = tag.uri;
           frame.contentName = tag.name;
           frame.contentPrefix = tag.name.includes(":")
             ? tag.name.slice(0, tag.name.indexOf(":") + 1)
             : "";
           frame.contentSelfClosing = /\/\s*>$/u.test(openingTag);
-          frame.contentStart = frame.contentSelfClosing ? null : parser.position;
+          frame.contentStart = frame.contentSelfClosing
+            ? null
+            : parser.position;
           frame.contentTokenStart = frame.contentSelfClosing ? start : null;
         }
       }
     }
-    elements.push({ local: tag.local, uri: tag.uri });
+    elements.push(element);
   });
   parser.on("closetag", (tag) => {
+    if (
+      tag.local === "Fallback" &&
+      tag.uri === templateMarkupCompatibilityNamespace
+    ) {
+      alternateFallbackDepth -= 1;
+      elements.pop();
+      return;
+    }
+    if (alternateFallbackDepth > 0) {
+      elements.pop();
+      return;
+    }
+    if (tag.local === "showingPlcHdr" && templateWordNamespaces.has(tag.uri)) {
+      const placeholder = showingPlcHdrStarts.pop();
+      if (placeholder?.remove && placeholder.start >= 0) {
+        patches.push({
+          end: parser.position,
+          replacement: "",
+          start: placeholder.start,
+        });
+      }
+    }
     const frame = controls.at(-1);
     if (frame) {
-      if (tag.local === "sdtPr" && templateWordNamespaces.has(tag.uri)) {
+      if (
+        frame.contentStart !== null &&
+        frame.paragraphPropertiesStart !== null &&
+        tag.local === "pPr" &&
+        templateWordNamespaces.has(tag.uri)
+      ) {
+        frame.paragraphProperties = xml.slice(
+          frame.paragraphPropertiesStart,
+          parser.position
+        );
+        frame.paragraphPropertiesStart = null;
+      } else if (
+        frame.contentStart !== null &&
+        frame.runPropertiesStart !== null &&
+        tag.local === "rPr" &&
+        templateWordNamespaces.has(tag.uri)
+      ) {
+        frame.runProperties = xml.slice(
+          frame.runPropertiesStart,
+          parser.position
+        );
+        frame.runPropertiesStart = null;
+      } else if (tag.local === "sdtPr" && templateWordNamespaces.has(tag.uri)) {
         frame.inPropertiesDepth = 0;
       } else if (frame.inPropertiesDepth > 0) {
+        if (
+          tag.local === "checkbox" &&
+          tag.uri === templateCheckboxNamespace &&
+          frame.checkboxElement
+        ) {
+          if (!frame.checkboxHasChecked) {
+            const { attributeDeclaration, attributeName, end, prefix, start } =
+              frame.checkboxElement;
+            const checkedValue =
+              data[frame.tag?.trim() ?? ""] === true ? "1" : "0";
+            patches.push({
+              end,
+              replacement: `${xml.slice(start, end)}<${prefix}checked ${attributeName}="${checkedValue}"${attributeDeclaration}/>`,
+              start,
+            });
+          }
+          frame.checkboxElement = null;
+        }
         frame.inPropertiesDepth -= 1;
       } else if (
         tag.local === "sdtContent" &&
@@ -6990,49 +10546,127 @@ function nativeTextControlXml(xml: string, data: JsonRecord): string {
         frame.contentEnd = frame.contentSelfClosing
           ? parser.position
           : xml.lastIndexOf("</", parser.position - 1);
-      } else if (tag.local === "sdt" && templateWordNamespaces.has(tag.uri)) {
         const completed = controls.pop();
         if (!completed?.tag || !completed.contentName) {
-          fail(422, "invalid_template", "A text field is incomplete");
+          fail(422, "invalid_template", "A native field is incomplete");
         }
-        const value = data[completed.tag.trim()];
-        const lines = (typeof value === "string" ? value : "").split(
-          /\r\n|\r|\n/u
-        );
-        const text = lines
-          .map(
-            (line, index) =>
-              `${index > 0 ? `<${completed.contentPrefix}br/>` : ""}<${completed.contentPrefix}t xml:space="preserve">${htmlEscape(line)}</${completed.contentPrefix}t>`
-          )
-          .join("");
-        const run = `<${completed.contentPrefix}r>${text}</${completed.contentPrefix}r>`;
-        const content = completed.block
-          ? `<${completed.contentPrefix}p>${run}</${completed.contentPrefix}p>`
-          : run;
-        if (completed.contentSelfClosing) {
-          if (
-            completed.contentTokenStart === null ||
-            completed.contentEnd === null
-          ) {
-            fail(422, "invalid_template", "A text field is incomplete");
-          }
-          patches.push({
-            end: completed.contentEnd,
-            replacement: `<${completed.contentName}>${content}</${completed.contentName}>`,
-            start: completed.contentTokenStart,
-          });
-        } else if (
+        if (selectedTags && !selectedTags.has(completed.tag.trim())) {
+          elements.pop();
+          return;
+        }
+        const tagName = completed.tag.trim();
+        const field = fieldsByTag.get(tagName);
+        const storedValue = data[tagName];
+        const checkboxChecked = storedValue === true;
+        const checkboxState = checkboxChecked
+          ? completed.checkedState
+          : completed.uncheckedState;
+        const value =
+          field?.type === FieldType.checkbox
+            ? (checkboxState?.glyph ?? (checkboxChecked ? "☒" : "☐"))
+            : typeof storedValue === "string"
+              ? storedValue
+              : "";
+        const option =
+          typeof storedValue === "string" &&
+          (field?.type === FieldType.dropdown ||
+            field?.type === FieldType.combo)
+            ? (Array.isArray(field.options) ? field.options : []).find(
+                (item) =>
+                  item &&
+                  typeof item === "object" &&
+                  !Array.isArray(item) &&
+                  (item as Record<string, unknown>).value === storedValue
+              )
+            : null;
+        const displayValue =
+          field?.type === FieldType.date
+            ? nativeDateDisplayValue(value, completed.dateFormat)
+            : option &&
+                typeof (option as Record<string, unknown>).displayText ===
+                  "string"
+              ? ((option as Record<string, unknown>).displayText as string)
+              : value;
+        const existingContent =
+          !completed.contentSelfClosing &&
           completed.contentStart !== null &&
-          completed.contentEnd !== null &&
-          completed.contentEnd >= completed.contentStart
-        ) {
-          patches.push({
-            end: completed.contentEnd,
-            replacement: content,
-            start: completed.contentStart,
-          });
+          completed.contentEnd !== null
+            ? xml.slice(completed.contentStart, completed.contentEnd)
+            : null;
+        let preservedContent =
+          existingContent === null
+            ? null
+            : nativeRewriteTextControlContentXml(existingContent, displayValue);
+        if (preservedContent !== null && checkboxState?.font) {
+          preservedContent = nativeApplyTextControlFontXml(
+            preservedContent,
+            checkboxState.font,
+            completed.contentFontAttributeNames,
+            completed.contentNamespace
+          );
+        }
+        if (preservedContent === null) {
+          const lines = displayValue.split(/\r\n|\r|\n/u);
+          const text = lines
+            .map(
+              (line, index) =>
+                `${index > 0 ? `<${completed.contentPrefix}br/>` : ""}<${completed.contentPrefix}t xml:space="preserve">${htmlEscape(line)}</${completed.contentPrefix}t>`
+            )
+            .join("");
+          const runProperties = nativeRunPropertiesXml(
+            completed.runProperties,
+            completed.contentPrefix,
+            checkboxState?.font ?? null,
+            completed.runPropertiesFontAttributeNames,
+            completed.contentNamespace
+          );
+          const run = `<${completed.contentPrefix}r>${runProperties}${text}</${completed.contentPrefix}r>`;
+          const content = completed.block
+            ? `<${completed.contentPrefix}p>${completed.paragraphProperties ?? ""}${run}</${completed.contentPrefix}p>`
+            : run;
+          if (completed.contentSelfClosing) {
+            if (
+              completed.contentTokenStart === null ||
+              completed.contentEnd === null
+            ) {
+              fail(422, "invalid_template", "A native field is incomplete");
+            }
+            const openingTag = xml.slice(
+              completed.contentTokenStart,
+              completed.contentEnd
+            );
+            const expandedOpeningTag = openingTag.replace(/\/\s*>$/u, ">");
+            patches.push({
+              end: completed.contentEnd,
+              replacement: `${expandedOpeningTag}${content}</${completed.contentName}>`,
+              start: completed.contentTokenStart,
+            });
+          } else if (
+            completed.contentStart !== null &&
+            completed.contentEnd !== null &&
+            completed.contentEnd >= completed.contentStart
+          ) {
+            patches.push({
+              end: completed.contentEnd,
+              replacement: content,
+              start: completed.contentStart,
+            });
+          } else {
+            fail(422, "invalid_template", "A native field is incomplete");
+          }
         } else {
-          fail(422, "invalid_template", "A text field is incomplete");
+          if (preservedContent !== existingContent) {
+            const contentStart = completed.contentStart;
+            const contentEnd = completed.contentEnd;
+            if (contentStart === null || contentEnd === null) {
+              fail(422, "invalid_template", "A native field is incomplete");
+            }
+            patches.push({
+              end: contentEnd,
+              replacement: preservedContent,
+              start: contentStart,
+            });
+          }
         }
       }
     }
@@ -7052,38 +10686,743 @@ function nativeTextControlXml(xml: string, data: JsonRecord): string {
   }
   return result;
 }
-
-async function nativeTextResponseDocument(
-  publishedTemplateId: string,
-  data: JsonRecord
-): Promise<Uint8Array> {
-  const publishedTemplate = await prisma.publishedTemplate.findUnique({
-    select: { objectKey: true },
-    where: { id: publishedTemplateId },
-  });
-  if (!publishedTemplate?.objectKey) {
-    fail(409, "document_unavailable", "The published document is unavailable");
+function nativePreserveAlternateNamespaceDeclarations(
+  xml: string,
+  declarations: readonly { name: string; value: string }[]
+): string {
+  if (declarations.length === 0) {
+    return xml;
   }
-  const { archive, xmlPaths } = safeTemplateArchive(
-    await readObject(publishedTemplate.objectKey)
-  );
+  let depth = 0;
+  const patches: { end: number; replacement: string; start: number }[] = [];
+  const parser = new SaxesParser({
+    fragment: true,
+    position: true,
+    xmlns: false,
+  });
+  parser.on("doctype", () => {
+    fail(422, "invalid_template", "DOCX XML document types are not allowed");
+  });
+  parser.on("opentag", (tag) => {
+    if (depth === 0) {
+      const start = xml.lastIndexOf("<", parser.position - 1);
+      if (start !== -1) {
+        const originalTag = xml.slice(start, parser.position);
+        let replacement = originalTag;
+        for (const declaration of declarations) {
+          if (!Object.hasOwn(tag.attributes, declaration.name)) {
+            replacement = replacement.replace(
+              /(\/?)>$/u,
+              ` ${declaration.name}="${htmlEscape(declaration.value)}"$1>`
+            );
+          }
+        }
+        if (replacement !== originalTag) {
+          patches.push({ end: parser.position, replacement, start });
+        }
+      }
+    }
+    if (!tag.isSelfClosing) {
+      depth += 1;
+    }
+  });
+  parser.on("closetag", (tag) => {
+    if (!tag.isSelfClosing) {
+      depth -= 1;
+    }
+  });
+  try {
+    parser.write(xml).close();
+  } catch {
+    fail(422, "invalid_template", "DOCX XML is malformed");
+  }
+  let result = xml;
+  for (const patch of patches.sort((left, right) => right.start - left.start)) {
+    result =
+      result.slice(0, patch.start) +
+      patch.replacement +
+      result.slice(patch.end);
+  }
+  return result;
+}
+
+// PDF conversion omits AlternateContent fields; retain compatible Choice content and namespace bindings.
+function nativeFlattenAlternateFieldsXml(
+  xml: string,
+  fieldTags: ReadonlySet<string>,
+  validateOnly = false
+): { xml: string; supported: boolean } {
+  let result = xml;
+  while (result.includes("AlternateContent")) {
+    interface AlternateContentFrame {
+      branch: "choice" | "fallback" | null;
+      choiceContentStart: number | null;
+      choiceFieldCount: number;
+      choiceFieldEnd: number | null;
+      choiceFieldStart: number | null;
+      choiceHasField: boolean;
+      choiceNamespaceDeclarations: Map<string, string> | null;
+      choiceNamespaces: Map<string, string> | null;
+      choiceRequiresSupported: boolean;
+      fallbackHasField: boolean;
+      hasField: boolean;
+      hasNestedField: boolean;
+      namespaceDeclarations: Map<string, string>;
+      parent: AlternateContentFrame | null;
+      start: number;
+      unsupported: boolean;
+      firstSupportedChoiceHasField: boolean | null;
+    }
+    interface AlternateControlFrame {
+      alternate: AlternateContentFrame | null;
+      branch: "choice" | "fallback" | null;
+      inPropertiesDepth: number;
+      start: number;
+      tag: string | null;
+    }
+    const alternates: AlternateContentFrame[] = [];
+    const controls: AlternateControlFrame[] = [];
+    const patches: { end: number; replacement: string; start: number }[] = [];
+    const namespaceBindings = new Map<string, string>([
+      ["xml", "http://www.w3.org/XML/1998/namespace"],
+    ]);
+    const namespaceChanges: {
+      prefix: string;
+      previous: string | undefined;
+    }[][] = [];
+    const parser = new SaxesParser({ position: true, xmlns: true });
+    let unsupported = false;
+    parser.on("doctype", () => {
+      fail(422, "invalid_template", "DOCX XML document types are not allowed");
+    });
+    parser.on("opentag", (tag) => {
+      const changes: { prefix: string; previous: string | undefined }[] = [];
+      for (const attribute of Object.values(tag.attributes)) {
+        if (attribute.uri !== templateXmlnsNamespace) {
+          continue;
+        }
+        const prefix = attribute.name === "xmlns" ? "" : attribute.local;
+        changes.push({ prefix, previous: namespaceBindings.get(prefix) });
+        namespaceBindings.set(prefix, attribute.value);
+      }
+      namespaceChanges.push(changes);
+      if (
+        tag.local === "AlternateContent" &&
+        tag.uri === templateMarkupCompatibilityNamespace
+      ) {
+        const declarations = new Map<string, string>();
+        for (const attribute of Object.values(tag.attributes)) {
+          if (attribute.uri === templateXmlnsNamespace) {
+            declarations.set(attribute.name, attribute.value);
+          }
+        }
+        alternates.push({
+          branch: null,
+          choiceContentStart: null,
+          choiceFieldCount: 0,
+          choiceFieldEnd: null,
+          choiceFieldStart: null,
+          choiceHasField: false,
+          choiceNamespaceDeclarations: null,
+          choiceNamespaces: null,
+          choiceRequiresSupported: false,
+          fallbackHasField: false,
+          firstSupportedChoiceHasField: null,
+          hasField: false,
+          hasNestedField: false,
+          namespaceDeclarations: declarations,
+          parent: alternates.at(-1) ?? null,
+          start: result.lastIndexOf("<", parser.position - 1),
+          unsupported: false,
+        });
+      } else if (
+        tag.local === "Choice" &&
+        tag.uri === templateMarkupCompatibilityNamespace
+      ) {
+        const alternate = alternates.at(-1);
+        if (alternate) {
+          const requires = Object.values(tag.attributes).find(
+            (attribute) =>
+              attribute.local === "Requires" && attribute.uri === ""
+          )?.value;
+          const requiredPrefixes =
+            requires?.trim().split(/\s+/u).filter(Boolean) ?? [];
+          alternate.choiceRequiresSupported =
+            requiredPrefixes.length > 0 &&
+            requiredPrefixes.every((prefix) =>
+              templateControlNamespaces.has(namespaceBindings.get(prefix) ?? "")
+            );
+          alternate.choiceNamespaceDeclarations = new Map(
+            alternate.namespaceDeclarations
+          );
+          for (const attribute of Object.values(tag.attributes)) {
+            if (attribute.uri === templateXmlnsNamespace) {
+              alternate.choiceNamespaceDeclarations.set(
+                attribute.name,
+                attribute.value
+              );
+            }
+          }
+          alternate.branch = "choice";
+          alternate.choiceContentStart = parser.position;
+          alternate.choiceHasField = false;
+        }
+      } else if (
+        tag.local === "Fallback" &&
+        tag.uri === templateMarkupCompatibilityNamespace
+      ) {
+        const alternate = alternates.at(-1);
+        if (alternate) {
+          alternate.branch = "fallback";
+        }
+      }
+      const control = controls.at(-1);
+      if (tag.local === "sdt" && templateWordNamespaces.has(tag.uri)) {
+        const alternate = alternates.at(-1) ?? null;
+        controls.push({
+          alternate,
+          branch: alternate?.branch ?? null,
+          inPropertiesDepth: 0,
+          start: result.lastIndexOf("<", parser.position - 1),
+          tag: null,
+        });
+      } else if (control) {
+        if (tag.local === "sdtPr" && templateWordNamespaces.has(tag.uri)) {
+          control.inPropertiesDepth = 1;
+        } else if (control.inPropertiesDepth > 0) {
+          if (
+            control.inPropertiesDepth === 1 &&
+            tag.local === "tag" &&
+            templateWordNamespaces.has(tag.uri)
+          ) {
+            control.tag =
+              templateControlAttribute(templateXmlElement(tag), "val") ?? null;
+          }
+          control.inPropertiesDepth += 1;
+        }
+      }
+    });
+    parser.on("closetag", (tag) => {
+      if (tag.local === "sdt" && templateWordNamespaces.has(tag.uri)) {
+        const completed = controls.pop();
+        const fieldTag = completed?.tag?.trim();
+        if (completed?.alternate && fieldTag && fieldTags.has(fieldTag)) {
+          completed.alternate.hasField = true;
+          if (completed.branch === "choice") {
+            completed.alternate.choiceHasField = true;
+          } else if (completed.branch === "fallback") {
+            completed.alternate.fallbackHasField = true;
+          }
+        }
+      } else {
+        const control = controls.at(-1);
+        if (
+          control &&
+          tag.local === "sdtPr" &&
+          templateWordNamespaces.has(tag.uri)
+        ) {
+          control.inPropertiesDepth = 0;
+        } else if (control && control.inPropertiesDepth > 0) {
+          control.inPropertiesDepth -= 1;
+        }
+      }
+      const alternate = alternates.at(-1);
+      if (
+        alternate &&
+        tag.local === "Choice" &&
+        tag.uri === templateMarkupCompatibilityNamespace
+      ) {
+        if (alternate.choiceRequiresSupported) {
+          if (alternate.firstSupportedChoiceHasField === null) {
+            alternate.firstSupportedChoiceHasField = alternate.choiceHasField;
+          } else if (
+            !alternate.firstSupportedChoiceHasField &&
+            alternate.choiceHasField
+          ) {
+            alternate.unsupported = true;
+          }
+        }
+        if (alternate.choiceHasField) {
+          alternate.choiceFieldCount += 1;
+          alternate.unsupported ||= !alternate.choiceRequiresSupported;
+          if (
+            alternate.choiceFieldStart === null &&
+            alternate.choiceContentStart !== null
+          ) {
+            alternate.choiceFieldStart = alternate.choiceContentStart;
+            alternate.choiceFieldEnd = result.lastIndexOf(
+              "</",
+              parser.position - 1
+            );
+            alternate.choiceNamespaces = alternate.choiceNamespaceDeclarations;
+          }
+        }
+        alternate.branch = null;
+        alternate.choiceContentStart = null;
+        alternate.choiceHasField = false;
+        alternate.choiceNamespaceDeclarations = null;
+      } else if (
+        alternate &&
+        tag.local === "Fallback" &&
+        tag.uri === templateMarkupCompatibilityNamespace
+      ) {
+        alternate.branch = null;
+      } else if (
+        alternate &&
+        tag.local === "AlternateContent" &&
+        tag.uri === templateMarkupCompatibilityNamespace
+      ) {
+        const completed = alternates.pop();
+        if (completed) {
+          completed.unsupported ||= completed.choiceFieldCount > 1;
+          completed.unsupported ||= completed.fallbackHasField;
+          unsupported ||= completed.unsupported;
+          if (completed.hasField && completed.parent) {
+            completed.parent.hasNestedField = true;
+            completed.parent.hasField = true;
+            if (completed.parent.branch === "choice") {
+              completed.parent.choiceHasField = true;
+            } else if (completed.parent.branch === "fallback") {
+              completed.parent.fallbackHasField = true;
+            }
+          }
+          if (
+            !validateOnly &&
+            completed.hasField &&
+            !completed.hasNestedField &&
+            completed.choiceFieldStart !== null &&
+            completed.choiceFieldEnd !== null
+          ) {
+            const declarations = Array.from(
+              completed.choiceNamespaces ?? [],
+              ([name, value]) => ({ name, value })
+            );
+            patches.push({
+              end: parser.position,
+              replacement: nativePreserveAlternateNamespaceDeclarations(
+                result.slice(
+                  completed.choiceFieldStart,
+                  completed.choiceFieldEnd
+                ),
+                declarations
+              ),
+              start: completed.start,
+            });
+          }
+        }
+      }
+      const changes = namespaceChanges.pop() ?? [];
+      for (const { prefix, previous } of changes) {
+        if (previous === undefined) {
+          namespaceBindings.delete(prefix);
+        } else {
+          namespaceBindings.set(prefix, previous);
+        }
+      }
+    });
+    try {
+      parser.write(result).close();
+    } catch {
+      fail(422, "invalid_template", "The DOCX package contains invalid XML");
+    }
+    if (unsupported) {
+      return { supported: false, xml: result };
+    }
+    if (validateOnly) {
+      return { supported: true, xml: result };
+    }
+    let flattened = result;
+    for (const patch of patches.sort(
+      (left, right) => right.start - left.start
+    )) {
+      flattened =
+        flattened.slice(0, patch.start) +
+        patch.replacement +
+        flattened.slice(patch.end);
+    }
+    if (flattened === result) {
+      return { supported: true, xml: result };
+    }
+    result = flattened;
+  }
+  return { supported: true, xml: result };
+}
+
+function overlayNativeResponseDocument(
+  callbackBytes: Uint8Array,
+  fields: readonly { options: unknown; tag: string; type: FieldType }[],
+  data: JsonRecord,
+  selectedTags: ReadonlySet<string>
+): Uint8Array {
+  const { archive, xmlPaths } = safeTemplateArchive(callbackBytes);
   const controlParts = reachableTemplateControlParts(archive, xmlPaths);
   if (templatePartsHaveNestedControls(archive, controlParts)) {
-    fail(422, "invalid_template", "Native text fields cannot be nested");
+    fail(422, "invalid_template", "Native fields cannot be nested");
   }
   if (controlParts.size === 0) {
-    fail(422, "invalid_template", "The published document has no text fields");
+    fail(422, "invalid_template", "The document has no fields");
   }
+  const fieldsByTag = new Map(
+    fields
+      .filter(
+        ({ tag, type }) => type !== FieldType.picture && selectedTags.has(tag)
+      )
+      .map(({ options, tag, type }) => [tag, { options, type }])
+  );
+  const fieldTags = new Set(fields.map(({ tag }) => tag));
   for (const archivePath of controlParts) {
-    const xml = nativeTextControlXml(
-      templateArchiveText(archive, archivePath),
-      data
+    const originalXml = templateArchiveText(archive, archivePath);
+    const flattened = nativeFlattenAlternateFieldsXml(
+      nativeFieldControlXml(originalXml, data, fieldsByTag, selectedTags),
+      fieldTags
     );
-    archive[archivePath] = strToU8(
-      xml.replace(/encoding=(["'])UTF-16(?:LE|BE)?\1/iu, 'encoding="UTF-8"')
-    );
+    if (!flattened.supported) {
+      fail(
+        422,
+        "invalid_template",
+        "AlternateContent field branches are unsupported"
+      );
+    }
+    const xml = flattened.xml;
+    if (xml !== originalXml) {
+      archive[archivePath] = strToU8(
+        xml.replace(/encoding=(["'])UTF-16(?:LE|BE)?\1/iu, 'encoding="UTF-8"')
+      );
+    }
   }
   return zipSync(archive);
+}
+
+function nativePdfScalarControlXml(xml: string): string {
+  interface ScalarControlFrame {
+    contentCloseStart: number | null;
+    contentDepth: number | null;
+    contentHasContent: boolean;
+    contentIsBlock: boolean;
+    contentOpenEnd: number | null;
+    contentSelfClosing: boolean;
+    namespaceAttributeNames: ReadonlySet<string>;
+    namespaceDeclarations: { name: string; value: string }[];
+    parentContentControls: ScalarControlFrame[] | null;
+    parentIsBlockContainer: boolean;
+    scalarControl: boolean;
+    start: number;
+    startEnd: number;
+    wordNamespace: string;
+    wordPrefix: string;
+  }
+  const controls: ScalarControlFrame[] = [];
+  const elementStack: { local: string; uri: string }[] = [];
+  const propertyControls: ScalarControlFrame[] = [];
+  const patches: { end: number; replacement: string; start: number }[] = [];
+  const parser = new SaxesParser({ position: true, xmlns: true });
+  const preserveNamespaces = (
+    start: number,
+    end: number,
+    declarations: readonly { name: string; value: string }[],
+    existingAttributes: ReadonlySet<string>
+  ) => {
+    if (declarations.length === 0) {
+      return;
+    }
+    const original = xml.slice(start, end);
+    let replacement = original;
+    for (const declaration of declarations) {
+      if (existingAttributes.has(declaration.name)) {
+        continue;
+      }
+      const insertionIndex = replacement.endsWith("/>")
+        ? replacement.length - 2
+        : replacement.length - 1;
+      replacement = `${replacement.slice(0, insertionIndex)} ${declaration.name}="${htmlEscape(declaration.value)}"${replacement.slice(insertionIndex)}`;
+    }
+    if (replacement !== original) {
+      patches.push({ end, replacement, start });
+    }
+  };
+  const activeScalarNamespaceDeclarations = () => {
+    const declarations = new Map<string, { name: string; value: string }>();
+    for (const control of controls) {
+      if (!control.scalarControl || control.contentDepth === null) {
+        continue;
+      }
+      for (const declaration of control.namespaceDeclarations) {
+        declarations.set(declaration.name, declaration);
+      }
+    }
+    return [...declarations.values()];
+  };
+  parser.on("doctype", () => {
+    fail(422, "invalid_template", "DOCX XML document types are not allowed");
+  });
+  parser.on("opentag", (tag) => {
+    const start = xml.lastIndexOf("<", parser.position - 1);
+    let hasContentControl = false;
+    let parentContentControls: ScalarControlFrame[] | null = null;
+    for (const control of controls) {
+      if (control.contentDepth === null) {
+        continue;
+      }
+      if (control.contentDepth === 0) {
+        hasContentControl = true;
+        control.contentHasContent = true;
+        if (tag.local === "sdt" && templateWordNamespaces.has(tag.uri)) {
+          (parentContentControls ??= []).push(control);
+        }
+      }
+      if (
+        templateWordNamespaces.has(tag.uri) &&
+        (tag.local === "p" ||
+          tag.local === "tbl" ||
+          (control.contentDepth === 0 &&
+            (tag.local === "altChunk" ||
+              tag.local === "customXml" ||
+              tag.local === "oMathPara")))
+      ) {
+        control.contentIsBlock = true;
+      }
+    }
+    if (hasContentControl && tag.local !== "sdt") {
+      preserveNamespaces(
+        start,
+        parser.position,
+        activeScalarNamespaceDeclarations(),
+        new Set(Object.keys(tag.attributes))
+      );
+    }
+    for (const control of controls) {
+      if (control.contentDepth !== null) {
+        control.contentDepth += 1;
+      }
+    }
+    if (tag.local === "sdt" && templateWordNamespaces.has(tag.uri)) {
+      const parent = elementStack.at(-1);
+      controls.push({
+        contentCloseStart: null,
+        contentDepth: null,
+        contentHasContent: false,
+        contentIsBlock: false,
+        contentOpenEnd: null,
+        contentSelfClosing: false,
+        namespaceAttributeNames: new Set(Object.keys(tag.attributes)),
+        namespaceDeclarations: Object.values(tag.attributes)
+          .filter((attribute) => attribute.uri === templateXmlnsNamespace)
+          .map((attribute) => ({
+            name: attribute.name,
+            value: attribute.value,
+          })),
+        parentContentControls,
+        parentIsBlockContainer:
+          parent !== undefined &&
+          templateWordNamespaces.has(parent.uri) &&
+          (parent.local === "body" ||
+            parent.local === "comment" ||
+            parent.local === "docPartBody" ||
+            parent.local === "endnote" ||
+            parent.local === "ftr" ||
+            parent.local === "footnote" ||
+            parent.local === "hdr" ||
+            parent.local === "txbxContent"),
+        scalarControl: false,
+        start,
+        startEnd: parser.position,
+        wordNamespace: tag.uri,
+        wordPrefix: tag.name.includes(":")
+          ? tag.name.slice(0, tag.name.indexOf(":"))
+          : "",
+      });
+    } else if (tag.local === "sdtPr" && templateWordNamespaces.has(tag.uri)) {
+      const control = controls.at(-1);
+      if (control) {
+        propertyControls.push(control);
+      }
+    } else if (
+      propertyControls.length > 0 &&
+      ((tag.local === "checkbox" && tag.uri === templateCheckboxNamespace) ||
+        (templateWordNamespaces.has(tag.uri) &&
+          (tag.local === "comboBox" ||
+            tag.local === "date" ||
+            tag.local === "dropDownList")))
+    ) {
+      const control = propertyControls.at(-1);
+      if (control) {
+        control.scalarControl = true;
+      }
+    } else if (
+      tag.local === "sdtContent" &&
+      templateWordNamespaces.has(tag.uri)
+    ) {
+      const control = controls.at(-1);
+      if (control) {
+        control.contentOpenEnd = parser.position;
+        control.contentSelfClosing = tag.isSelfClosing;
+        control.contentDepth = 0;
+        for (const attribute of Object.values(tag.attributes)) {
+          if (attribute.uri === templateXmlnsNamespace) {
+            control.namespaceDeclarations.push({
+              name: attribute.name,
+              value: attribute.value,
+            });
+          }
+        }
+      }
+    }
+    elementStack.push({ local: tag.local, uri: tag.uri });
+  });
+  parser.on("closetag", (tag) => {
+    if (tag.local === "sdtContent" && templateWordNamespaces.has(tag.uri)) {
+      const control = controls.at(-1);
+      if (control && control.contentOpenEnd !== null) {
+        control.contentCloseStart = xml.lastIndexOf("<", parser.position - 1);
+        control.contentDepth = null;
+      }
+    } else if (tag.local === "sdtPr" && templateWordNamespaces.has(tag.uri)) {
+      propertyControls.pop();
+    } else if (tag.local === "sdt" && templateWordNamespaces.has(tag.uri)) {
+      const control = controls.pop();
+      if (control?.contentIsBlock && control.parentContentControls) {
+        for (const parentControl of control.parentContentControls) {
+          parentControl.contentIsBlock = true;
+        }
+      }
+      if (
+        control?.scalarControl &&
+        control.contentOpenEnd !== null &&
+        control.contentCloseStart !== null
+      ) {
+        if (control.contentSelfClosing) {
+          patches.push({
+            end: parser.position,
+            replacement: "",
+            start: control.start,
+          });
+        } else {
+          const needsParagraph =
+            control.parentIsBlockContainer &&
+            control.contentHasContent &&
+            !control.contentIsBlock;
+          const paragraphName = control.wordPrefix
+            ? `${control.wordPrefix}:p`
+            : "p";
+          const namespaceAttribute = control.wordPrefix
+            ? `xmlns:${control.wordPrefix}`
+            : "xmlns";
+          const paragraphOpen = needsParagraph
+            ? `<${paragraphName} ${namespaceAttribute}="${htmlEscape(control.wordNamespace)}">`
+            : "";
+          const paragraphClose = needsParagraph ? `</${paragraphName}>` : "";
+          patches.push(
+            {
+              end: control.contentOpenEnd,
+              replacement: paragraphOpen,
+              start: control.start,
+            },
+            {
+              end: parser.position,
+              replacement: paragraphClose,
+              start: control.contentCloseStart,
+            }
+          );
+        }
+      } else if (control) {
+        preserveNamespaces(
+          control.start,
+          control.startEnd,
+          activeScalarNamespaceDeclarations(),
+          control.namespaceAttributeNames
+        );
+      }
+    }
+    for (const control of controls) {
+      if (control.contentDepth !== null && control.contentDepth > 0) {
+        control.contentDepth -= 1;
+      }
+    }
+    elementStack.pop();
+  });
+  try {
+    parser.write(xml).close();
+  } catch {
+    fail(422, "invalid_template", "The DOCX package contains invalid XML");
+  }
+  let transformed = xml;
+  for (const patch of patches.toSorted(
+    (left, right) => right.start - left.start
+  )) {
+    transformed =
+      transformed.slice(0, patch.start) +
+      patch.replacement +
+      transformed.slice(patch.end);
+  }
+  return transformed;
+}
+
+async function nativePdfDocument(documentKey: string): Promise<Uint8Array> {
+  const sourceObjectKey = await operationDocumentKey(documentKey);
+  if (!sourceObjectKey || !(await objectExists(sourceObjectKey))) {
+    fail(404, "not_found", "Document was not found");
+  }
+  const { archive, xmlPaths } = safeTemplateArchive(
+    await readObject(sourceObjectKey)
+  );
+  const controlParts = reachableTemplateControlParts(archive, xmlPaths);
+  for (const archivePath of controlParts) {
+    const originalXml = templateArchiveText(archive, archivePath);
+    const transformedXml = nativePdfScalarControlXml(originalXml);
+    if (transformedXml !== originalXml) {
+      archive[archivePath] = strToU8(
+        transformedXml.replace(
+          /encoding=(?<quote>["'])UTF-16(?:LE|BE)?\k<quote>/iu,
+          'encoding="UTF-8"'
+        )
+      );
+    }
+  }
+  return zipSync(archive);
+}
+async function nativeResponseDocument(
+  publishedTemplateId: string,
+  data: JsonRecord,
+  baseDocumentBytes?: Uint8Array,
+  pictures: ReadonlyMap<string, NativePictureUpload> = new Map()
+): Promise<Uint8Array> {
+  const [publishedTemplate, manifest] = await Promise.all([
+    prisma.publishedTemplate.findUnique({
+      select: { objectKey: true },
+      where: { id: publishedTemplateId },
+    }),
+    prisma.fieldManifest.findUnique({
+      include: {
+        fields: {
+          select: {
+            options: true,
+            pictureMaxBytes: true,
+            pictureMaxHeight: true,
+            pictureMaxWidth: true,
+            required: true,
+            tag: true,
+            type: true,
+          },
+        },
+      },
+      where: { publishedTemplateId },
+    }),
+  ]);
+  if (!publishedTemplate?.objectKey || !manifest) {
+    fail(409, "document_unavailable", "The published document is unavailable");
+  }
+  const scalarTags = new Set(
+    manifest.fields
+      .filter(({ type }) => type !== FieldType.picture)
+      .map(({ tag }) => tag)
+  );
+  const baseBytes =
+    baseDocumentBytes ?? (await readObject(publishedTemplate.objectKey));
+  return overlayNativeResponsePictures(
+    overlayNativeResponseDocument(baseBytes, manifest.fields, data, scalarTags),
+    manifest.fields,
+    pictures
+  );
 }
 
 async function completeDraftOperation(
@@ -7285,11 +11624,15 @@ async function processNativeResponseOperation(
     ) {
       fail(409, "stale_operation", "The response is no longer editable");
     }
-    const bytes = await nativeTextResponseDocument(
-      response.publishedTemplateId,
-      metadata.data
-    );
-    await storeObject(metadata.stagedObjectKey, bytes, DOCX_CONTENT_TYPE);
+    const bytes = metadata.nativeDocumentStaged
+      ? await readObject(metadata.stagedObjectKey)
+      : await nativeResponseDocument(
+          response.publishedTemplateId,
+          metadata.data
+        );
+    if (!metadata.nativeDocumentStaged) {
+      await storeObject(metadata.stagedObjectKey, bytes, DOCX_CONTENT_TYPE);
+    }
     await storeObject(metadata.finalObjectKey, bytes, DOCX_CONTENT_TYPE);
     const completion =
       metadata.action === "submit"
@@ -7513,9 +11856,86 @@ async function finalizeCallback(
   if (claimed.count !== 1) {
     return;
   }
-
   let completion: OperationCompletion | undefined;
+
   try {
+    if (
+      (metadata.action === "save-draft" ||
+        metadata.action === "save-correction" ||
+        metadata.action === "submit") &&
+      metadata.responseId &&
+      metadata.data
+    ) {
+      const response = await prisma.response.findUnique({
+        select: { publishedTemplateId: true },
+        where: { id: metadata.responseId },
+      });
+      if (response) {
+        const [publishedTemplate, manifest] = await Promise.all([
+          prisma.publishedTemplate.findUnique({
+            select: { objectKey: true },
+            where: { id: response.publishedTemplateId },
+          }),
+          prisma.fieldManifest.findUnique({
+            include: {
+              fields: { select: { options: true, tag: true, type: true } },
+            },
+            where: { publishedTemplateId: response.publishedTemplateId },
+          }),
+        ]);
+        if (publishedTemplate?.objectKey && manifest) {
+          const templateBytes = await readObject(publishedTemplate.objectKey);
+          if (
+            await supportsNativeTemplate(
+              publishedTemplate.objectKey,
+              manifest.fields,
+              templateBytes
+            )
+          ) {
+            const callbackValues =
+              metadata.callbackEmptyFieldTags &&
+              metadata.callbackEmptyFieldTags.length > 0
+                ? responseTextControlValues(bytes)
+                : null;
+            const callbackMetadata =
+              callbackValues === null
+                ? null
+                : onlyOfficeFieldDisplayMetadata(bytes);
+            const serverHeldFieldTags = new Set(metadata.serverHeldFieldTags);
+            const callbackEmptyFieldTags = new Set(
+              metadata.callbackEmptyFieldTags
+            );
+            for (const field of manifest.fields) {
+              if (
+                !callbackEmptyFieldTags.has(field.tag) ||
+                serverHeldFieldTags.has(field.tag)
+              ) {
+                continue;
+              }
+              const callbackValue = callbackValues?.get(field.tag);
+              if (callbackValue === undefined || !callbackMetadata) {
+                continue;
+              }
+              const normalizedValue = normalizeOnlyOfficeDisplayValue(
+                field,
+                callbackValue,
+                callbackMetadata.get(field.tag)
+              );
+              if (manifestFieldValueMatches(field, normalizedValue)) {
+                metadata.data[field.tag] = normalizedValue;
+              }
+            }
+            bytes = await overlayNativeResponseDocument(
+              bytes,
+              manifest.fields,
+              metadata.data,
+              serverHeldFieldTags
+            );
+          }
+        }
+      }
+    }
+
     if (metadata.action === "save-template") {
       validateTemplatePackage(bytes);
     } else if (metadata.action === "publish") {
@@ -8859,6 +13279,11 @@ async function correctionEditorConfig(
       prefill: lockedPrefillForSnapshot(response.prefillSnapshot),
       publicId: form.publicId,
       responseId: response.id,
+      tagAliases: form.publishedTemplate?.objectKey
+        ? onlyOfficeFieldTagAliases(
+            await readObject(form.publishedTemplate.objectKey)
+          )
+        : {},
     },
     identity
   );
@@ -8876,16 +13301,26 @@ interface CorrectionRevisionSummary {
   revision: number;
   pictures: Record<string, boolean> | null;
 }
-type RevisionSelector = "original" | "latest";
+type RevisionSelector = number | "latest";
 
 function revisionSelector(value: unknown): RevisionSelector {
-  if (value === undefined) {
-    return "original";
+  if (value === undefined || value === "latest") {
+    return "latest";
   }
-  if (value === "original" || value === "latest") {
-    return value;
+  if (value === "original") {
+    return 0;
   }
-  fail(400, "invalid_request", "revision must be original or latest");
+  if (typeof value === "string" && /^(0|[1-9]\d*)$/u.test(value)) {
+    const revision = Number(value);
+    if (Number.isSafeInteger(revision)) {
+      return revision;
+    }
+  }
+  fail(
+    400,
+    "invalid_request",
+    "revision must be latest, original, or a revision number"
+  );
 }
 
 function selectedSubmissionRevision(
@@ -8898,14 +13333,27 @@ function selectedSubmissionRevision(
   objectKey: string;
   revision: number;
 } {
+  const revision =
+    selector === "latest"
+      ? (submission.corrections[0]?.revision ?? 0)
+      : selector;
+  if (
+    revision > 0 &&
+    !submission.corrections.some((item) => item.revision === revision)
+  ) {
+    fail(404, "not_found", "Submission revision was not found");
+  }
   const correction =
-    selector === "latest" ? (submission.corrections[0] ?? null) : null;
+    revision === 0
+      ? null
+      : (submission.corrections.find((item) => item.revision === revision) ??
+        null);
   return {
     correction,
     data: jsonRecord(correction?.data ?? submission.data),
     documentKey: correction?.documentKey ?? submission.documentKey,
     objectKey: correction?.objectKey ?? submission.objectKey,
-    revision: correction?.revision ?? 0,
+    revision,
   };
 }
 
@@ -8979,6 +13427,30 @@ async function receiptManifestFields(submission: SubmissionWithManifest) {
     manifest.fields
   );
 }
+function receiptField(
+  field: ManifestDisplayField & { options: unknown; type: FieldType }
+) {
+  return {
+    label: field.label,
+    options: Array.isArray(field.options)
+      ? field.options.flatMap((option) => {
+          if (!option || typeof option !== "object" || Array.isArray(option)) {
+            return [];
+          }
+          const optionRecord = option as Record<string, unknown>;
+          const displayText = optionRecord.displayText;
+          const value = optionRecord.value;
+          return typeof displayText === "string" && typeof value === "string"
+            ? [{ displayText, value }]
+            : [];
+        })
+      : [],
+    placeholder: field.placeholder,
+    position: field.position,
+    tag: field.tag,
+    type: field.type,
+  };
+}
 
 async function userEditorConfig(
   form: FormWithDocuments,
@@ -9033,6 +13505,10 @@ async function userEditorConfig(
     form.id
   );
   if (form.fillMethod === FillMethod.native) {
+    const nativeFieldConfig = await nativeFields(
+      publishedTemplate.id,
+      await readObject(response.draftObjectKey)
+    );
     return {
       capabilities: {
         "save-draft": actionEditorCapability(
@@ -9053,39 +13529,39 @@ async function userEditorConfig(
           ? jsonRecord(snapshot?.values ?? {})
           : jsonRecord(response.draftData),
       documentKey: response.draftDocumentKey,
-      fields: await nativeTextFields(publishedTemplate.id),
+      fields: nativeFieldConfig.fields,
       fillMethod: FillMethod.native,
       lockedFields: snapshot ? jsonRecord(snapshot.lockedFields) : {},
+      pictures: nativeFieldConfig.pictures,
       responseId: response.id,
     };
   }
   return {
     ...editorConfig(
-    {
-      action:
-        requestedAction === "submit"
-          ? "submit"
-          : requestedAction === "fill"
-            ? "fill"
-            : "draft",
-      capabilities: {
-        "save-draft": actionEditorCapability(
-          identity,
-          capabilityScope,
-          "save-draft",
-          lease
-        ),
-        submit: actionEditorCapability(
-          identity,
-          capabilityScope,
-          "submit",
-          lease
-        ),
-      },
-      documentKey: response.draftDocumentKey,
-      lease: editorLeaseBridge(lease),
-      prefill:
-        snapshot
+      {
+        action:
+          requestedAction === "submit"
+            ? "submit"
+            : requestedAction === "fill"
+              ? "fill"
+              : "draft",
+        capabilities: {
+          "save-draft": actionEditorCapability(
+            identity,
+            capabilityScope,
+            "save-draft",
+            lease
+          ),
+          submit: actionEditorCapability(
+            identity,
+            capabilityScope,
+            "submit",
+            lease
+          ),
+        },
+        documentKey: response.draftDocumentKey,
+        lease: editorLeaseBridge(lease),
+        prefill: snapshot
           ? requestedAction === "fill"
             ? {
                 data: jsonRecord(snapshot.values),
@@ -9093,10 +13569,13 @@ async function userEditorConfig(
               }
             : lockedPrefillForSnapshot(snapshot)
           : undefined,
-      publicId: form.publicId,
-      responseId: response.id,
-    },
-    identity
+        publicId: form.publicId,
+        responseId: response.id,
+        tagAliases: onlyOfficeFieldTagAliases(
+          await readObject(publishedTemplate.objectKey)
+        ),
+      },
+      identity
     ),
     fillMethod: FillMethod.onlyoffice,
   };
@@ -9285,13 +13764,17 @@ export function createApp(options: AppOptions = {}) {
         { headers: { "Cache-Control": "no-store" } }
       )
     )
-    .get(
+    .post(
       "/api/legacy-sso/start",
-      ({ request }) => {
+      async ({ request }) => {
         if (!legacySso) {
           fail(404, "legacy_sso_unavailable", "Legacy SSO is unavailable");
         }
-        return startLegacySso(request, legacySso, handoffClock);
+        const identity = await identityFor(request);
+        if (request.headers.has("authorization") && !identity) {
+          fail(401, "unauthorized", "Authentication is required");
+        }
+        return startLegacySso(request, legacySso, handoffClock, identity);
       },
       { parse: "none" }
     )
@@ -9303,10 +13786,26 @@ export function createApp(options: AppOptions = {}) {
           : legacySsoFailureResponse(),
       { parse: "none" }
     )
+    .get(
+      "/api/legacy-sso/switch",
+      ({ request }) => readLegacySsoSwitch(request, handoffClock, legacySso),
+      { parse: "none" }
+    )
+    .post(
+      "/api/legacy-sso/switch/confirm",
+      ({ request }) =>
+        consumeLegacySsoSwitch(request, handoffClock, legacySso, true),
+      { parse: "none" }
+    )
+    .post(
+      "/api/legacy-sso/switch/cancel",
+      ({ request }) =>
+        consumeLegacySsoSwitch(request, handoffClock, legacySso, false),
+      { parse: "none" }
+    )
     .post(
       "/api/legacy-sso/session",
-      ({ request }) =>
-        claimLegacySsoSession(request, handoffClock, legacySso),
+      ({ request }) => claimLegacySsoSession(request, handoffClock, legacySso),
       { parse: "none" }
     )
     .get("/prefill/handoff", () => {
@@ -9333,8 +13832,7 @@ export function createApp(options: AppOptions = {}) {
         user: {
           email: identity.email,
           id: identity.id,
-          mustChangePassword:
-            identity.mustChangePassword && !identity.isSso,
+          mustChangePassword: identity.mustChangePassword && !identity.isSso,
           name: identity.name,
           role: identity.role,
         },
@@ -9431,6 +13929,96 @@ export function createApp(options: AppOptions = {}) {
       await endAiAuthoringSessions(aiAuthoring, revokedOwnerSessionIds);
       return { ok: true };
     })
+    .get("/api/admin/account-links", async ({ request, query }) => {
+      const identity = await requireIdentity(request);
+      requireAdmin(identity);
+      const queryRecord = query as unknown as JsonRecord;
+      const cursor = queryString(queryRecord, "cursor");
+      if (cursor !== undefined && !idPattern.test(cursor)) {
+        fail(400, "invalid_request", "cursor is invalid");
+      }
+      const where: Prisma.LegacyAccountLinkRequestWhereInput = {
+        status: LegacyAccountLinkStatus.pending,
+      };
+      if (cursor) {
+        where.id = { gt: cursor };
+      }
+      const rows = await prisma.legacyAccountLinkRequest.findMany({
+        orderBy: { id: "asc" },
+        select: {
+          createdAt: true,
+          email: true,
+          id: true,
+          providerId: true,
+          status: true,
+          subject: true,
+          user: { select: adminUserSelect },
+        },
+        take: accountUserPageSize + 1,
+        where,
+      });
+      const page = rows.slice(0, accountUserPageSize);
+      return {
+        nextCursor:
+          rows.length > accountUserPageSize ? (page.at(-1)?.id ?? null) : null,
+        requests: page.map(({ user, ...linkRequest }) => ({
+          ...linkRequest,
+          user: accountUserSummary(user),
+        })),
+      };
+    })
+    .post(
+      "/api/admin/account-links/:id/approve",
+      ({ request, params }) => {
+        const requestId = accountAuditTargetId(params.id);
+        if (!requestId) {
+          fail(400, "invalid_request", "Account link request id is invalid");
+        }
+        return withAdminMutation(
+          request,
+          "approve_legacy_account_link",
+          async () => {
+            const linkRequest =
+              await prisma.legacyAccountLinkRequest.findUnique({
+                select: { userId: true },
+                where: { id: requestId },
+              });
+            if (!linkRequest) {
+              fail(404, "not_found", "Account link request was not found");
+            }
+            return linkRequest.userId;
+          },
+          (identity) => reviewLegacyAccountLink(identity, requestId, "approved")
+        );
+      },
+      { parse: "none" }
+    )
+    .post(
+      "/api/admin/account-links/:id/reject",
+      ({ request, params }) => {
+        const requestId = accountAuditTargetId(params.id);
+        if (!requestId) {
+          fail(400, "invalid_request", "Account link request id is invalid");
+        }
+        return withAdminMutation(
+          request,
+          "reject_legacy_account_link",
+          async () => {
+            const linkRequest =
+              await prisma.legacyAccountLinkRequest.findUnique({
+                select: { userId: true },
+                where: { id: requestId },
+              });
+            if (!linkRequest) {
+              fail(404, "not_found", "Account link request was not found");
+            }
+            return linkRequest.userId;
+          },
+          (identity) => reviewLegacyAccountLink(identity, requestId, "rejected")
+        );
+      },
+      { parse: "none" }
+    )
     .get("/api/admin/users", async ({ request, query }) => {
       const identity = await requireIdentity(request);
       requireAdmin(identity);
@@ -9710,81 +14298,86 @@ export function createApp(options: AppOptions = {}) {
             if (Object.keys(input).length !== 1 || input.confirm !== true) {
               fail(400, "invalid_request", "confirm must be true");
             }
-            const revokedOwnerSessionIds = await accountTransaction(identity, async (tx) => {
-              const target = await lockAccountUser(tx, userId);
-              if (target.role === "admin" && target.enabled) {
-                const enabledAdminCount = await tx.user.count({
-                  where: { enabled: true, role: "admin" },
+            const revokedOwnerSessionIds = await accountTransaction(
+              identity,
+              async (tx) => {
+                const target = await lockAccountUser(tx, userId);
+                if (target.role === "admin" && target.enabled) {
+                  const enabledAdminCount = await tx.user.count({
+                    where: { enabled: true, role: "admin" },
+                  });
+                  if (enabledAdminCount <= 1) {
+                    fail(
+                      409,
+                      "final_admin_required",
+                      "At least one enabled Admin is required"
+                    );
+                  }
+                }
+                const responseCount = await tx.response.count({
+                  where: { userId: target.id },
                 });
-                if (enabledAdminCount <= 1) {
+                if (responseCount > 0) {
                   fail(
                     409,
-                    "final_admin_required",
-                    "At least one enabled Admin is required"
+                    "personal_data_remains",
+                    "Personal Responses must be deleted first"
                   );
                 }
-              }
-              const responseCount = await tx.response.count({
-                where: { userId: target.id },
-              });
-              if (responseCount > 0) {
-                fail(
-                  409,
-                  "personal_data_remains",
-                  "Personal Responses must be deleted first"
-                );
-              }
-              const cleanupIntentCount = await tx.objectCleanupIntent.count({
-                where: { deletionOwnerUserId: target.id },
-              });
-              if (cleanupIntentCount > 0) {
-                fail(
-                  409,
-                  "personal_data_remains",
-                  "Response object cleanup is still pending"
-                );
-              }
-              const handoffs = await tx.handoff.findMany({
-                select: { id: true },
-                where: { normalizedEmail: target.email },
-              });
-              if (handoffs.length > 0) {
-                await tx.pendingClaim.deleteMany({
-                  where: {
-                    handoffId: {
-                      in: handoffs.map((handoff) => handoff.id),
+                const cleanupIntentCount = await tx.objectCleanupIntent.count({
+                  where: { deletionOwnerUserId: target.id },
+                });
+                if (cleanupIntentCount > 0) {
+                  fail(
+                    409,
+                    "personal_data_remains",
+                    "Response object cleanup is still pending"
+                  );
+                }
+                const handoffs = await tx.handoff.findMany({
+                  select: { id: true },
+                  where: { normalizedEmail: target.email },
+                });
+                if (handoffs.length > 0) {
+                  await tx.pendingClaim.deleteMany({
+                    where: {
+                      handoffId: {
+                        in: handoffs.map((handoff) => handoff.id),
+                      },
                     },
-                  },
+                  });
+                  await tx.handoff.updateMany({
+                    data: {
+                      codeDigest: null,
+                      configurationHash: null,
+                      consumedAt: null,
+                      filteredValues: Prisma.JsonNull,
+                      formId: null,
+                      normalizedEmail: null,
+                      reservedAt: null,
+                      responseId: null,
+                      status: HandoffStatus.deleted,
+                    },
+                    where: {
+                      id: { in: handoffs.map((handoff) => handoff.id) },
+                    },
+                  });
+                }
+                await createAccountAudit(tx, {
+                  action: "delete_user",
+                  actorId: identity.id,
+                  outcome: AuditOutcome.success,
+                  safeMetadata: { change: "deleted" },
+                  targetId: target.id,
                 });
-                await tx.handoff.updateMany({
-                  data: {
-                    codeDigest: null,
-                    configurationHash: null,
-                    consumedAt: null,
-                    filteredValues: Prisma.JsonNull,
-                    formId: null,
-                    normalizedEmail: null,
-                    reservedAt: null,
-                    responseId: null,
-                    status: HandoffStatus.deleted,
-                  },
-                  where: { id: { in: handoffs.map((handoff) => handoff.id) } },
+                const sessions = await tx.session.findMany({
+                  select: { id: true },
+                  where: { userId: target.id },
                 });
+                await tx.user.delete({ where: { id: target.id } });
+                return sessions.map(({ id }) => id);
               }
-              await createAccountAudit(tx, {
-                action: "delete_user",
-                actorId: identity.id,
-                outcome: AuditOutcome.success,
-                safeMetadata: { change: "deleted" },
-                targetId: target.id,
-              });
-              const sessions = await tx.session.findMany({
-                select: { id: true },
-                where: { userId: target.id },
-              });
-              await tx.user.delete({ where: { id: target.id } });
-              return sessions.map(({ id }) => id);
-            });
+            );
             await endAiAuthoringSessions(aiAuthoring, revokedOwnerSessionIds);
             return { deleted: true };
           }
@@ -9914,7 +14507,10 @@ export function createApp(options: AppOptions = {}) {
             },
             input.pdfBytes
           );
-          return { session };
+          return Response.json(
+            { session },
+            { headers: { "Cache-Control": "private, no-store" } }
+          );
         } finally {
           sourcePdf?.fill(0);
           aiAuthoring.releaseRequest(reservation);
@@ -9997,7 +14593,8 @@ export function createApp(options: AppOptions = {}) {
         return new Response(bytes, {
           headers: {
             "Cache-Control": "private, no-store",
-            "Content-Disposition": 'attachment; filename="ai-authored-template.docx"',
+            "Content-Disposition":
+              'attachment; filename="ai-authored-template.docx"',
             "Content-Type": DOCX_CONTENT_TYPE,
             "X-Content-Type-Options": "nosniff",
           },
@@ -10125,18 +14722,18 @@ export function createApp(options: AppOptions = {}) {
                 fail(
                   409,
                   "native_fill_unsupported",
-                  "Native filling requires a published text-only form"
+                  "Native filling requires supported fields"
                 );
               }
               const manifest = await tx.fieldManifest.findUnique({
-                include: { fields: { select: { type: true } } },
+                include: { fields: { select: { tag: true, type: true } } },
                 where: {
                   publishedTemplateId: current.publishedTemplate.id,
                 },
               });
               if (
                 !manifest ||
-                !(await supportsNativeTextTemplate(
+                !(await supportsNativeTemplate(
                   current.publishedTemplate.objectKey,
                   manifest.fields
                 ))
@@ -10144,7 +14741,7 @@ export function createApp(options: AppOptions = {}) {
                 fail(
                   409,
                   "native_fill_unsupported",
-                  "Native filling requires a published text-only form"
+                  "Native filling requires supported fields"
                 );
               }
             }
@@ -10673,7 +15270,7 @@ export function createApp(options: AppOptions = {}) {
       ]);
       const manifest = form.publishedTemplate
         ? await prisma.fieldManifest.findUnique({
-            include: { fields: { select: { type: true } } },
+            include: { fields: { select: { tag: true, type: true } } },
             where: {
               publishedTemplateId: form.publishedTemplate.id,
             },
@@ -10681,7 +15278,7 @@ export function createApp(options: AppOptions = {}) {
         : null;
       const nativeFillAvailable =
         manifest && form.publishedTemplate
-          ? await supportsNativeTextTemplate(
+          ? await supportsNativeTemplate(
               form.publishedTemplate.objectKey,
               manifest.fields
             )
@@ -11447,36 +16044,28 @@ export function createApp(options: AppOptions = {}) {
         results: page.map(adminResultSummary),
       };
     })
-    .get("/api/admin/results/:id", async ({ request, params }) => {
+    .get("/api/admin/results/:id", async ({ request, params, query }) => {
       const identity = await requireIdentity(request);
       requireAdmin(identity);
       validateId(params.id, "Response");
+      const selector = revisionSelector(query.revision);
       const response = await prisma.response.findUnique({
         include: {
           corrections: {
             orderBy: { revision: "desc" },
-            select: {
-              createdAt: true,
-              data: true,
-              documentKey: true,
-              id: true,
-              objectKey: true,
-              reason: true,
-              revision: true,
-            },
-            take: 1,
           },
           form: { select: { publicId: true, title: true } },
           owner: { select: { email: true } },
-          submission: {
-            select: {
-              createdAt: true,
-              data: true,
-              documentKey: true,
-              id: true,
-              objectKey: true,
+          publishedTemplate: {
+            include: {
+              manifest: {
+                include: {
+                  fields: { orderBy: { position: "asc" } },
+                },
+              },
             },
           },
+          submission: true,
         },
         where: { id: params.id },
       });
@@ -11484,65 +16073,89 @@ export function createApp(options: AppOptions = {}) {
         fail(404, "not_found", "Response was not found");
       }
       const submitted = response.status === ResponseStatus.submitted;
+      if (!submitted && selector !== "latest") {
+        fail(404, "not_found", "Submission revision was not found");
+      }
       const latestCorrection = submitted ? response.corrections[0] : undefined;
+      const selected = submitted
+        ? response.submission
+          ? selectedSubmissionRevision(
+              { ...response.submission, corrections: response.corrections },
+              selector
+            )
+          : fail(404, "not_found", "Response was not found")
+        : undefined;
       await createResponseAudit({
         action: "view_response",
         actorId: identity.id,
         outcome: AuditOutcome.success,
         safeMetadata: {
-          revision: latestCorrection?.revision ?? 0,
+          revision: selected?.revision ?? 0,
           state: submitted ? "submitted" : "draft",
         },
         targetId: response.id,
         targetType: "response",
       });
-      if (latestCorrection) {
+      if (selected?.correction) {
         await createResponseAudit({
           action: "view_correction",
           actorId: identity.id,
           outcome: AuditOutcome.success,
           safeMetadata: {
-            revision: latestCorrection.revision,
+            revision: selected.correction.revision,
             state: "submitted",
           },
-          targetId: latestCorrection.id,
+          targetId: selected.correction.id,
           targetType: "correction",
         });
       }
       const documentObjectKey = submitted
-        ? (latestCorrection?.objectKey ?? response.submission?.objectKey)
+        ? selected?.objectKey
         : response.draftObjectKey;
       const documentAvailable = submitted
         ? Boolean(documentObjectKey && (await objectExists(documentObjectKey)))
-        : Boolean(response.draftDocumentKey && response.draftObjectKey);
+        : Boolean(
+            response.draftDocumentKey &&
+            documentObjectKey &&
+            (await objectExists(documentObjectKey))
+          );
+      const publishedTemplate = response.publishedTemplate;
+      const manifest = publishedTemplate?.manifest;
+      const manifestFields =
+        manifest && publishedTemplate
+          ? await manifestFieldsWithDocumentMetadata(
+              publishedTemplate.objectKey,
+              manifest.displayMetadataVersion,
+              manifest.fields
+            )
+          : [];
       return {
         result: {
-          correction: latestCorrection
+          correction: selected?.correction
             ? {
-                createdAt: latestCorrection.createdAt,
-                reason: latestCorrection.reason,
-                revision: latestCorrection.revision,
+                createdAt: selected.correction.createdAt,
+                reason: selected.correction.reason,
+                revision: selected.correction.revision,
               }
             : null,
           createdAt: response.createdAt,
           data: submitted
-            ? jsonRecord(
-                latestCorrection?.data ?? response.submission?.data ?? {}
-              )
+            ? (selected?.data ?? {})
             : jsonRecord(response.draftData ?? {}),
           document: {
             available: documentAvailable,
-            state: latestCorrection
+            state: selected?.correction
               ? "correction"
               : submitted
                 ? "submission"
                 : "draft",
           },
+          fields: manifestFields.map(receiptField),
           formPublicId: response.form.publicId,
           formTitle: response.form.title,
           id: response.id,
           latestCorrectionNumber: latestCorrection?.revision ?? null,
-          revision: submitted ? (latestCorrection?.revision ?? 0) : null,
+          revision: submitted ? (selected?.revision ?? 0) : null,
           state: submitted ? "submitted" : "draft",
           submissionId: response.submission?.id ?? null,
           submittedAt: response.submission?.createdAt ?? null,
@@ -11557,49 +16170,38 @@ export function createApp(options: AppOptions = {}) {
         const identity = await requireIdentity(request);
         requireAdmin(identity);
         validateId(params.id, "Response");
-        if (
-          query.revision !== undefined &&
-          query.revision !== "original" &&
-          query.revision !== "latest"
-        ) {
-          fail(400, "invalid_request", "revision must be original or latest");
-        }
+        const selector = revisionSelector(query.revision);
         const response = await prisma.response.findUnique({
           include: {
-            corrections: {
-              orderBy: { revision: "desc" },
-              select: {
-                documentKey: true,
-                id: true,
-                objectKey: true,
-                revision: true,
-              },
-              take: 1,
-            },
+            corrections: { orderBy: { revision: "desc" } },
             form: { select: { publicId: true } },
-            submission: {
-              select: { documentKey: true, id: true, objectKey: true },
-            },
+            submission: true,
           },
           where: { id: params.id },
         });
         if (
           !response ||
-          (response.status === ResponseStatus.submitted &&
-            !response.submission)
+          (response.status === ResponseStatus.submitted && !response.submission)
         ) {
           fail(404, "not_found", "Response was not found");
         }
         const submitted = response.status === ResponseStatus.submitted;
-        const selectedCorrection =
-          submitted && query.revision !== "original"
-            ? response.corrections[0]
+        if (!submitted && selector !== "latest") {
+          fail(404, "not_found", "Submission revision was not found");
+        }
+        const selected =
+          submitted && response.submission
+            ? selectedSubmissionRevision(
+                { ...response.submission, corrections: response.corrections },
+                selector
+              )
             : undefined;
+        const selectedCorrection = selected?.correction;
         const documentKey = submitted
-          ? (selectedCorrection?.documentKey ?? response.submission?.documentKey)
+          ? selected?.documentKey
           : response.draftDocumentKey;
         const documentObjectKey = submitted
-          ? (selectedCorrection?.objectKey ?? response.submission?.objectKey)
+          ? selected?.objectKey
           : response.draftObjectKey;
         if (
           !documentKey ||
@@ -11613,12 +16215,14 @@ export function createApp(options: AppOptions = {}) {
           actorId: identity.id,
           outcome: AuditOutcome.success,
           safeMetadata: {
-            revision: selectedCorrection?.revision ?? 0,
+            revision: selected?.revision ?? 0,
             state: submitted ? "submitted" : "draft",
           },
           targetId:
             selectedCorrection?.id ??
-            (submitted ? (response.submission?.id ?? response.id) : response.id),
+            (submitted
+              ? (response.submission?.id ?? response.id)
+              : response.id),
           targetType: selectedCorrection
             ? "correction"
             : submitted
@@ -11720,6 +16324,7 @@ export function createApp(options: AppOptions = {}) {
           form,
           response,
           { ...previousData, ...input.data },
+          true,
           true
         );
         if (await activeOperationForResponse(response.id)) {
@@ -11753,12 +16358,16 @@ export function createApp(options: AppOptions = {}) {
           nextDocumentKey: `correction-${response.id}-${crypto.randomUUID()}`,
           publicId: form.publicId,
           reason: input.reason,
+          ...(form.fillMethod === FillMethod.onlyoffice
+            ? callbackFieldMetadata(data, input.data, response.prefillSnapshot)
+            : {}),
           responseId: response.id,
           stagedObjectKey,
           submissionId: response.submission.id,
           workspaceDocumentKey: workspaceLease.workspaceDocumentKey,
           workspaceObjectKey: workspaceLease.workspaceObjectKey,
         };
+
         const operation = await createOperation({
           actorId: identity.id,
           authorization,
@@ -11921,8 +16530,8 @@ export function createApp(options: AppOptions = {}) {
           await deleteObjects(redeemed.cleanupObjectKeys);
           set.headers["Set-Cookie"] = pendingClaimCookie("", 0);
           return {
-            fillMethod: form.fillMethod,
             editorConfigUrl: `/api/forms/${form.publicId}/editor-config?responseId=${redeemed.response.id}&action=fill`,
+            fillMethod: form.fillMethod,
             prefill: {
               data: jsonRecord(redeemed.response.prefillSnapshot?.values),
               editableFields: redeemed.response.prefillSnapshot
@@ -11953,8 +16562,8 @@ export function createApp(options: AppOptions = {}) {
           );
         }
         return {
-          fillMethod: form.fillMethod,
           editorConfigUrl: `/api/forms/${form.publicId}/editor-config?responseId=${existing.id}&action=${existing.draftData ? "draft" : "fill"}`,
+          fillMethod: form.fillMethod,
           prefill: existing.draftData ? null : undefined,
           response: responseSummary(existing),
         };
@@ -12098,8 +16707,8 @@ export function createApp(options: AppOptions = {}) {
         }
         await deleteObjects([existing?.draftObjectKey, unusedDraftObjectKey]);
         return {
-          fillMethod: form.fillMethod,
           editorConfigUrl: `/api/forms/${form.publicId}/editor-config?responseId=${response.id}&action=${response.draftData ? "draft" : "fill"}`,
+          fillMethod: form.fillMethod,
           prefill: response.draftData ? null : { data: {}, editableFields: {} },
           response: responseSummary(response),
         };
@@ -12119,8 +16728,8 @@ export function createApp(options: AppOptions = {}) {
             (await objectExists(current.draftObjectKey))
           ) {
             return {
-              fillMethod: form.fillMethod,
               editorConfigUrl: `/api/forms/${form.publicId}/editor-config?responseId=${current.id}&action=${current.draftData ? "draft" : "fill"}`,
+              fillMethod: form.fillMethod,
               prefill: current.draftData
                 ? null
                 : { data: {}, editableFields: {} },
@@ -12329,7 +16938,8 @@ export function createApp(options: AppOptions = {}) {
           });
         }
         const pdf = await onlyOffice.convertDocxToPdf(
-          response.draftDocumentKey
+          response.draftDocumentKey,
+          true
         );
         set.headers["Content-Disposition"] =
           `attachment; filename="response-${response.id}.pdf"`;
@@ -12415,10 +17025,15 @@ export function createApp(options: AppOptions = {}) {
         const authorization = await requireActionEditorAuthorization(request);
         const { actor: identity } = authorization;
         const form = await findFormByPublicId(params.publicId);
-        const input = await readJsonRecord(
+        const pictureFields =
+          form.fillMethod === FillMethod.native && form.publishedTemplate
+            ? await nativePictureManifestFields(form.publishedTemplate.id)
+            : [];
+        const nativeRequest = await nativeResponseRequest(
           request,
-          maxNativePictureMultipartOverheadBytes
+          pictureFields
         );
+        const input = nativeRequest.input;
         requireCurrentFillMethod(form, input);
         const responseId = requiredString(input, "responseId");
         const documentKey = requiredString(input, "documentKey");
@@ -12445,12 +17060,43 @@ export function createApp(options: AppOptions = {}) {
           action: "save-draft",
         });
         await requireActiveEditorLease(authorization, capabilityScope);
-        const data = await normalizeResponseData(form, response, input.data);
+        const data = await normalizeResponseData(
+          form,
+          response,
+          input.data,
+          false,
+          form.fillMethod === FillMethod.onlyoffice,
+          form.fillMethod === FillMethod.onlyoffice
+            ? input.canonicalDateFields
+            : undefined
+        );
         if (await activeOperationForResponse(response.id)) {
           fail(
             409,
             "operation_in_progress",
             "Another response operation is already in progress"
+          );
+        }
+        const nativeDocumentBytes =
+          pictureFields.length === 0
+            ? null
+            : response.draftObjectKey
+              ? await nativeResponseDocument(
+                  response.publishedTemplateId,
+                  data,
+                  await readObject(response.draftObjectKey),
+                  nativeRequest.pictures
+                )
+              : fail(
+                  409,
+                  "document_unavailable",
+                  "Response document is unavailable"
+                );
+        if (nativeDocumentBytes) {
+          await validateResponseDocument(
+            response.publishedTemplateId,
+            nativeDocumentBytes,
+            false
           );
         }
         const operationId = crypto.randomUUID();
@@ -12475,8 +17121,13 @@ export function createApp(options: AppOptions = {}) {
           nextDocumentKey: `response-${response.id}-${crypto.randomUUID()}`,
           publicId: form.publicId,
           responseId: response.id,
+          ...(form.fillMethod === FillMethod.onlyoffice
+            ? callbackFieldMetadata(data, input.data, response.prefillSnapshot)
+            : {}),
+          ...(nativeDocumentBytes ? { nativeDocumentStaged: true } : {}),
           stagedObjectKey,
         };
+
         const operation = await createOperation({
           actorId: identity.id,
           authorization,
@@ -12492,6 +17143,18 @@ export function createApp(options: AppOptions = {}) {
           targetType: OperationTargetType.response,
           type: operationTypeForAction["save-draft"],
         });
+        if (nativeDocumentBytes) {
+          try {
+            await storeObject(
+              stagedObjectKey,
+              nativeDocumentBytes,
+              DOCX_CONTENT_TYPE
+            );
+          } catch (error) {
+            await updateOperationFailed(operation.id, "document_save_failed");
+            throw error;
+          }
+        }
         set.status = 202;
         if (form.fillMethod === FillMethod.native) {
           void processNativeResponseOperation(operation, storeObject);
@@ -12517,10 +17180,15 @@ export function createApp(options: AppOptions = {}) {
         const authorization = await requireActionEditorAuthorization(request);
         const { actor: identity } = authorization;
         const form = await findFormByPublicId(params.publicId);
-        const input = await readJsonRecord(
+        const pictureFields =
+          form.fillMethod === FillMethod.native && form.publishedTemplate
+            ? await nativePictureManifestFields(form.publishedTemplate.id)
+            : [];
+        const nativeRequest = await nativeResponseRequest(
           request,
-          maxNativePictureMultipartOverheadBytes
+          pictureFields
         );
+        const input = nativeRequest.input;
         requireCurrentFillMethod(form, input);
         const responseId = requiredString(input, "responseId");
         const documentKey = requiredString(input, "documentKey");
@@ -12551,13 +17219,39 @@ export function createApp(options: AppOptions = {}) {
           form,
           response,
           input.data,
-          true
+          true,
+          form.fillMethod === FillMethod.onlyoffice,
+          form.fillMethod === FillMethod.onlyoffice
+            ? input.canonicalDateFields
+            : undefined
         );
         if (await activeOperationForResponse(response.id)) {
           fail(
             409,
             "operation_in_progress",
             "Another response operation is already in progress"
+          );
+        }
+        const nativeDocumentBytes =
+          pictureFields.length === 0
+            ? null
+            : response.draftObjectKey
+              ? await nativeResponseDocument(
+                  response.publishedTemplateId,
+                  data,
+                  await readObject(response.draftObjectKey),
+                  nativeRequest.pictures
+                )
+              : fail(
+                  409,
+                  "document_unavailable",
+                  "Response document is unavailable"
+                );
+        if (nativeDocumentBytes) {
+          await validateResponseDocument(
+            response.publishedTemplateId,
+            nativeDocumentBytes,
+            true
           );
         }
         const operationId = crypto.randomUUID();
@@ -12583,9 +17277,13 @@ export function createApp(options: AppOptions = {}) {
           formId: form.id,
           publicId: form.publicId,
           responseId: response.id,
+          ...(form.fillMethod === FillMethod.onlyoffice
+            ? callbackFieldMetadata(data, input.data, response.prefillSnapshot)
+            : {}),
           stagedObjectKey,
           submissionDocumentKey,
           submissionId,
+          ...(nativeDocumentBytes ? { nativeDocumentStaged: true } : {}),
         };
         let operation: Operation;
         try {
@@ -12602,7 +17300,11 @@ export function createApp(options: AppOptions = {}) {
                 `
               );
               if (!lockedForm || lockedForm.fillMethod !== form.fillMethod) {
-                fail(409, "fill_method_changed", "The form Fill Method changed");
+                fail(
+                  409,
+                  "fill_method_changed",
+                  "The form Fill Method changed"
+                );
               }
               await lockActiveEditorLease(tx, authorization, capabilityScope);
               const activeOperation = await tx.operation.findFirst({
@@ -12665,6 +17367,18 @@ export function createApp(options: AppOptions = {}) {
             );
           }
           throw error;
+        }
+        if (nativeDocumentBytes) {
+          try {
+            await storeObject(
+              stagedObjectKey,
+              nativeDocumentBytes,
+              DOCX_CONTENT_TYPE
+            );
+          } catch (error) {
+            await updateOperationFailed(operation.id, "document_save_failed");
+            throw error;
+          }
         }
         set.status = 202;
         if (form.fillMethod === FillMethod.native) {
@@ -12788,31 +17502,7 @@ export function createApp(options: AppOptions = {}) {
             }
           : null,
         data: selected.data,
-        fields: manifestFields.map((field) => ({
-          label: field.label,
-          options: Array.isArray(field.options)
-            ? field.options.flatMap((option) => {
-                if (
-                  !option ||
-                  typeof option !== "object" ||
-                  Array.isArray(option)
-                ) {
-                  return [];
-                }
-                const optionRecord = option as Record<string, unknown>;
-                const displayText = optionRecord.displayText;
-                const value = optionRecord.value;
-                return typeof displayText === "string" &&
-                  typeof value === "string"
-                  ? [{ displayText, value }]
-                  : [];
-              })
-            : [],
-          placeholder: field.placeholder,
-          position: field.position,
-          tag: field.tag,
-          type: field.type,
-        })),
+        fields: manifestFields.map(receiptField),
         returnUrl: prefillReturnUrl,
         revision: selected.revision,
         submission: submissionSummary(submission, {
@@ -12908,7 +17598,7 @@ export function createApp(options: AppOptions = {}) {
         );
         let pdf: Uint8Array;
         try {
-          pdf = await onlyOffice.convertDocxToPdf(selected.documentKey);
+          pdf = await onlyOffice.convertDocxToPdf(selected.documentKey, true);
         } catch (error) {
           await createResponseAudit({
             action: selected.correction
@@ -12965,6 +17655,11 @@ export function createApp(options: AppOptions = {}) {
       const objectKey = await operationDocumentKey(key);
       if (!objectKey || !(await objectExists(objectKey))) {
         fail(404, "not_found", "Document was not found");
+      }
+      if (query.pdf === "1") {
+        return new Response(await nativePdfDocument(key), {
+          headers: { "Content-Type": DOCX_CONTENT_TYPE },
+        });
       }
       return new Response(streamObject(objectKey), {
         headers: { "Content-Type": DOCX_CONTENT_TYPE },
@@ -13099,7 +17794,8 @@ export function createApp(options: AppOptions = {}) {
         }
       },
       { parse: "none" }
-    ).onStop(() => aiAuthoring.close());
+    )
+    .onStop(() => aiAuthoring.close());
 }
 
 async function readTemplateSourceBytes(
