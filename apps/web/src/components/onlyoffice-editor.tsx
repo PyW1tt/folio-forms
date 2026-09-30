@@ -291,6 +291,7 @@ export const OnlyOfficeEditor = ({
   const terminalOperationIdsRef = useRef(new Set<string>());
   const editorId = useId().replaceAll(":", "");
   const surfaceId = `${editorId}-surface`;
+  const keyboardHelpId = `${editorId}-keyboard-help`;
   const leaseRef = useRef<EditorLease | null>(null);
   const loadedConfigUrlRef = useRef<string | null>(null);
   const [config, setConfig] = useState<EditorConfig | null>(null);
@@ -304,6 +305,11 @@ export const OnlyOfficeEditor = ({
   const reportState = useCallback((nextState: OnlyOfficeEditorState) => {
     setEditorState(nextState);
     onStateChangeRef.current?.(nextState);
+  }, []);
+
+  const restore = useCallback(() => {
+    setExpanded(false);
+    surfaceRef.current?.querySelector("button")?.focus();
   }, []);
 
   const releaseCurrentLease = useCallback(async (): Promise<void> => {
@@ -394,7 +400,7 @@ export const OnlyOfficeEditor = ({
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         event.preventDefault();
-        setExpanded(false);
+        restore();
       }
     };
 
@@ -413,7 +419,7 @@ export const OnlyOfficeEditor = ({
         }
       }
     };
-  }, [expanded]);
+  }, [expanded, restore]);
 
   useEffect(() => {
     const lease =
@@ -758,7 +764,25 @@ export const OnlyOfficeEditor = ({
       };
     }
 
-    const editorConfig = config.config;
+    const documentEditorConfig = isRecord(config.config.editorConfig)
+      ? config.config.editorConfig
+      : {};
+    const editorConfig = {
+      ...config.config,
+      editorConfig: {
+        ...documentEditorConfig,
+        customization: {
+          ...(isRecord(documentEditorConfig.customization)
+            ? documentEditorConfig.customization
+            : {}),
+          close: { visible: true, text: "คืนค่าขนาดปกติ" },
+        },
+      },
+      events: {
+        ...(isRecord(config.config.events) ? config.config.events : {}),
+        onRequestClose: restore,
+      },
+    };
     const mount = () => {
       if (cancelled) {
         return;
@@ -810,7 +834,7 @@ export const OnlyOfficeEditor = ({
         mountedHost?.replaceChildren();
       }
     };
-  }, [config, configUrl, editorId, readOnly, reportState]);
+  }, [config, configUrl, editorId, readOnly, reportState, restore]);
 
   const retry = () => {
     setError(null);
@@ -910,6 +934,7 @@ export const OnlyOfficeEditor = ({
   return (
     <div
       aria-label={expanded ? title : undefined}
+      aria-describedby={expanded ? keyboardHelpId : undefined}
       aria-modal={expanded ? true : undefined}
       ref={surfaceRef}
       role={expanded ? "dialog" : undefined}
@@ -919,7 +944,13 @@ export const OnlyOfficeEditor = ({
           : "relative"
       }
     >
-      <div className="flex shrink-0 justify-end pb-2">
+      <div className="flex shrink-0 flex-wrap items-center justify-end gap-2 pb-2">
+        {expanded && (
+          <p className="mr-auto text-sm text-[var(--ink-soft)]" id={keyboardHelpId}>
+            คืนขนาดจากในเอกสารด้วยแป้นพิมพ์: กด Alt/Option แล้ว F และเลือก
+            “คืนค่าขนาดปกติ” ตามคำใบ้ของ ONLYOFFICE
+          </p>
+        )}
         <Button
           aria-controls={surfaceId}
           aria-expanded={expanded}
