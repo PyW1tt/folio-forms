@@ -12500,7 +12500,7 @@ test("Ticket 19 PDF authoring re-inspects original bytes when revising a retaine
   ]);
   const firstPrompt = "Create an equipment intake form from the attached PDF";
   const revisionPrompt = "Add a serial number field from the same PDF";
-  const instructionsRevisionPrompt = "Rewrite the instructions to match the attached PDF";
+  const instructionsRevisionPrompt = "Shorten the instructions to match the attached PDF";
   const observations = [
     "PDF observation: the intake requires an employee name.",
     "PDF observation: the intake also requires an equipment serial number.",
@@ -12509,6 +12509,7 @@ test("Ticket 19 PDF authoring re-inspects original bytes when revising a retaine
   const receivedPdfs: Uint8Array[] = [];
   const piMessages: string[] = [];
   let piCalls = 0;
+  let invalidEditDeclaration = false;
   let blockInspection = false;
   const { promise: inspectionStarted, resolve: notifyInspectionStarted } =
     Promise.withResolvers<void>();
@@ -12566,6 +12567,15 @@ test("Ticket 19 PDF authoring re-inspects original bytes when revising a retaine
       const toolCall = piCalls % 2 === 1;
       const generated = {
         description: "Request equipment for work.",
+        ...(revisingInstructions
+          ? {
+              editedParagraphs: [
+                invalidEditDeclaration
+                  ? "This paragraph does not exist in the current document."
+                  : "Complete each field.",
+              ],
+            }
+          : {}),
         fields: [
           {
             label: "Employee Name",
@@ -12578,8 +12588,9 @@ test("Ticket 19 PDF authoring re-inspects original bytes when revising a retaine
         ],
         paragraphs: [
           revisingInstructions
-            ? "Enter the employee name and equipment serial number from the PDF."
+            ? "Enter name, serial."
             : "Complete each field.",
+          ...(invalidEditDeclaration ? ["Route the intake to Facilities."] : []),
         ],
         title: "Equipment Intake",
       };
@@ -12783,15 +12794,42 @@ test("Ticket 19 PDF authoring re-inspects original bytes when revising a retaine
       { headers: { Authorization: `Bearer ${adminBearer}` } }
     ));
     expect(instructionsDownload.status).toBe(200);
-    const instructionsXml = unzipSync(new Uint8Array(await instructionsDownload.arrayBuffer()))["word/document.xml"];
+    const instructionsDocument = new Uint8Array(
+      await instructionsDownload.arrayBuffer()
+    );
+    const instructionsXml = unzipSync(instructionsDocument)["word/document.xml"];
     const instructionsText = new TextDecoder().decode(instructionsXml);
-    expect(instructionsText).toContain("Enter the employee name and equipment serial number from the PDF.");
+    expect(instructionsText).toContain("Enter name, serial.");
     expect(instructionsText).not.toContain("Complete each field.");
     expect(instructionsText).toContain('<w:tag w:val="employee_name"/>');
     expect(instructionsText).toContain('<w:tag w:val="serial_number"/>');
     expect(await (await getCurrent(adminBearer)).json()).toEqual({
       session: instructionsRevised,
     });
+
+    invalidEditDeclaration = true;
+    const invalidRevisionResponse = await pdfApp.handle(
+      revisionRequest(adminBearer, true, "Add a PDF routing note after the instructions")
+    );
+    invalidEditDeclaration = false;
+    expect(invalidRevisionResponse.status).toBe(502);
+    expect(receivedPdfs).toEqual([
+      originalPdf,
+      originalPdf,
+      originalPdf,
+      originalPdf,
+    ]);
+    expect(await (await getCurrent(adminBearer)).json()).toEqual({
+      session: instructionsRevised,
+    });
+    const unchangedDownload = await pdfApp.handle(new Request(
+      `http://test.local${instructionsRevised.downloadUrl}`,
+      { headers: { Authorization: `Bearer ${adminBearer}` } }
+    ));
+    expect(unchangedDownload.status).toBe(200);
+    expect(new Uint8Array(await unchangedDownload.arrayBuffer())).toEqual(
+      instructionsDocument
+    );
     expect((await pdfApp.handle(new Request(
       `${sessionUrl}/${created.sessionId}`,
       { headers: { Authorization: `Bearer ${adminBearer}` }, method: "DELETE" }
@@ -12834,6 +12872,7 @@ test("Ticket 19 PDF authoring re-inspects original bytes when revising a retaine
     activeSessionId = undefined;
     expect((await pdfApp.handle(revisionRequest(adminBearer))).status).toBe(404);
     expect(receivedPdfs).toEqual([
+      originalPdf,
       originalPdf,
       originalPdf,
       originalPdf,

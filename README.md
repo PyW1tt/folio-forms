@@ -183,6 +183,8 @@ Before sending a prompt, the Admin must consent to sending prompt, document cont
 
 Each DOCX contains static text and tagged content controls. Folio validates the complete DOCX package and supported controls before preview or download. The Admin can download the document and upload it as a normal Template Draft. When the isolated document worker is configured and reachable, Pi can use model-generated Python to produce a DOCX; otherwise it offers only the built-in structured document tool. Python runs in a disposable worker container with no network or shell access and bounded CPU, memory, and execution time. Never run generated Python in the API container or mount application data into the worker.
 
+For revisions, the model declares the exact existing paragraphs it intentionally rewrites or removes and the existing field tags it intentionally removes or changes. Folio rejects undeclared paragraph or control loss and declarations that do not reference the current document. Refinement does not require specific English edit keywords.
+
 Compose starts a private Docker-in-Docker daemon and document-worker sidecar; the API receives only `DOCUMENT_WORKER_URL`, never the Docker socket. The daemon needs privileged container support. Neither daemon nor worker HTTP port is published in production. Worker containers do not retain stdout/stderr logs; restarting the sidecar removes abandoned job containers and source workspaces before accepting requests. For local host API testing, run `docker compose -f compose.yaml -f compose.dev.yaml up -d document-worker`, then set `DOCUMENT_WORKER_URL=http://127.0.0.1:3020`. Without a reachable worker, the Python tool is unavailable; structured DOCX generation remains available.
 
 ### User workflow
