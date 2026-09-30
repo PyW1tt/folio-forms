@@ -279,6 +279,7 @@ export const OnlyOfficeEditor = ({
   title: string;
 }) => {
   const hostRef = useRef<HTMLDivElement>(null);
+  const surfaceRef = useRef<HTMLDivElement>(null);
   const feedbackRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<{ destroyEditor?: () => void } | null>(null);
   const onBridgeMessageRef = useRef(onBridgeMessage);
@@ -339,8 +340,31 @@ export const OnlyOfficeEditor = ({
     }
   }, [editorState]);
   useEffect(() => {
-    if (!expanded) {
+    const surface = surfaceRef.current;
+    if (!expanded || !surface) {
       return;
+    }
+
+    const obscured: HTMLElement[] = [];
+    const focusableAncestors: [HTMLElement, string | null][] = [];
+    let branch: HTMLElement = surface;
+    while (branch.parentElement) {
+      const parent = branch.parentElement;
+      for (const sibling of parent.children) {
+        if (
+          sibling instanceof HTMLElement &&
+          sibling !== branch &&
+          !sibling.inert
+        ) {
+          sibling.inert = true;
+          obscured.push(sibling);
+        }
+      }
+      branch = parent;
+      if (parent.tabIndex >= 0) {
+        focusableAncestors.push([parent, parent.getAttribute("tabindex")]);
+        parent.tabIndex = -1;
+      }
     }
 
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -351,7 +375,19 @@ export const OnlyOfficeEditor = ({
     };
 
     window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      for (const sibling of obscured) {
+        sibling.inert = false;
+      }
+      for (const [ancestor, tabIndex] of focusableAncestors) {
+        if (tabIndex === null) {
+          ancestor.removeAttribute("tabindex");
+        } else {
+          ancestor.setAttribute("tabindex", tabIndex);
+        }
+      }
+    };
   }, [expanded]);
 
   useEffect(() => {
@@ -848,6 +884,10 @@ export const OnlyOfficeEditor = ({
 
   return (
     <div
+      aria-label={expanded ? title : undefined}
+      aria-modal={expanded ? true : undefined}
+      ref={surfaceRef}
+      role={expanded ? "dialog" : undefined}
       className={
         expanded
           ? "fixed inset-0 z-[100] flex min-h-0 flex-col overflow-hidden overscroll-none bg-[var(--canvas)] p-3 sm:p-4"
