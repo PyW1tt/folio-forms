@@ -347,24 +347,48 @@ export const OnlyOfficeEditor = ({
 
     const obscured: HTMLElement[] = [];
     const focusableAncestors: [HTMLElement, string | null][] = [];
+    const branches = new Map<HTMLElement, HTMLElement>();
+    const hideSibling = (sibling: Element, activeBranch: HTMLElement) => {
+      if (
+        sibling instanceof HTMLElement &&
+        sibling !== activeBranch &&
+        !sibling.inert
+      ) {
+        sibling.inert = true;
+        obscured.push(sibling);
+      }
+    };
     let branch: HTMLElement = surface;
     while (branch.parentElement) {
       const parent = branch.parentElement;
+      branches.set(parent, branch);
       for (const sibling of parent.children) {
-        if (
-          sibling instanceof HTMLElement &&
-          sibling !== branch &&
-          !sibling.inert
-        ) {
-          sibling.inert = true;
-          obscured.push(sibling);
-        }
+        hideSibling(sibling, branch);
       }
       branch = parent;
       if (parent.tabIndex >= 0) {
         focusableAncestors.push([parent, parent.getAttribute("tabindex")]);
         parent.tabIndex = -1;
       }
+    }
+    const observer = new MutationObserver((records) => {
+      for (const record of records) {
+        const activeBranch =
+          record.target instanceof HTMLElement
+            ? branches.get(record.target)
+            : undefined;
+        if (!activeBranch) {
+          continue;
+        }
+        for (const sibling of record.addedNodes) {
+          if (sibling instanceof Element) {
+            hideSibling(sibling, activeBranch);
+          }
+        }
+      }
+    });
+    for (const parent of branches.keys()) {
+      observer.observe(parent, { childList: true });
     }
 
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -377,6 +401,7 @@ export const OnlyOfficeEditor = ({
     window.addEventListener("keydown", handleKeyDown);
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
+      observer.disconnect();
       for (const sibling of obscured) {
         sibling.inert = false;
       }
