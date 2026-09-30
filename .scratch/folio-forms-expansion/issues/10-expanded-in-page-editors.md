@@ -4,12 +4,14 @@
 
 **Blocked by:** 02: Readable Admin Submission Results.
 
-**Status:** ready-for-agent
+**Status:** ready-for-human
 
-**Verification:** Real browser smoke with valid local ONLYOFFICE configuration loaded Admin design, User fill, read-only Admin Result, and Correction documents. The same iframe stayed mounted through expand and restore on all four surfaces; Correction zoom remained at 110% after restoration, and Result stayed read-only. The restore button worked by pointer and by Enter when focused. Expanded Result background controls became inert and recovered on restore. Browser fullscreen remained inactive.
+**Verification:** Real-browser smoke loaded live ONLYOFFICE documents on User fill, Admin design, read-only Result, and Correction. Pointer restoration and keyboard restoration from document focus retained the same iframe on all four surfaces; focus returned to the expand control, Result remained read-only, and background controls recovered. Correction zoom stayed at 110% and its entered reason survived restoration. Browser fullscreen remained inactive. The expanded control and keyboard guidance fit at 320, 375, 414, and 768 px. Web typecheck, scoped Ultracite, and UI detector passed; both required review axes found no blocking issues.
 
-**Remaining:** With focus inside ONLYOFFICE's document iframe, Escape does not reach the parent, and repeated Shift+Tab did not reach the restore control. A reliable keyboard exit from document focus remains unverified; ONLYOFFICE's documented plugin events expose no global keyboard shortcut. Keep this ticket open until that path is implemented and browser-verified.
+**Keyboard exit:** With focus inside the document, press Alt/Option, then F, then the displayed ONLYOFFICE key tip for “คืนค่าขนาดปกติ” (D on the tested editable surfaces; C on Result). This uses the documented DocsAPI `onRequestClose` event and `customization.close` control to restore the page without closing or remounting the document. Escape still restores when focus is on the parent page; no unsupported vendor keyboard API is used.
 
 - [x] One accessible control expands and restores the iframe on every editor or read-only viewer surface.
-- [ ] Expansion preserves editing/view state, permissions, and ability to leave the mode from keyboard or pointer.
+- [x] Expansion preserves editing/view state, permissions, and ability to leave the mode from keyboard or pointer.
 - [x] Browser smoke covers User fill, Admin design, read-only Result, and Correction without invoking browser fullscreen.
+
+**Suite note:** Final source-suite verification passed 53 tests with 1,598 assertions. Three previously reported, unrelated HTTP failures were filtered out rather than rerun: the broad authenticated workflow's native-picture ZIP equality, Ticket 17 sign-out cleanup, and Ticket 17 shutdown fixture. The existing pending-cleanup diagnostic also appeared; no unrelated code was changed. No ticket-specific blockers remain.

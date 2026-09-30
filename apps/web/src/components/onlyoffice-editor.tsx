@@ -76,6 +76,8 @@ interface FieldSelectionBridgeMessage {
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === "object" && !Array.isArray(value);
+const recordOrEmpty = (value: unknown): Record<string, unknown> =>
+  isRecord(value) ? value : {};
 
 const isNonEmptyString = (value: unknown): value is string =>
   typeof value === "string" && value.length > 0;
@@ -764,22 +766,18 @@ export const OnlyOfficeEditor = ({
       };
     }
 
-    const documentEditorConfig = isRecord(config.config.editorConfig)
-      ? config.config.editorConfig
-      : {};
+    const documentEditorConfig = recordOrEmpty(config.config.editorConfig);
     const editorConfig = {
       ...config.config,
       editorConfig: {
         ...documentEditorConfig,
         customization: {
-          ...(isRecord(documentEditorConfig.customization)
-            ? documentEditorConfig.customization
-            : {}),
-          close: { visible: true, text: "คืนค่าขนาดปกติ" },
+          ...recordOrEmpty(documentEditorConfig.customization),
+          close: { text: "คืนค่าขนาดปกติ", visible: true },
         },
       },
       events: {
-        ...(isRecord(config.config.events) ? config.config.events : {}),
+        ...recordOrEmpty(config.config.events),
         onRequestClose: restore,
       },
     };
@@ -946,7 +944,10 @@ export const OnlyOfficeEditor = ({
     >
       <div className="flex shrink-0 flex-wrap items-center justify-end gap-2 pb-2">
         {expanded && (
-          <p className="mr-auto text-sm text-[var(--ink-soft)]" id={keyboardHelpId}>
+          <p
+            className="mr-auto text-sm text-[var(--ink-soft)]"
+            id={keyboardHelpId}
+          >
             คืนขนาดจากในเอกสารด้วยแป้นพิมพ์: กด Alt/Option แล้ว F และเลือก
             “คืนค่าขนาดปกติ” ตามคำใบ้ของ ONLYOFFICE
           </p>
