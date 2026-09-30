@@ -5039,6 +5039,20 @@ function parseTemplateFields(
         if (alternateFallbackDepth > 0) {
           return;
         }
+        if (content && templateWordNamespaces.has(element.uri)) {
+          if (element.local === "t") {
+            textDepth -= 1;
+          }
+          if (element.local.endsWith("Pr")) {
+            propertyDepth -= 1;
+          }
+          if (element.local === "p") {
+            const text = paragraphs.pop()?.text.trim();
+            if (text) {
+              content.paragraphs.push(text);
+            }
+          }
+        }
         const frame = controls.at(-1);
         if (!frame) {
           return;
@@ -5086,6 +5100,17 @@ function parseTemplateFields(
         }
         if (alternateFallbackDepth > 0) {
           return;
+        }
+        if (content && templateWordNamespaces.has(element.uri)) {
+          if (element.local === "t") {
+            textDepth += 1;
+          }
+          if (element.local.endsWith("Pr")) {
+            propertyDepth += 1;
+          }
+          if (element.local === "p") {
+            paragraphs.push({ text: "" });
+          }
         }
         if (
           element.local === "sdt" &&
@@ -5579,20 +5604,6 @@ function validateResponsePictureControls(
         if (alternateFallbackDepth > 0) {
           return;
         }
-        if (content && templateWordNamespaces.has(element.uri)) {
-          if (element.local === "t") {
-            textDepth -= 1;
-          }
-          if (element.local.endsWith("Pr")) {
-            propertyDepth -= 1;
-          }
-          if (element.local === "p") {
-            const text = paragraphs.pop()?.text.trim();
-            if (text) {
-              content.paragraphs.push(text);
-            }
-          }
-        }
         const frame = controls.at(-1);
         if (!frame) {
           return;
@@ -5634,17 +5645,6 @@ function validateResponsePictureControls(
         }
         if (alternateFallbackDepth > 0) {
           return;
-        }
-        if (content && templateWordNamespaces.has(element.uri)) {
-          if (element.local === "t") {
-            textDepth += 1;
-          }
-          if (element.local.endsWith("Pr")) {
-            propertyDepth += 1;
-          }
-          if (element.local === "p") {
-            paragraphs.push({ text: "" });
-          }
         }
         if (
           element.local === "sdt" &&
