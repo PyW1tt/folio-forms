@@ -172,6 +172,8 @@ const maxTemplateUploadBytes = 25 * 1024 * 1024;
 const maxTemplateMultipartOverheadBytes = 64 * 1024;
 const maxTemplateMultipartBodyBytes =
   maxTemplateUploadBytes + maxTemplateMultipartOverheadBytes;
+const maxAuthoringPdfBytes = 10 * 1024 * 1024;
+const maxAuthoringMultipartBodyBytes = 11 * 1024 * 1024;
 const maxTemplateArchiveExpandedBytes = 64 * 1024 * 1024;
 const maxTemplateArchiveEntries = 2048;
 const maxCallbackDocumentBytes = maxTemplateUploadBytes;
@@ -705,6 +707,79 @@ async function readJsonRecord(
   } catch {
     fail(400, "invalid_request", "Request body must be valid JSON");
   }
+}
+
+async function readAuthoringCreationInput(
+  request: Request
+): Promise<{ consent: unknown; pdfBytes?: Uint8Array; prompt: string }> {
+  const contentType = request.headers.get("content-type");
+  if (!contentType || !/^multipart\/form-data(?:\s*;|$)/iu.test(contentType)) {
+    const input = await readJsonRecord(request, accountBodyMaximumBytes);
+    if (
+      Object.keys(input).length !== 2 ||
+      !Object.hasOwn(input, "consent") ||
+      !Object.hasOwn(input, "prompt") ||
+      typeof input.prompt !== "string"
+    ) {
+      fail(400, "invalid_request", "Only consent and prompt are accepted");
+    }
+    return { consent: input.consent, prompt: input.prompt };
+  }
+
+  const requestBytes = await readRequestBytes(
+    request,
+    maxAuthoringMultipartBodyBytes,
+    "Multipart form data is required"
+  );
+  const multipartRequest = new Request(request.url, {
+    body: requestBytes,
+    headers: { "content-type": contentType },
+    method: "POST",
+  });
+  const formData = await multipartRequest.formData().catch(() => {
+    fail(400, "invalid_request", "Multipart form data is invalid");
+  });
+  const entries = new Map<string, unknown>();
+  for (const [key, value] of formData.entries()) {
+    if (key !== "prompt" && key !== "consent" && key !== "pdf") {
+      fail(400, "invalid_request", "Only prompt, consent, and pdf are accepted");
+    }
+    if (entries.has(key)) {
+      fail(400, "invalid_request", `${key} must be provided once`);
+    }
+    entries.set(key, value);
+  }
+  const prompt = entries.get("prompt");
+  const consent = entries.get("consent");
+  const pdf = entries.get("pdf");
+  if (typeof prompt !== "string" || (consent !== undefined && typeof consent !== "string")) {
+    fail(400, "invalid_request", "prompt and consent must be text");
+  }
+  if (!(pdf instanceof File)) {
+    fail(400, "invalid_request", "pdf is required");
+  }
+  const normalizedType = pdf.type.trim().toLowerCase();
+  if (
+    normalizedType !== "" &&
+    normalizedType !== "application/octet-stream" &&
+    normalizedType !== "application/pdf"
+  ) {
+    fail(415, "invalid_file_type", "Source must be a PDF file");
+  }
+  if (pdf.size > maxAuthoringPdfBytes) {
+    fail(413, "payload_too_large", "Source PDF is too large");
+  }
+  const pdfBytes = new Uint8Array(await pdf.arrayBuffer());
+  if (
+    pdfBytes[0] !== 0x25 ||
+    pdfBytes[1] !== 0x50 ||
+    pdfBytes[2] !== 0x44 ||
+    pdfBytes[3] !== 0x46 ||
+    pdfBytes[4] !== 0x2d
+  ) {
+    fail(415, "invalid_file_type", "Source must be a PDF file");
+  }
+  return { consent: consent === "true", pdfBytes, prompt };
 }
 
 interface TemplateCreationInput {
@@ -9734,6 +9809,57 @@ export function createApp(options: AppOptions = {}) {
         const identity = await requireIdentity(request);
         requireAdmin(identity);
         const reservation = aiAuthoring.reserveRequest(identity.sessionId);
+        let sourcePdf: Uint8Array | undefined;
+        try {
+          const input = await readAuthoringCreationInput(request);
+          sourcePdf = input.pdfBytes;
+          const session = await aiAuthoring.create(
+            { authSessionId: identity.sessionId, userId: identity.id },
+            input.prompt,
+            input.consent,
+            (document) => validateTemplateControls(document),
+            reservation,
+            async () => {
+              const currentIdentity = await identityFor(request);
+              return (
+                currentIdentity !== null &&
+                currentIdentity.id === identity.id &&
+                currentIdentity.sessionId === identity.sessionId &&
+                currentIdentity.role === "admin" &&
+                (!currentIdentity.mustChangePassword || currentIdentity.isSso)
+              );
+            },
+            input.pdfBytes
+          );
+          return { session };
+        } finally {
+          sourcePdf?.fill(0);
+          aiAuthoring.releaseRequest(reservation);
+        }
+      },
+      { parse: "none" }
+    )
+    .get(
+      "/api/admin/ai-authoring/sessions/current",
+      async ({ request }) => {
+        const identity = await requireIdentity(request);
+        requireAdmin(identity);
+        const session = await aiAuthoring.current({
+          authSessionId: identity.sessionId,
+          userId: identity.id,
+        });
+        return Response.json(
+          { session },
+          { headers: { "Cache-Control": "private, no-store" } }
+        );
+      }
+    )
+    .post(
+      "/api/admin/ai-authoring/sessions/:sessionId/revisions",
+      async ({ request, params }) => {
+        const identity = await requireIdentity(request);
+        requireAdmin(identity);
+        const reservation = aiAuthoring.reserveRequest(identity.sessionId);
         try {
           const input = await readJsonRecord(request, accountBodyMaximumBytes);
           if (
@@ -9742,9 +9868,14 @@ export function createApp(options: AppOptions = {}) {
             !Object.hasOwn(input, "prompt") ||
             typeof input.prompt !== "string"
           ) {
-            fail(400, "invalid_request", "Only consent and prompt are accepted");
+            fail(
+              400,
+              "invalid_request",
+              "Only consent and prompt are accepted"
+            );
           }
-          const session = await aiAuthoring.create(
+          const session = await aiAuthoring.revise(
+            params.sessionId,
             { authSessionId: identity.sessionId, userId: identity.id },
             input.prompt,
             input.consent,
@@ -9761,7 +9892,10 @@ export function createApp(options: AppOptions = {}) {
               );
             }
           );
-          return { session };
+          return Response.json(
+            { session },
+            { headers: { "Cache-Control": "private, no-store" } }
+          );
         } finally {
           aiAuthoring.releaseRequest(reservation);
         }

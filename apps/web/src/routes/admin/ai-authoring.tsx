@@ -1,7 +1,7 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { Download, FileCheck2, WandSparkles } from "lucide-react";
-import type { FormEvent } from "react";
-import { useEffect, useState } from "react";
+import type { ChangeEvent, FormEvent } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { PageHeader } from "@/components/app-shell";
 import { Button, Card, Input, Notice, Spinner, Textarea } from "@/components/ui";
@@ -18,6 +18,8 @@ import type { FormSummary } from "@/lib/api";
 
 const docxContentType =
   "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+const maximumSourcePdfBytes = 10 * 1024 * 1024;
+const pdfOnlyInstruction = "Create a form based on the attached PDF.";
 interface AiAuthoringStatus {
   disclosure: string;
   enabled: boolean;
@@ -32,12 +34,17 @@ interface AuthoringPreview {
   description: string;
   downloadUrl: string;
   fields: GeneratedField[];
+  hasSourcePdf: boolean;
   paragraphs: string[];
   sessionId: string;
   title: string;
+  turns: { prompt: string; assistantMessage: string }[];
 }
 interface AuthoringStartResponse {
   session: AuthoringPreview;
+}
+interface CurrentAuthoringResponse {
+  session: AuthoringPreview | null;
 }
 interface CreateTemplateDraftResponse {
   form: FormSummary;
@@ -46,6 +53,12 @@ interface CreateTemplateDraftResponse {
 const authoringErrorMessage = (error: unknown): string => {
   if (!(error instanceof ApiError)) {
     return "AI Authoring is unavailable. Try again later.";
+  }
+  if (error.status === 413 || error.code === "payload_too_large") {
+    return "PDF must be 10 MiB or smaller.";
+  }
+  if (error.code === "invalid_file_type") {
+    return "Choose a valid PDF file.";
   }
   if (error.code === "forbidden") {
     return "Only Admins can use AI Authoring.";
@@ -66,18 +79,25 @@ const AiAuthoringRoute = () => {
   const navigate = useNavigate();
   const [status, setStatus] = useState<AiAuthoringStatus | null>(null);
   const [prompt, setPrompt] = useState("");
+  const [sourcePdf, setSourcePdf] = useState<File | null>(null);
+  const [revisionPrompt, setRevisionPrompt] = useState("");
   const [consent, setConsent] = useState(false);
   const [preview, setPreview] = useState<AuthoringPreview | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const sourcePdfInput = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     let active = true;
-    apiGet<AiAuthoringStatus>("/api/admin/ai-authoring")
-      .then((result) => {
+    Promise.all([
+      apiGet<AiAuthoringStatus>("/api/admin/ai-authoring"),
+      apiGet<CurrentAuthoringResponse>("/api/admin/ai-authoring/sessions/current"),
+    ])
+      .then(([authoringStatus, current]) => {
         if (active) {
-          setStatus(result);
+          setStatus(authoringStatus);
+          setPreview(current.session);
         }
       })
       .catch((caughtError: unknown) => {
@@ -95,19 +115,53 @@ const AiAuthoringRoute = () => {
     };
   }, []);
 
+  const clearSourcePdf = () => {
+    setSourcePdf(null);
+    if (sourcePdfInput.current) {
+      sourcePdfInput.current.value = "";
+    }
+  };
+
+  const selectSourcePdf = (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0] ?? null;
+    setConsent(false);
+    if (file && file.size > maximumSourcePdfBytes) {
+      clearSourcePdf();
+      setError("PDF must be 10 MiB or smaller.");
+      return;
+    }
+    setSourcePdf(file);
+    setError(null);
+  };
+
   const createDocument = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (busy || !status?.enabled || !consent || !prompt.trim()) {
+    const instruction = prompt.trim() || (sourcePdf ? pdfOnlyInstruction : "");
+    if (busy || !status?.enabled || !consent || !instruction) {
       return;
     }
     setBusy(true);
     setError(null);
     try {
-      const result = await apiPost<AuthoringStartResponse>(
-        "/api/admin/ai-authoring/sessions",
-        { consent: true, prompt }
-      );
+      let result: AuthoringStartResponse;
+      if (sourcePdf) {
+        const formData = new FormData();
+        formData.set("prompt", instruction);
+        formData.set("consent", "true");
+        formData.set("pdf", sourcePdf);
+        result = await apiPostFormData<AuthoringStartResponse>(
+          "/api/admin/ai-authoring/sessions",
+          formData
+        );
+      } else {
+        result = await apiPost<AuthoringStartResponse>(
+          "/api/admin/ai-authoring/sessions",
+          { consent: true, prompt }
+        );
+      }
       setPreview(result.session);
+      clearSourcePdf();
+      setPrompt("");
     } catch (caughtError) {
       setError(authoringErrorMessage(caughtError));
     } finally {
@@ -115,6 +169,37 @@ const AiAuthoringRoute = () => {
     }
   };
 
+  const reviseDocument = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (
+      !preview ||
+      busy ||
+      !status?.enabled ||
+      !consent ||
+      !revisionPrompt.trim()
+    ) {
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      const result = await apiPost<AuthoringStartResponse>(
+        `/api/admin/ai-authoring/sessions/${preview.sessionId}/revisions`,
+        { consent: true, prompt: revisionPrompt }
+      );
+      setPreview(result.session);
+      setRevisionPrompt("");
+    } catch (caughtError) {
+      if (caughtError instanceof ApiError && caughtError.status === 404) {
+        setPreview(null);
+        setError("This authoring session expired. Start a new document.");
+      } else {
+        setError(authoringErrorMessage(caughtError));
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
   const download = async () => {
     if (!preview || busy) {
       return;
@@ -171,12 +256,16 @@ const AiAuthoringRoute = () => {
         `/api/admin/ai-authoring/sessions/${preview.sessionId}`
       );
       setPreview(null);
+      clearSourcePdf();
       setPrompt("");
+      setRevisionPrompt("");
       setConsent(false);
     } catch (caughtError) {
       if (caughtError instanceof ApiError && caughtError.status === 404) {
         setPreview(null);
+        clearSourcePdf();
         setPrompt("");
+        setRevisionPrompt("");
         setConsent(false);
       } else {
         setError(authoringErrorMessage(caughtError));
@@ -198,14 +287,94 @@ const AiAuthoringRoute = () => {
     <div className="mx-auto max-w-3xl">
       <PageHeader
         title="AI Authoring"
-        description="Describe a form in text. Preview the generated DOCX, then upload it into a normal Template Draft."
+        description="Describe a form, refine its DOCX with follow-up instructions, then upload it into a Template Draft."
       />
       {error ? <Notice tone="danger">{error}</Notice> : null}
       {preview ? (
         <div className="space-y-5">
-          <Notice tone="success">
-            {preview.assistantMessage}
-          </Notice>
+          <section aria-label="Authoring conversation" className="space-y-4">
+            <h2 className="text-xl font-bold">Conversation</h2>
+            {preview.hasSourcePdf ? (
+              <p className="text-sm text-[var(--ink-soft)]">
+                Source PDF retained for this session. Each revision re-inspects
+                the original PDF; no re-upload needed.
+              </p>
+            ) : null}
+            <ol className="space-y-4">
+              {preview.turns.map((turn, index) => (
+                <li className="space-y-3" key={`${index}-${turn.prompt}`}>
+                  <div>
+                    <h3 className="text-sm font-semibold">Your instruction</h3>
+                    <p className="whitespace-pre-wrap break-words">
+                      {turn.prompt}
+                    </p>
+                  </div>
+                  <div>
+                    <h3 className="text-sm font-semibold">AI response</h3>
+                    <p className="whitespace-pre-wrap break-words text-[var(--ink-soft)]">
+                      {turn.assistantMessage}
+                    </p>
+                  </div>
+                </li>
+              ))}
+            </ol>
+          </section>
+          <Card className="space-y-5 p-5 sm:p-7">
+            <h2 className="text-xl font-bold">Refine this document</h2>
+            <form
+              aria-busy={busy}
+              className="space-y-5"
+              onSubmit={reviseDocument}
+            >
+              <label className="block space-y-2">
+                <span className="font-semibold">Next instruction</span>
+                <Textarea
+                  disabled={!status?.enabled || busy}
+                  maxLength={16_000}
+                  onChange={(event) => setRevisionPrompt(event.target.value)}
+                  placeholder="For example: Add an approval date and make the equipment list clearer."
+                  required
+                  rows={4}
+                  value={revisionPrompt}
+                />
+              </label>
+              <Notice>
+                {status?.disclosure ??
+                  "Your prompt and document content go to OmniRoute and its configured provider. Folio Forms cannot promise upstream deletion."}
+                {preview.hasSourcePdf
+                  ? " The original source PDF is sent again with each revision."
+                  : null}
+              </Notice>
+              <label className="flex items-start gap-3 text-sm">
+                <input
+                  checked={consent}
+                  className="mt-1 size-4 accent-[var(--ink)]"
+                  disabled={!status?.enabled || busy}
+                  onChange={(event) => setConsent(event.target.checked)}
+                  required
+                  type="checkbox"
+                />
+                <span>
+                  I consent to sending this instruction, document content
+                  {preview.hasSourcePdf ? ", and the original PDF" : ""} to
+                  OmniRoute and its configured provider.
+                </span>
+              </label>
+              <Button
+                disabled={
+                  !status?.enabled || busy || !consent || !revisionPrompt.trim()
+                }
+                type="submit"
+              >
+                {busy ? (
+                  <Spinner />
+                ) : (
+                  <WandSparkles size={16} />
+                )}
+                {busy ? "Updating DOCX…" : "Update DOCX"}
+              </Button>
+            </form>
+          </Card>
           <Card className="space-y-5 p-5 sm:p-7" aria-label="Read-only DOCX preview">
             <div>
               <h2 className="text-2xl font-bold">{preview.title}</h2>
@@ -275,14 +444,43 @@ const AiAuthoringRoute = () => {
                 maxLength={16_000}
                 onChange={(event) => setPrompt(event.target.value)}
                 placeholder="For example: Create an employee equipment request form with name, department, requested items, and approval notes."
-                required
+                required={!sourcePdf}
                 rows={7}
                 value={prompt}
               />
+              <span className="block text-xs text-[var(--ink-soft)]">
+                Optional when attaching a PDF. Without an instruction, we’ll
+                create a form based on the PDF.
+              </span>
             </label>
+            <div>
+              <label className="block font-semibold" htmlFor="source-pdf">
+                Source PDF (optional)
+              </label>
+              <input
+                accept="application/pdf"
+                aria-describedby="source-pdf-hint"
+                className="mt-2 min-h-11 w-full rounded-[10px] border border-[var(--line-strong)] bg-[var(--paper)] px-3 text-[var(--ink)] shadow-sm focus:border-[var(--ink)] focus:outline-none file:mr-3 file:rounded-md file:border-0 file:bg-[var(--accent-soft)] file:px-3 file:py-2 file:font-semibold"
+                disabled={!status?.enabled || busy}
+                id="source-pdf"
+                onChange={selectSourcePdf}
+                ref={sourcePdfInput}
+                type="file"
+              />
+              <p
+                className="mt-1 text-xs text-[var(--ink-soft)]"
+                id="source-pdf-hint"
+              >
+                PDF up to 10 MiB. The original PDF stays in this session for
+                later revisions.
+              </p>
+            </div>
             <Notice>
               {status?.disclosure ??
                 "Your prompt and document content go to OmniRoute and its configured provider. Folio Forms cannot promise upstream deletion."}
+              {sourcePdf
+                ? " The original PDF is sent now and again with each revision. Folio Forms retains it until this session ends; upstream deletion cannot be promised."
+                : null}
             </Notice>
             <label className="flex items-start gap-3 text-sm">
               <input
@@ -296,10 +494,13 @@ const AiAuthoringRoute = () => {
               <span>
                 I consent to sending this prompt and generated document content
                 to OmniRoute and its configured provider.
+                {sourcePdf
+                  ? " I also consent to sending the original PDF now and on future revisions."
+                  : null}
               </span>
             </label>
             <Button
-              disabled={!status?.enabled || busy || !consent || !prompt.trim()}
+              disabled={!status?.enabled || busy || !consent || (!prompt.trim() && !sourcePdf)}
               type="submit"
             >
               {busy ? <Spinner /> : <WandSparkles size={16} />}
