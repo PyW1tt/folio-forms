@@ -201,6 +201,8 @@ The prefill is snapshotted when the response starts. Resuming a draft does not r
 
 Static document images remain non-editable. Picture input uses ONLYOFFICE's native control; the canonical DOCX is authoritative, with no separate image upload or image object. Submission is complete only after the extracted field JSON and canonical filled DOCX are persisted. PDF is an on-demand export and is not durable submission state.
 
+Saving may rewrite the DOCX ZIP container while preserving embedded image bytes and their document relationships. Corrections preserve the original Submission and save a separate revised document.
+
 ### External editable Prefill handoff
 
 An external system uses the deterministic mock's schema pointers, then calls `POST /api/integrations/prefill/handoffs` with `X-Prefill-Handoff-Secret` (the deployment-only `PREFILL_HANDOFF_SECRET`, distinct from the editor capability, auth, and ONLYOFFICE JWT secrets) and the published Form public ID, normalized email, external reference, and candidate scalar object. Folio filters the candidate through the immutable Prefill Configuration and retains only configured tag values. Invalid credentials and unavailable Forms return the same non-enumerating failure. The runnable deterministic mock lives in `apps/prefill-mock`: set `FOLIO_ORIGIN` and the distinct `PREFILL_HANDOFF_SECRET`, then run `bun run --cwd apps/prefill-mock start`. Its `/schema` endpoint returns the fixed scalar-pointer catalog, `/handoffs` is the narrow server-to-server connector, and `/launch` renders a form whose browser submits the code directly to Folio so the pending cookie remains scoped to the Folio host.
@@ -460,6 +462,15 @@ docker compose --env-file .env.production -f compose.yaml down
 ```
 
 Run `bun run --cwd apps/server test:http` and `bun run --cwd apps/server test:storage` against an isolated PostgreSQL database and disposable private RustFS bucket.
+
+For the complete source suite, build the Prefill mock first and pass explicit source paths so generated `dist` tests are not included:
+
+```bash
+bun run --cwd apps/prefill-mock build
+bun test --timeout 120000 ./apps/server/test/http.test.ts ./apps/server/test/storage.test.ts ./apps/web/test/form-lifecycle.test.ts ./apps/onlyoffice-plugin/plugin.test.js
+```
+
+Provide the same isolated database and storage environment to both commands. Use a fresh disposable database for each full run; the scenarios retain records, including paginated account-link fixtures and immutable audit history. Set `DOCUMENT_WORKER_URL` to a running isolated document worker to exercise the Python-worker scenario.
 
 ## Troubleshooting
 

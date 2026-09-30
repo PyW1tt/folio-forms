@@ -29,11 +29,11 @@ import { Elysia } from "elysia";
 import { strToU8, unzipSync, zipSync } from "fflate";
 import { SaxesParser } from "saxes";
 import {
-  AiAuthoringError,
   AiAuthoringSessions,
   authoringDisclosure,
 } from "./ai-authoring";
 import type { GeneratedTemplate, OmniRouteConfig } from "./ai-authoring";
+import { AiAuthoringError } from "./ai-authoring-error";
 
 import {
   callbackClaim,
@@ -184,6 +184,8 @@ const passwordMinimumLength = 12;
 const passwordMaximumLength = 128;
 const correctionReasonMaximumLength = 2000;
 const maxResponseDataBytes = 256 * 1024;
+const maxNativePictureMultipartOverheadBytes =
+  maxResponseDataBytes + maxTemplateMultipartOverheadBytes;
 const maxResponseTextLength = 10_000;
 const fieldRuleBodyMaximumBytes = 8 * 1024;
 const dateFieldPattern = /^\d{4}-\d{2}-\d{2}$/u;
@@ -12409,11 +12411,14 @@ export function createApp(options: AppOptions = {}) {
     })
     .post(
       "/api/forms/:publicId/draft",
-      async ({ request, params, body, set }) => {
+      async ({ request, params, set }) => {
         const authorization = await requireActionEditorAuthorization(request);
         const { actor: identity } = authorization;
         const form = await findFormByPublicId(params.publicId);
-        const input = asRecord(body);
+        const input = await readJsonRecord(
+          request,
+          maxNativePictureMultipartOverheadBytes
+        );
         requireCurrentFillMethod(form, input);
         const responseId = requiredString(input, "responseId");
         const documentKey = requiredString(input, "documentKey");
@@ -12503,15 +12508,19 @@ export function createApp(options: AppOptions = {}) {
           responseId: response.id,
           status: operation.status,
         };
-      }
+      },
+      { parse: "none" }
     )
     .post(
       "/api/forms/:publicId/submit",
-      async ({ request, params, body, set }) => {
+      async ({ request, params, set }) => {
         const authorization = await requireActionEditorAuthorization(request);
         const { actor: identity } = authorization;
         const form = await findFormByPublicId(params.publicId);
-        const input = asRecord(body);
+        const input = await readJsonRecord(
+          request,
+          maxNativePictureMultipartOverheadBytes
+        );
         requireCurrentFillMethod(form, input);
         const responseId = requiredString(input, "responseId");
         const documentKey = requiredString(input, "documentKey");
@@ -12674,7 +12683,8 @@ export function createApp(options: AppOptions = {}) {
           status: operation.status,
           submissionId,
         };
-      }
+      },
+      { parse: "none" }
     )
     .get("/api/operations/:id", async ({ request, params }) => {
       const authorization = await editorAuthorization(request);

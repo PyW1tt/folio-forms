@@ -151,7 +151,7 @@ const pngFixture = (
   width = 1,
   height = 1,
   byteLength = onePixelPng.byteLength
-): Uint8Array => {
+): Uint8Array<ArrayBuffer> => {
   const bytes = new Uint8Array(byteLength);
   bytes.set(onePixelPng.subarray(0, Math.min(onePixelPng.length, byteLength)));
   const writeUint32 = (value: number, offset: number) => {
@@ -164,7 +164,7 @@ const pngFixture = (
   writeUint32(height, 20);
   return bytes;
 };
-const jpegFixture = (width = 1, height = 1): Uint8Array =>
+const jpegFixture = (width = 1, height = 1): Uint8Array<ArrayBuffer> =>
   Uint8Array.from([
     0xff,
     0xd8,
@@ -4474,9 +4474,17 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   if (!savedPictureResponse.draftObjectKey) {
     throw new Error("The saved picture draft object was not persisted");
   }
-  expect(await readObject(savedPictureResponse.draftObjectKey)).toEqual(
-    validPictureDocument
+  const savedPictureArchive = unzipSync(
+    await readObject(savedPictureResponse.draftObjectKey)
   );
+  expect(savedPictureArchive["word/media/image1.png"]).toEqual(pngFixture());
+  expect(savedPictureArchive["word/media/image2.png"]).toEqual(pngFixture());
+  expect(
+    new TextDecoder().decode(savedPictureArchive["word/document.xml"])
+  ).toContain('r:embed="rIdPicture1"');
+  expect(
+    new TextDecoder().decode(savedPictureArchive["word/document.xml"])
+  ).toContain('r:embed="rIdStatic"');
   const resumedPictureStartResponse = await pictureApp.handle(
     new Request(
       `http://test.local/api/forms/${requiredPicturePublicId}/start`,
@@ -4495,9 +4503,12 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
       { headers: { Authorization: `Bearer ${adminBearer}` } }
     )
   );
-  expect(new Uint8Array(await pictureDocxExport.arrayBuffer())).toEqual(
-    Uint8Array.from(validPictureDocument)
+  expect(pictureDocxExport.status).toBe(200);
+  const exportedPictureArchive = unzipSync(
+    new Uint8Array(await pictureDocxExport.arrayBuffer())
   );
+  expect(exportedPictureArchive["word/media/image1.png"]).toEqual(pngFixture());
+  expect(exportedPictureArchive["word/media/image2.png"]).toEqual(pngFixture());
   const picturePdfExport = await pictureApp.handle(
     new Request(
       `http://test.local/api/responses/${pictureResponseId}/draft/pdf`,
@@ -4633,9 +4644,11 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     where: { responseId: pictureResponseId },
   });
   expect(pictureSubmission.data).toEqual({});
-  expect(await readObject(pictureSubmission.objectKey)).toEqual(
-    nextPictureDocument
-  );
+  expect(
+    unzipSync(await readObject(pictureSubmission.objectKey))[
+      "word/media/image1.jpg"
+    ]
+  ).toEqual(jpegFixture());
   const pictureCorrectionEditorResponse = await app.handle(
     new Request(
       `http://test.local/api/admin/results/${pictureResponseId}/correction/editor-config`,
@@ -4687,9 +4700,11 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     where: { responseId: pictureResponseId },
   });
   expect(pictureCorrection).toMatchObject({ data: {}, revision: 1 });
-  expect(await readObject(pictureCorrection.objectKey)).toEqual(
-    nextPictureDocument
-  );
+  expect(
+    unzipSync(await readObject(pictureCorrection.objectKey))[
+      "word/media/image1.jpg"
+    ]
+  ).toEqual(jpegFixture());
   await putObject(
     pictureCorrection.objectKey,
     pictureDocumentFixture(),
@@ -6856,16 +6871,23 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     { data: { department: "not-an-option" }, status: 422 },
     { data: { start_date: "2026-02-30" }, status: 422 },
     { data: { description_1: "x".repeat(10_001) }, status: 422 },
-    { data: { description_1: "🙂".repeat(100_000) }, status: 413 },
+    {
+      data: { description_1: "🙂".repeat(70_000) },
+      error: "response_too_large",
+      status: 413,
+    },
+    {
+      data: { description_1: "🙂".repeat(100_000) },
+      error: "payload_too_large",
+      status: 413,
+    },
   ];
   for (const invalidDraftCase of invalidDraftCases) {
     const invalidDraftResponse = await draftRequest(invalidDraftCase.data);
     expect(invalidDraftResponse.status).toBe(invalidDraftCase.status);
     expect(await invalidDraftResponse.json()).toHaveProperty(
       "error",
-      invalidDraftCase.status === 413
-        ? "response_too_large"
-        : "invalid_response_data"
+      invalidDraftCase.error ?? "invalid_response_data"
     );
   }
   const trustedPrefillValue = selectedPointer.endsWith("/active")
@@ -6954,6 +6976,42 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
       error: "invalid_response_data",
     });
   }
+
+  const draftBeforeClear = await prisma.response.findUniqueOrThrow({
+    select: { draftObjectKey: true },
+    where: { id: responseId },
+  });
+  if (!draftBeforeClear.draftObjectKey) {
+    throw new Error("The editable response document is missing");
+  }
+  const clearedDraftArchive = unzipSync(
+    await readObject(draftBeforeClear.draftObjectKey)
+  );
+  const draftBeforeClearXml = new TextDecoder().decode(
+    clearedDraftArchive["word/document.xml"]
+  );
+  const descriptionControl =
+    /(?<opening><w:tag\b[^>]*\bw:val="description_2"\s*\/>[\s\S]*?<w:sdtContent\b[^>]*>)(?<content>[\s\S]*?)<\/w:sdtContent>/u;
+  const descriptionContent =
+    descriptionControl.exec(draftBeforeClearXml)?.groups?.content;
+  if (descriptionContent === undefined) {
+    throw new Error("The editable description field is missing");
+  }
+  // Model the editor clearing this field before its unchanged force-save reply.
+  const clearedDescriptionContent = descriptionContent
+    .replaceAll(/<w:t\b[^>]*>[\s\S]*?<\/w:t>/gu, "<w:t></w:t>")
+    .replaceAll(/<w:br\b[^>]*\/>/gu, "");
+  clearedDraftArchive["word/document.xml"] = strToU8(
+    draftBeforeClearXml.replace(
+      descriptionControl,
+      `$<opening>${clearedDescriptionContent}</w:sdtContent>`
+    )
+  );
+  await putObject(
+    draftBeforeClear.draftObjectKey,
+    zipSync(clearedDraftArchive),
+    DOCX_CONTENT_TYPE
+  );
 
   const saveResponse = await app.handle(
     new Request(`http://test.local/api/forms/${formRecord.publicId}/draft`, {
@@ -7808,7 +7866,6 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     throw new Error("The test template draft was not found");
   }
   const sourceDocument = await readObject(templateDraft.objectKey);
-  expect(submissionDocument).toEqual(Uint8Array.from(sourceDocument));
   const adminDocxResponse = await app.handle(
     new Request(
       `http://test.local/api/submissions/${completedSubmissionId}/docx`,
@@ -10977,12 +11034,14 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
         ? (event.safeMetadata as Record<string, unknown>)
         : null;
     expect(
-      Object.keys(metadata ?? {}).every(
-        (key) =>
+      Object.entries(metadata ?? {}).every(
+        ([key, value]) =>
           key === "errorCode" ||
           key === "source" ||
           key === "sourcePublicId" ||
-          key === "status"
+          key === "status" ||
+          (key === "fillMethod" &&
+            (value === "native" || value === "onlyoffice"))
       )
     ).toBe(true);
   }
@@ -11271,9 +11330,16 @@ test("Ticket 17 sign-out always revokes and clears tombstones after failures", a
       lastActivity: Date;
       ownerSessionId: string;
       piSession: { dispose: () => void };
-      prompt: string;
-      reply: string;
       tempDirectory: string;
+      toolState: {
+        pending: {
+          cancelled: boolean;
+          done: Promise<void>;
+          inspectionAbort: AbortController;
+          started: boolean;
+        };
+      };
+      turns: { assistantMessage: string; prompt: string }[];
       userId: string;
     }
   >;
@@ -11282,6 +11348,9 @@ test("Ticket 17 sign-out always revokes and clears tombstones after failures", a
     join(tmpdir(), "folio-authoring-cleanup-")
   );
   const cleanupDocument = new Uint8Array([1]);
+  const cleanupTurns = [
+    { assistantMessage: "private reply", prompt: "private prompt" },
+  ];
   let cleanupTimerFired = false;
   vi.useFakeTimers();
   const cleanupTimer = setTimeout(() => {
@@ -11297,9 +11366,16 @@ test("Ticket 17 sign-out always revokes and clears tombstones after failures", a
         throw cleanupError;
       },
     },
-    prompt: "",
-    reply: "",
     tempDirectory: cleanupDirectory,
+    toolState: {
+      pending: {
+        cancelled: false,
+        done: Promise.resolve(),
+        inspectionAbort: new AbortController(),
+        started: false,
+      },
+    },
+    turns: cleanupTurns,
     userId: "user",
   });
   let revocationAttempted = false;
@@ -11315,6 +11391,8 @@ test("Ticket 17 sign-out always revokes and clears tombstones after failures", a
     expect(revocationAttempted).toBe(true);
     expect(cleanupErrorPropagated).toBe(true);
     expect(cleanupDocument).toEqual(new Uint8Array([0]));
+    expect(cleanupTurns).toEqual([]);
+    expect(sessions.size).toBe(0);
     vi.advanceTimersByTime(21);
     expect(cleanupTimerFired).toBe(false);
     expect(await readdir(tmpdir())).not.toContain(basename(cleanupDirectory));
@@ -11422,9 +11500,16 @@ test("Ticket 17 authoring shutdown cleans every active session after errors", as
       lastActivity: Date;
       ownerSessionId: string;
       piSession: { dispose: () => void };
-      prompt: string;
-      reply: string;
       tempDirectory: string;
+      toolState: {
+        pending: {
+          cancelled: boolean;
+          done: Promise<void>;
+          inspectionAbort: AbortController;
+          started: boolean;
+        };
+      };
+      turns: { assistantMessage: string; prompt: string }[];
       userId: string;
     }
   >;
@@ -11451,6 +11536,12 @@ test("Ticket 17 authoring shutdown cleans every active session after errors", as
   );
   const firstDocument = new Uint8Array([1, 2]);
   const secondDocument = new Uint8Array([3, 4]);
+  const firstTurns = [
+    { assistantMessage: "first reply", prompt: "first prompt" },
+  ];
+  const secondTurns = [
+    { assistantMessage: "second reply", prompt: "second prompt" },
+  ];
   const firstExpiry = vi.fn();
   const secondExpiry = vi.fn();
   const secondDispose = vi.fn();
@@ -11468,9 +11559,16 @@ test("Ticket 17 authoring shutdown cleans every active session after errors", as
           throw disposeError;
         },
       },
-      prompt: "first prompt",
-      reply: "first reply",
       tempDirectory: firstDirectory,
+      toolState: {
+        pending: {
+          cancelled: false,
+          done: Promise.resolve(),
+          inspectionAbort: new AbortController(),
+          started: false,
+        },
+      },
+      turns: firstTurns,
       userId: "first-user",
     });
     sessions.set("close-second", {
@@ -11479,9 +11577,16 @@ test("Ticket 17 authoring shutdown cleans every active session after errors", as
       lastActivity: new Date(),
       ownerSessionId: "close-owner-second",
       piSession: { dispose: secondDispose },
-      prompt: "second prompt",
-      reply: "second reply",
       tempDirectory: secondDirectory,
+      toolState: {
+        pending: {
+          cancelled: false,
+          done: Promise.resolve(),
+          inspectionAbort: new AbortController(),
+          started: false,
+        },
+      },
+      turns: secondTurns,
       userId: "second-user",
     });
 
@@ -11512,7 +11617,10 @@ test("Ticket 17 authoring shutdown cleans every active session after errors", as
     ]);
     expect(firstDocument).toEqual(new Uint8Array([0, 0]));
     expect(secondDocument).toEqual(new Uint8Array([0, 0]));
+    expect(firstTurns).toEqual([]);
+    expect(secondTurns).toEqual([]);
     expect(secondDispose).toHaveBeenCalledTimes(1);
+    expect(sessions.size).toBe(0);
     vi.advanceTimersByTime(21);
     expect(firstExpiry).not.toHaveBeenCalled();
     expect(secondExpiry).not.toHaveBeenCalled();

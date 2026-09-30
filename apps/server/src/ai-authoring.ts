@@ -13,6 +13,7 @@ import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import { strToU8, zipSync } from "fflate";
 import { Type } from "typebox";
 
+import { AiAuthoringError } from "./ai-authoring-error";
 import { documentWorkerAvailable, runDocumentWorker } from "./document-worker";
 
 const sessionLifetimeMs = 2 * 60 * 60 * 1000;
@@ -23,7 +24,8 @@ const maxInspectionResponseBytes = 64 * 1024;
 const maxInspectionTextLength = 16 * 1024;
 const maxParagraphs = 20;
 const maxFields = 40;
-const xmlNamespace = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+const xmlNamespace =
+  "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
 const modelProviderId = "folio-omniroute";
 const disclosure =
   "Your prompt, original source PDF (when provided), and generated document content will be sent to OmniRoute and its configured provider. The source PDF is sent again for each revision. Folio Forms deletes its own temporary session and files when you end the session, sign out, or after two hours of inactivity. Folio Forms cannot promise deletion by OmniRoute or its provider.";
@@ -54,16 +56,6 @@ export interface AuthoringOwner {
 }
 export interface AuthoringRequestReservation {
   readonly ownerSessionId: string;
-}
-export class AiAuthoringError extends Error {
-  constructor(
-    readonly status: number,
-    readonly code: string,
-    message: string
-  ) {
-    super(message);
-    this.name = "AiAuthoringError";
-  }
 }
 
 interface RevisionEdits {
@@ -127,15 +119,15 @@ const xmlEscape = (value: string): string =>
 
 const xmlText = (value: string): string => {
   if (
-    Array.from(value).some((character) => {
+    [...value].some((character) => {
       const codePoint = character.codePointAt(0) ?? 0;
       return !(
         codePoint === 0x09 ||
         codePoint === 0x0a ||
         codePoint === 0x0d ||
-        (codePoint >= 0x20 && codePoint <= 0xd7ff) ||
-        (codePoint >= 0xe000 && codePoint <= 0xfffd) ||
-        (codePoint >= 0x10000 && codePoint <= 0x10ffff)
+        (codePoint >= 0x20 && codePoint <= 0xd7_ff) ||
+        (codePoint >= 0xe0_00 && codePoint <= 0xff_fd) ||
+        (codePoint >= 0x1_00_00 && codePoint <= 0x10_ff_ff)
       );
     })
   ) {
@@ -144,8 +136,16 @@ const xmlText = (value: string): string => {
   return xmlEscape(value);
 };
 
-const requiredText = (value: unknown, name: string, maxLength: number): string => {
-  if (typeof value !== "string" || !value.trim() || value.trim().length > maxLength) {
+const requiredText = (
+  value: unknown,
+  name: string,
+  maxLength: number
+): string => {
+  if (
+    typeof value !== "string" ||
+    !value.trim() ||
+    value.trim().length > maxLength
+  ) {
     throw new Error(`${name} is invalid`);
   }
   return value.trim();
@@ -186,7 +186,11 @@ const validateGeneratedTemplate = (value: {
     }
     const input = field as Record<string, unknown>;
     const label = requiredText(input.label, "field label", 120);
-    const placeholder = requiredText(input.placeholder, "field placeholder", 120);
+    const placeholder = requiredText(
+      input.placeholder,
+      "field placeholder",
+      120
+    );
     const tag = requiredText(input.tag, "field tag", 64);
     if (!/^[a-z][a-z0-9_]*$/u.test(tag) || tags.has(tag)) {
       throw new Error("field tag is invalid or duplicated");
@@ -218,8 +222,7 @@ const createTemplateDocx = (input: {
   const descriptionXml = content.description
     ? paragraphXml(content.description)
     : "";
-  const documentXml =
-    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="${xmlNamespace}"><w:body>${paragraphXml(content.title)}${descriptionXml}${content.paragraphs.map(paragraphXml).join("")}${fieldsXml}<w:sectPr/></w:body></w:document>`;
+  const documentXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="${xmlNamespace}"><w:body>${paragraphXml(content.title)}${descriptionXml}${content.paragraphs.map(paragraphXml).join("")}${fieldsXml}<w:sectPr/></w:body></w:document>`;
   const document = zipSync(
     {
       "[Content_Types].xml": strToU8(
@@ -293,10 +296,7 @@ const preserveUnchangedContent = (
   }
   const nextTags = new Set(candidate.fields.map((field) => field.tag));
   for (const field of current.fields) {
-    if (
-      !nextTags.has(field.tag) &&
-      !removedFieldTags.includes(field.tag)
-    ) {
+    if (!nextTags.has(field.tag) && !removedFieldTags.includes(field.tag)) {
       throw new Error(
         "Revision unexpectedly removed an existing tagged control"
       );
@@ -315,23 +315,23 @@ const toolParameters = Type.Object({
   ),
   fields: Type.Array(
     Type.Object({
-      label: Type.String({ minLength: 1, maxLength: 120 }),
-      placeholder: Type.String({ minLength: 1, maxLength: 120 }),
-      tag: Type.String({ minLength: 1, maxLength: 64 }),
+      label: Type.String({ maxLength: 120, minLength: 1 }),
+      placeholder: Type.String({ maxLength: 120, minLength: 1 }),
+      tag: Type.String({ maxLength: 64, minLength: 1 }),
     }),
     { maxItems: maxFields, minItems: 1 }
   ),
   paragraphs: Type.Array(Type.String({ maxLength: 2000 }), {
     maxItems: maxParagraphs,
   }),
-  title: Type.String({ minLength: 1, maxLength: 200 }),
   removedFieldTags: Type.Optional(
-    Type.Array(Type.String({ minLength: 1, maxLength: 64 }), {
+    Type.Array(Type.String({ maxLength: 64, minLength: 1 }), {
       description:
         "Exact OLD field tags from the CURRENT DOCX deliberately removed or retagged at the Admin's request, never PDF source fields. Keep unchanged tags stable; omit for creation or add-only revisions.",
       maxItems: maxFields,
     })
   ),
+  title: Type.String({ maxLength: 200, minLength: 1 }),
 });
 const pythonToolParameters = Type.Object({
   ...toolParameters.properties,
@@ -362,6 +362,222 @@ export const validOmniRouteConfig = (
   }
 };
 
+const validateAuthoringInput = (
+  prompt: string,
+  consent: unknown,
+  sourcePdf?: Uint8Array
+): void => {
+  if (consent !== true) {
+    throw new AiAuthoringError(
+      428,
+      "consent_required",
+      "AI authoring consent is required"
+    );
+  }
+  if (
+    !prompt.trim() ||
+    new TextEncoder().encode(prompt).byteLength > maxPromptBytes
+  ) {
+    throw new AiAuthoringError(
+      400,
+      "invalid_request",
+      "AI authoring prompt is invalid"
+    );
+  }
+  if (
+    sourcePdf &&
+    (sourcePdf.byteLength === 0 ||
+      sourcePdf.byteLength > maxSourcePdfBytes ||
+      sourcePdf[0] !== 0x25 ||
+      sourcePdf[1] !== 0x50 ||
+      sourcePdf[2] !== 0x44 ||
+      sourcePdf[3] !== 0x46 ||
+      sourcePdf[4] !== 0x2d)
+  ) {
+    throw new AiAuthoringError(400, "invalid_request", "Source PDF is invalid");
+  }
+};
+
+const assistantMessageFor = (
+  piSession: AgentSession,
+  generated: GeneratedTemplate,
+  action: "Created" | "Revised"
+): string => {
+  const reply = piSession.getLastAssistantText()?.trim();
+  if (reply) {
+    return reply;
+  }
+  return `${action} ${generated.title} with ${generated.fields.length} tagged field${generated.fields.length === 1 ? "" : "s"}.`;
+};
+
+const acceptCandidate = (
+  toolState: AuthoringToolState,
+  candidate: GeneratedTemplate,
+  edits: RevisionEdits,
+  validateMetadata = false
+) => {
+  try {
+    if (toolState.pending.cancelled) {
+      throw new Error("AI authoring generation was cancelled");
+    }
+    if (toolState.generated) {
+      throw new Error("Only one DOCX can be created in this turn");
+    }
+    preserveUnchangedContent(toolState.current, candidate, edits);
+    const tags = toolState.validateDocument(
+      candidate.document,
+      validateMetadata ? candidate : undefined
+    );
+    if (
+      tags.length !== candidate.fields.length ||
+      candidate.fields.some((field) => !tags.includes(field.tag))
+    ) {
+      throw new Error("Generated DOCX controls do not match its fields");
+    }
+    toolState.generated = candidate;
+    return {
+      content: [
+        {
+          text: `Created ${candidate.title} with ${candidate.fields.length} tagged fields.`,
+          type: "text" as const,
+        },
+      ],
+      details: {},
+    };
+  } catch (error) {
+    candidate.document.fill(0);
+    throw error;
+  }
+};
+
+const createDocumentTools = (
+  toolState: AuthoringToolState,
+  pythonAvailable: boolean
+) => {
+  const documentTool = {
+    description:
+      "Create and validate the requested DOCX with static text and unique tagged text controls.",
+    execute: (
+      _toolCallId: string,
+      parameters: RevisionEdits & {
+        description: string;
+        fields: GeneratedField[];
+        paragraphs: string[];
+        title: string;
+      }
+    ) => {
+      try {
+        return Promise.resolve(
+          acceptCandidate(toolState, createTemplateDocx(parameters), parameters)
+        );
+      } catch (error) {
+        return Promise.reject(error);
+      }
+    },
+    label: "Create DOCX",
+    name: "create_template_docx",
+    parameters: toolParameters,
+  };
+  const pythonTool = {
+    description:
+      "Run Python 3 standard-library document code in an isolated worker; source must write output.docx.",
+    execute: async (
+      _toolCallId: string,
+      parameters: RevisionEdits & {
+        description: string;
+        fields: GeneratedField[];
+        paragraphs: string[];
+        source: string;
+        title: string;
+      }
+    ) => {
+      if (toolState.pending.cancelled || toolState.generated) {
+        throw new Error(
+          "AI authoring generation was cancelled or already complete"
+        );
+      }
+      const content = validateGeneratedTemplate(parameters);
+      const document = await runDocumentWorker(
+        parameters.source,
+        toolState.pending.inspectionAbort.signal
+      );
+      return acceptCandidate(
+        toolState,
+        { ...content, document },
+        parameters,
+        true
+      );
+    },
+    label: "Create DOCX with Python",
+    name: "create_template_docx_python",
+    parameters: pythonToolParameters,
+  };
+  return pythonAvailable ? [documentTool, pythonTool] : [documentTool];
+};
+
+const createPiSession = async (
+  config: OmniRouteConfig,
+  tempDirectory: string,
+  toolState: AuthoringToolState
+): Promise<{ piSession: AgentSession; pythonAvailable: boolean }> => {
+  const modelRuntime = await ModelRuntime.create({
+    allowModelNetwork: false,
+    authPath: path.join(tempDirectory, "auth.json"),
+    modelsPath: null,
+    refreshOnCreate: false,
+  });
+  modelRuntime.registerProvider(modelProviderId, {
+    api: "openai-completions",
+    apiKey: config.apiKey,
+    baseUrl: config.baseUrl,
+    models: [
+      {
+        contextWindow: 32_768,
+        cost: { cacheRead: 0, cacheWrite: 0, input: 0, output: 0 },
+        id: config.model,
+        input: ["text"],
+        maxTokens: 4096,
+        name: "OmniRoute configured model",
+        reasoning: false,
+      },
+    ],
+    name: "OmniRoute",
+  });
+  const model = modelRuntime.getModel(modelProviderId, config.model);
+  if (!model) {
+    throw new Error("Configured OmniRoute model is unavailable");
+  }
+  const pythonAvailable = await documentWorkerAvailable();
+  const resourceLoader = new DefaultResourceLoader({
+    agentDir: tempDirectory,
+    appendSystemPromptOverride: () => [],
+    cwd: tempDirectory,
+    systemPromptOverride: () => systemPrompt,
+  });
+  await resourceLoader.reload();
+  const settingsManager = SettingsManager.inMemory({
+    defaultTools: [],
+    httpIdleTimeoutMs: upstreamTimeoutMs,
+    retry: {
+      enabled: false,
+      provider: { maxRetries: 0, timeoutMs: upstreamTimeoutMs },
+    },
+  });
+  const { session: piSession } = await createAgentSession({
+    agentDir: tempDirectory,
+    customTools: createDocumentTools(toolState, pythonAvailable),
+    cwd: tempDirectory,
+    model,
+    modelRuntime,
+    noTools: "builtin",
+    resourceLoader,
+    sessionManager: SessionManager.inMemory(tempDirectory),
+    settingsManager,
+    thinkingLevel: "off",
+  });
+  return { piSession, pythonAvailable };
+};
+
 export class AiAuthoringSessions {
   private readonly sessions = new Map<string, AuthoringSession>();
   private readonly pendingGenerations = new Map<
@@ -370,10 +586,16 @@ export class AiAuthoringSessions {
   >();
   private readonly endedOwnerSessions = new Set<string>();
   private readonly endingOwnerSessionCounts = new Map<string, number>();
+  private readonly config: OmniRouteConfig | null;
+  private readonly now: () => Date;
+
   constructor(
-    private readonly config: OmniRouteConfig | null,
-    private readonly now: () => Date = () => new Date()
-  ) {}
+    config: OmniRouteConfig | null,
+    now: () => Date = () => new Date()
+  ) {
+    this.config = config;
+    this.now = now;
+  }
 
   get enabled(): boolean {
     return validOmniRouteConfig(this.config);
@@ -387,7 +609,13 @@ export class AiAuthoringSessions {
         "AI authoring session was not found"
       );
     }
-    let finish!: () => void;
+    const {
+      promise: done,
+      resolve: finish,
+    }: {
+      promise: Promise<void>;
+      resolve: () => void;
+    } = Promise.withResolvers();
     if (this.pendingGenerations.get(ownerSessionId)?.size) {
       throw new AiAuthoringError(
         409,
@@ -398,11 +626,9 @@ export class AiAuthoringSessions {
     const reservation = { ownerSessionId };
     const pending: PendingGeneration = {
       cancelled: false,
+      done,
+      finish,
       inspectionAbort: new AbortController(),
-      done: new Promise<void>((resolve) => {
-        finish = resolve;
-      }),
-      finish: () => finish(),
       reservation,
       started: false,
     };
@@ -422,9 +648,8 @@ export class AiAuthoringSessions {
       this.finishPending(reservation.ownerSessionId, pending);
     }
   }
-
   async current(owner: AuthoringOwner): Promise<AuthoringPreview | null> {
-    for (const [sessionId, session] of this.sessions) {
+    for await (const [sessionId, session] of this.sessions) {
       if (
         session.ownerSessionId !== owner.authSessionId ||
         session.userId !== owner.userId
@@ -440,7 +665,7 @@ export class AiAuthoringSessions {
         throw error;
       }
       this.touch(sessionId, session);
-      return this.preview(sessionId, session);
+      return AiAuthoringSessions.preview(sessionId, session);
     }
     return null;
   }
@@ -454,22 +679,7 @@ export class AiAuthoringSessions {
     isOwnerSessionCurrent: () => Promise<boolean>,
     sourcePdf?: Uint8Array
   ): Promise<AuthoringPreview> {
-    const ownerPending = this.pendingGenerations.get(owner.authSessionId);
-    const pending = [...(ownerPending ?? [])].find(
-      (generation) => generation.reservation === reservation
-    );
-    if (
-      !pending ||
-      reservation.ownerSessionId !== owner.authSessionId ||
-      pending.cancelled ||
-      this.endedOwnerSessions.has(owner.authSessionId)
-    ) {
-      throw new AiAuthoringError(
-        404,
-        "not_found",
-        "AI authoring session was not found"
-      );
-    }
+    const pending = this.pendingFor(owner.authSessionId, reservation);
     if (!this.enabled || !this.config) {
       throw new AiAuthoringError(
         503,
@@ -477,57 +687,9 @@ export class AiAuthoringSessions {
         "AI authoring is unavailable"
       );
     }
-    if (consent !== true) {
-      throw new AiAuthoringError(
-        428,
-        "consent_required",
-        "AI authoring consent is required"
-      );
-    }
-    if (
-      !prompt.trim() ||
-      new TextEncoder().encode(prompt).byteLength > maxPromptBytes
-    ) {
-      throw new AiAuthoringError(
-        400,
-        "invalid_request",
-        "AI authoring prompt is invalid"
-      );
-    }
-    if (
-      sourcePdf &&
-      (sourcePdf.byteLength === 0 ||
-        sourcePdf.byteLength > maxSourcePdfBytes ||
-        sourcePdf[0] !== 0x25 ||
-        sourcePdf[1] !== 0x50 ||
-        sourcePdf[2] !== 0x44 ||
-        sourcePdf[3] !== 0x46 ||
-        sourcePdf[4] !== 0x2d)
-    ) {
-      throw new AiAuthoringError(
-        400,
-        "invalid_request",
-        "Source PDF is invalid"
-      );
-    }
-    for (const [sessionId, session] of this.sessions) {
-      if (session.ownerSessionId !== owner.authSessionId) {
-        continue;
-      }
-      if (
-        this.now().getTime() - session.lastActivity.getTime() >=
-        sessionLifetimeMs
-      ) {
-        await this.dispose(sessionId, session);
-        continue;
-      }
-      throw new AiAuthoringError(
-        409,
-        "conflict",
-        "End the current AI authoring session before creating another"
-      );
-    }
-    const retainedPdf = sourcePdf?.slice();
+    validateAuthoringInput(prompt, consent, sourcePdf);
+    await this.ensureNoActiveSession(owner.authSessionId);
+    const retainedPdf = sourcePdf ? new Uint8Array(sourcePdf) : undefined;
     pending.started = true;
 
     let tempDirectory: string | undefined;
@@ -552,147 +714,9 @@ export class AiAuthoringSessions {
       if (pending.cancelled) {
         throw new Error("AI authoring generation was cancelled");
       }
-      const modelRuntime = await ModelRuntime.create({
-        allowModelNetwork: false,
-        authPath: path.join(tempDirectory, "auth.json"),
-        modelsPath: null,
-        refreshOnCreate: false,
-      });
-      modelRuntime.registerProvider(modelProviderId, {
-        api: "openai-completions",
-        apiKey: this.config.apiKey,
-        baseUrl: this.config.baseUrl,
-        models: [
-          {
-            contextWindow: 32_768,
-            cost: { cacheRead: 0, cacheWrite: 0, input: 0, output: 0 },
-            id: this.config.model,
-            input: ["text"],
-            maxTokens: 4096,
-            name: "OmniRoute configured model",
-            reasoning: false,
-          },
-        ],
-        name: "OmniRoute",
-      });
-      const model = modelRuntime.getModel(modelProviderId, this.config.model);
-      if (!model) {
-        throw new Error("Configured OmniRoute model is unavailable");
-      }
-      const pythonAvailable = await documentWorkerAvailable();
-      const resourceLoader = new DefaultResourceLoader({
-        agentDir: tempDirectory,
-        appendSystemPromptOverride: () => [],
-        cwd: tempDirectory,
-        systemPromptOverride: () => systemPrompt,
-      });
-      await resourceLoader.reload();
-      const settingsManager = SettingsManager.inMemory({
-        defaultTools: [],
-        httpIdleTimeoutMs: upstreamTimeoutMs,
-        retry: {
-          enabled: false,
-          provider: { maxRetries: 0, timeoutMs: upstreamTimeoutMs },
-        },
-      });
-      const acceptCandidate = (
-        candidate: GeneratedTemplate,
-        edits: RevisionEdits,
-        validateMetadata = false
-      ) => {
-        try {
-          if (toolState.pending.cancelled) {
-            throw new Error("AI authoring generation was cancelled");
-          }
-          if (toolState.generated) {
-            throw new Error("Only one DOCX can be created in this turn");
-          }
-          preserveUnchangedContent(toolState.current, candidate, edits);
-          const tags = toolState.validateDocument(
-            candidate.document,
-            validateMetadata ? candidate : undefined
-          );
-          if (
-            tags.length !== candidate.fields.length ||
-            candidate.fields.some((field) => !tags.includes(field.tag))
-          ) {
-            throw new Error("Generated DOCX controls do not match its fields");
-          }
-          toolState.generated = candidate;
-          return {
-            content: [
-              {
-                text: `Created ${candidate.title} with ${candidate.fields.length} tagged fields.`,
-                type: "text" as const,
-              },
-            ],
-            details: {},
-          };
-        } catch (error) {
-          candidate.document.fill(0);
-          throw error;
-        }
-      };
-      const documentTool = {
-        description:
-          "Create and validate the requested DOCX with static text and unique tagged text controls.",
-        execute: async (
-          _toolCallId: string,
-          parameters: RevisionEdits & {
-            description: string;
-            fields: GeneratedField[];
-            paragraphs: string[];
-            title: string;
-          }
-        ) => acceptCandidate(createTemplateDocx(parameters), parameters),
-        label: "Create DOCX",
-        name: "create_template_docx",
-        parameters: toolParameters,
-      };
-      const pythonTool = {
-        description:
-          "Run Python 3 standard-library document code in an isolated worker; source must write output.docx.",
-        execute: async (
-          _toolCallId: string,
-          parameters: RevisionEdits & {
-            description: string;
-            fields: GeneratedField[];
-            paragraphs: string[];
-            source: string;
-            title: string;
-          }
-        ) => {
-          if (toolState.pending.cancelled || toolState.generated) {
-            throw new Error(
-              "AI authoring generation was cancelled or already complete"
-            );
-          }
-          const content = validateGeneratedTemplate(parameters);
-          const document = await runDocumentWorker(
-            parameters.source,
-            toolState.pending.inspectionAbort.signal
-          );
-          return acceptCandidate({ ...content, document }, parameters, true);
-        },
-        label: "Create DOCX with Python",
-        name: "create_template_docx_python",
-        parameters: pythonToolParameters,
-      };
-      const created = await createAgentSession({
-        agentDir: tempDirectory,
-        customTools: pythonAvailable
-          ? [documentTool, pythonTool]
-          : [documentTool],
-        cwd: tempDirectory,
-        model,
-        modelRuntime,
-        noTools: "builtin",
-        resourceLoader,
-        sessionManager: SessionManager.inMemory(tempDirectory),
-        settingsManager,
-        thinkingLevel: "off",
-      });
-      piSession = created.session;
+      const { piSession: createdPiSession, pythonAvailable } =
+        await createPiSession(this.config, tempDirectory, toolState);
+      piSession = createdPiSession;
       pending.piSession = piSession;
       if (pending.cancelled) {
         throw new Error("AI authoring generation was cancelled");
@@ -720,28 +744,28 @@ export class AiAuthoringSessions {
       if (!toolState.generated) {
         throw new Error("OmniRoute did not create a valid DOCX");
       }
-      const generated = toolState.generated;
-      const reply =
-        piSession.getLastAssistantText()?.trim() ||
-        `Created ${generated.title} with ${generated.fields.length} tagged field${generated.fields.length === 1 ? "" : "s"}.`;
+      const { generated } = toolState;
+      const reply = assistantMessageFor(piSession, generated, "Created");
       const session: AuthoringSession = {
-        sourcePdf: retainedPdf,
         document: generated,
         lastActivity: this.now(),
         ownerSessionId: owner.authSessionId,
         piSession,
-        tempDirectory,
         pythonAvailable,
-        turns: [{ prompt: prompt.trim(), assistantMessage: reply }],
+        sourcePdf: retainedPdf,
+        tempDirectory,
         toolState,
+        turns: [{ assistantMessage: reply, prompt: prompt.trim() }],
         userId: owner.userId,
       };
       const sessionId = crypto.randomUUID();
       this.sessions.set(sessionId, session);
       this.touch(sessionId, session);
-      return this.preview(sessionId, session);
+      return AiAuthoringSessions.preview(sessionId, session);
     } catch (error) {
-      await piSession?.abort().catch(() => undefined);
+      await piSession?.abort().catch(() => {
+        // Abort failures must not prevent disposal and document erasure.
+      });
       try {
         piSession?.dispose();
       } catch (disposeError) {
@@ -775,21 +799,7 @@ export class AiAuthoringSessions {
     reservation: AuthoringRequestReservation,
     isOwnerSessionCurrent: () => Promise<boolean>
   ): Promise<AuthoringPreview> {
-    const pending = [
-      ...(this.pendingGenerations.get(owner.authSessionId) ?? []),
-    ].find((generation) => generation.reservation === reservation);
-    if (
-      !pending ||
-      reservation.ownerSessionId !== owner.authSessionId ||
-      pending.cancelled ||
-      this.endedOwnerSessions.has(owner.authSessionId)
-    ) {
-      throw new AiAuthoringError(
-        404,
-        "not_found",
-        "AI authoring session was not found"
-      );
-    }
+    const pending = this.pendingFor(owner.authSessionId, reservation);
     const session = await this.sessionFor(sessionId, owner);
     if (pending.cancelled || this.sessions.get(sessionId) !== session) {
       throw new AiAuthoringError(
@@ -805,23 +815,7 @@ export class AiAuthoringSessions {
         "AI authoring is unavailable"
       );
     }
-    if (consent !== true) {
-      throw new AiAuthoringError(
-        428,
-        "consent_required",
-        "AI authoring consent is required"
-      );
-    }
-    if (
-      !prompt.trim() ||
-      new TextEncoder().encode(prompt).byteLength > maxPromptBytes
-    ) {
-      throw new AiAuthoringError(
-        400,
-        "invalid_request",
-        "AI authoring prompt is invalid"
-      );
-    }
+    validateAuthoringInput(prompt, consent);
     pending.started = true;
     pending.piSession = session.piSession;
     session.toolState.pending = pending;
@@ -830,19 +824,7 @@ export class AiAuthoringSessions {
     session.toolState.validateDocument = validateDocument;
     try {
       const isCurrent = await isOwnerSessionCurrent();
-      if (
-        pending.cancelled ||
-        this.sessions.get(sessionId) !== session ||
-        this.now().getTime() - session.lastActivity.getTime() >=
-          sessionLifetimeMs ||
-        !isCurrent
-      ) {
-        throw new AiAuthoringError(
-          404,
-          "not_found",
-          "AI authoring session was not found"
-        );
-      }
+      this.assertRevisionCurrent(sessionId, session, pending, isCurrent);
       const sourceFindings = session.sourcePdf
         ? await this.inspectPdf(session.sourcePdf, prompt.trim(), pending)
         : undefined;
@@ -865,34 +847,24 @@ export class AiAuthoringSessions {
         }
       );
       const stillCurrent = await isOwnerSessionCurrent();
-      if (
-        pending.cancelled ||
-        this.sessions.get(sessionId) !== session ||
-        this.now().getTime() - session.lastActivity.getTime() >=
-          sessionLifetimeMs ||
-        !stillCurrent
-      ) {
-        throw new AiAuthoringError(
-          404,
-          "not_found",
-          "AI authoring session was not found"
-        );
-      }
+      this.assertRevisionCurrent(sessionId, session, pending, stillCurrent);
       const generated = session.toolState.generated as
         | GeneratedTemplate
         | undefined;
       if (!generated) {
         throw new Error("OmniRoute did not create a valid DOCX");
       }
-      const reply =
-        session.piSession.getLastAssistantText()?.trim() ||
-        `Revised ${generated.title} with ${generated.fields.length} tagged field${generated.fields.length === 1 ? "" : "s"}.`;
+      const reply = assistantMessageFor(
+        session.piSession,
+        generated,
+        "Revised"
+      );
       const oldDocument = session.document.document;
       session.document = generated;
-      session.turns.push({ prompt: prompt.trim(), assistantMessage: reply });
+      session.turns.push({ assistantMessage: reply, prompt: prompt.trim() });
       this.touch(sessionId, session);
       oldDocument.fill(0);
-      return this.preview(sessionId, session);
+      return AiAuthoringSessions.preview(sessionId, session);
     } catch (error) {
       (
         session.toolState.generated as GeneratedTemplate | undefined
@@ -925,7 +897,10 @@ export class AiAuthoringSessions {
   ): Promise<{ bytes: Uint8Array; title: string }> {
     const session = await this.sessionFor(sessionId, owner);
     this.touch(sessionId, session);
-    return { bytes: session.document.document.slice(), title: session.document.title };
+    return {
+      bytes: new Uint8Array(session.document.document),
+      title: session.document.title,
+    };
   }
 
   async end(sessionId: string, owner: AuthoringOwner): Promise<void> {
@@ -944,9 +919,7 @@ export class AiAuthoringSessions {
     this.endedOwnerSessions.add(ownerSessionId);
     try {
       const errors: unknown[] = [];
-      const pending = [
-        ...(this.pendingGenerations.get(ownerSessionId) ?? []),
-      ];
+      const pending = [...(this.pendingGenerations.get(ownerSessionId) ?? [])];
       for (const generation of pending) {
         generation.cancelled = true;
         generation.inspectionAbort.abort();
@@ -966,7 +939,7 @@ export class AiAuthoringSessions {
           this.finishPending(ownerSessionId, generation);
         }
       }
-      for (const [sessionId, session] of this.sessions) {
+      for await (const [sessionId, session] of this.sessions) {
         if (session.ownerSessionId === ownerSessionId) {
           try {
             await this.dispose(sessionId, session);
@@ -999,14 +972,15 @@ export class AiAuthoringSessions {
   }
   async close(): Promise<void> {
     const errors: unknown[] = [];
-    for (const ownerSessionId of [...this.pendingGenerations.keys()]) {
+    const ownerSessionIds = [...this.pendingGenerations.keys()];
+    for await (const ownerSessionId of ownerSessionIds) {
       try {
         await this.endForSession(ownerSessionId);
       } catch (error) {
         errors.push(error);
       }
     }
-    for (const [sessionId, session] of this.sessions) {
+    for await (const [sessionId, session] of this.sessions) {
       try {
         await this.dispose(sessionId, session);
       } catch (error) {
@@ -1075,26 +1049,24 @@ export class AiAuthoringSessions {
       await response.body?.cancel();
       throw new Error("OmniRoute PDF inspection is unavailable");
     }
-    const reader = response.body.getReader();
     const bytes = new Uint8Array(maxInspectionResponseBytes);
     let length = 0;
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) {
-          break;
-        }
-        if (value.byteLength > bytes.byteLength - length) {
-          await reader.cancel();
-          throw new Error("OmniRoute PDF inspection response is too large");
-        }
-        bytes.set(value, length);
-        length += value.byteLength;
+    let oversized = false;
+    for await (const value of response.body.values({ preventCancel: true })) {
+      if (value.byteLength > bytes.byteLength - length) {
+        oversized = true;
+        break;
       }
-    } finally {
-      reader.releaseLock();
+      bytes.set(value, length);
+      length += value.byteLength;
     }
-    const result = JSON.parse(new TextDecoder().decode(bytes.subarray(0, length))) as {
+    if (oversized) {
+      await response.body.cancel();
+      throw new Error("OmniRoute PDF inspection response is too large");
+    }
+    const result = JSON.parse(
+      new TextDecoder().decode(bytes.subarray(0, length))
+    ) as {
       choices?: { message?: { content?: unknown } }[];
     };
     const findings = result.choices?.[0]?.message?.content;
@@ -1106,6 +1078,69 @@ export class AiAuthoringSessions {
       throw new Error("OmniRoute did not inspect the source PDF");
     }
     return findings.trim();
+  }
+
+  private pendingFor(
+    ownerSessionId: string,
+    reservation: AuthoringRequestReservation
+  ): PendingGeneration {
+    const pending = [
+      ...(this.pendingGenerations.get(ownerSessionId) ?? []),
+    ].find((generation) => generation.reservation === reservation);
+    if (
+      !pending ||
+      reservation.ownerSessionId !== ownerSessionId ||
+      pending.cancelled ||
+      this.endedOwnerSessions.has(ownerSessionId)
+    ) {
+      throw new AiAuthoringError(
+        404,
+        "not_found",
+        "AI authoring session was not found"
+      );
+    }
+    return pending;
+  }
+
+  private async ensureNoActiveSession(ownerSessionId: string): Promise<void> {
+    for await (const [sessionId, session] of this.sessions) {
+      if (session.ownerSessionId !== ownerSessionId) {
+        continue;
+      }
+      if (
+        this.now().getTime() - session.lastActivity.getTime() >=
+        sessionLifetimeMs
+      ) {
+        await this.dispose(sessionId, session);
+        continue;
+      }
+      throw new AiAuthoringError(
+        409,
+        "conflict",
+        "End the current AI authoring session before creating another"
+      );
+    }
+  }
+
+  private assertRevisionCurrent(
+    sessionId: string,
+    session: AuthoringSession,
+    pending: PendingGeneration,
+    isCurrent: boolean
+  ): void {
+    if (
+      pending.cancelled ||
+      this.sessions.get(sessionId) !== session ||
+      this.now().getTime() - session.lastActivity.getTime() >=
+        sessionLifetimeMs ||
+      !isCurrent
+    ) {
+      throw new AiAuthoringError(
+        404,
+        "not_found",
+        "AI authoring session was not found"
+      );
+    }
   }
 
   private finishPending(
@@ -1138,7 +1173,10 @@ export class AiAuthoringSessions {
         "AI authoring session was not found"
       );
     }
-    if (this.now().getTime() - session.lastActivity.getTime() >= sessionLifetimeMs) {
+    if (
+      this.now().getTime() - session.lastActivity.getTime() >=
+      sessionLifetimeMs
+    ) {
       await this.dispose(sessionId, session);
       throw new AiAuthoringError(
         404,
@@ -1149,7 +1187,10 @@ export class AiAuthoringSessions {
     return session;
   }
 
-  private preview(sessionId: string, session: AuthoringSession): AuthoringPreview {
+  private static preview(
+    sessionId: string,
+    session: AuthoringSession
+  ): AuthoringPreview {
     return {
       assistantMessage: session.turns.at(-1)?.assistantMessage ?? "",
       description: session.document.description,
@@ -1166,26 +1207,33 @@ export class AiAuthoringSessions {
   private touch(sessionId: string, session: AuthoringSession): void {
     session.lastActivity = this.now();
     clearTimeout(session.expiryTimer);
-    session.expiryTimer = setTimeout(() => {
-      void this.dispose(sessionId, session).catch(() => {
+    session.expiryTimer = setTimeout(async () => {
+      try {
+        await this.dispose(sessionId, session);
+      } catch {
         console.error("Could not remove expired AI authoring files");
-      });
+      }
     }, sessionLifetimeMs);
     session.expiryTimer.unref();
   }
 
-  private async dispose(sessionId: string, session: AuthoringSession): Promise<void> {
+  private async dispose(
+    sessionId: string,
+    session: AuthoringSession
+  ): Promise<void> {
     if (this.sessions.get(sessionId) !== session) {
       return;
     }
     this.sessions.delete(sessionId);
     clearTimeout(session.expiryTimer);
-    const pending = session.toolState.pending;
+    const { pending } = session.toolState;
     if (this.pendingGenerations.get(session.ownerSessionId)?.has(pending)) {
       pending.cancelled = true;
       pending.inspectionAbort.abort();
       if (pending.started) {
-        await session.piSession.abort().catch(() => undefined);
+        await session.piSession.abort().catch(() => {
+          // The generation still owns cleanup and must finish after abort fails.
+        });
         await pending.done;
       }
     }
@@ -1206,7 +1254,8 @@ export class AiAuthoringSessions {
       if (disposeFailed) {
         throw new AggregateError(
           [disposeError, error],
-          "AI authoring session cleanup failed"
+          "AI authoring session cleanup failed",
+          { cause: error }
         );
       }
       throw error;
