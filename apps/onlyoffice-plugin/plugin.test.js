@@ -13,6 +13,8 @@ const createHarness = ({
   capabilityResponses = [],
   clipboard,
   controls = [],
+  editorSaveSupported = true,
+  holdEditorSave = false,
   prefill,
   responses = [],
   selection,
@@ -33,6 +35,7 @@ const createHarness = ({
     currentControl: selection?.currentControl,
     properties: selection?.properties,
   };
+  let pendingEditorSaveRequest;
 
   const createElement = (tagName = "div", id = "") => {
     const listeners = new Map();
@@ -142,6 +145,24 @@ const createHarness = ({
   const parentWindow = {
     postMessage(message, targetOrigin) {
       messages.push({ message, targetOrigin });
+      if (message.type === "editor-save-request") {
+        pendingEditorSaveRequest = message;
+        if (!holdEditorSave) {
+          queueMicrotask(() => {
+            dispatch({
+              data: {
+                ...message,
+                saved: true,
+                source: "folio-parent",
+                type: "editor-save-response",
+              },
+              origin: parentOrigin,
+              source: parentWindow,
+            });
+          });
+        }
+        return;
+      }
 
       if (message.type !== "capability-request") {
         return;
@@ -174,34 +195,6 @@ const createHarness = ({
       const callbacks = editorEvents.get(name) || [];
       callbacks.push(callback);
       editorEvents.set(name, callbacks);
-    },
-    callCommand(...args) {
-      const command = args[0];
-      const done = args.at(-1);
-      if (typeof done !== "function") {
-        return;
-      }
-      if (
-        command?.name === "getCurrentContentControlCommand" &&
-        selectionState.properties
-      ) {
-        done(command());
-        return;
-      }
-      if (
-        command?.name === "setCurrentContentControlTagCommand" &&
-        selectionState.properties
-      ) {
-        const tag = window.Asc.scope?.formBridgeSelectionTag;
-        selectionState.properties.Tag = tag;
-        done(JSON.stringify({ ok: true, tag }));
-        return;
-      }
-      if (typeof command === "function") {
-        done(command());
-        return;
-      }
-      done(JSON.stringify({ name: "Ada", value: "example" }));
     },
     executeMethod(method, ...args) {
       methodCalls.push(method);
@@ -291,6 +284,34 @@ const createHarness = ({
     },
     top: parentWindow,
   };
+  plugin.callCommand = function callCommand(...args) {
+    const command = args[0];
+    const done = args.at(-1);
+    if (typeof done !== "function") {
+      return;
+    }
+    if (
+      command?.name === "getCurrentContentControlCommand" &&
+      selectionState.properties
+    ) {
+      done(command());
+      return;
+    }
+    if (
+      command?.name === "setCurrentContentControlTagCommand" &&
+      selectionState.properties
+    ) {
+      const tag = window.Asc.scope?.formBridgeSelectionTag;
+      selectionState.properties.Tag = tag;
+      done(JSON.stringify({ ok: true, tag }));
+      return;
+    }
+    if (typeof command === "function") {
+      done(command());
+      return;
+    }
+    done(JSON.stringify({ name: "Ada", value: "example" }));
+  };
   const document = {
     body: createElement("body"),
     createElement,
@@ -332,6 +353,7 @@ const createHarness = ({
         },
       };
     },
+    Save: () => true,
   };
   const context = {
     Api,
@@ -354,6 +376,7 @@ const createHarness = ({
     bridgeId,
     dispatch,
     editorEvents,
+    editorSaveSupported,
     element(id) {
       return elements.get(id);
     },
@@ -370,6 +393,18 @@ const createHarness = ({
         timer.cancelled = true;
         timer.callback();
       }
+    },
+    finishEditorSave(error) {
+      dispatch({
+        data: {
+          ...pendingEditorSaveRequest,
+          ...(error ? { error } : { saved: true }),
+          source: "folio-parent",
+          type: "editor-save-response",
+        },
+        origin: parentOrigin,
+        source: parentWindow,
+      });
     },
     messages,
     methodCalls,
@@ -392,6 +427,7 @@ const acknowledgeBridge = (harness) => {
   harness.dispatch({
     data: {
       bridgeId: harness.bridgeId,
+      editorSaveSupported: harness.editorSaveSupported,
       source: "folio-parent",
       type: "bridge-ack",
     },
@@ -469,6 +505,120 @@ test("clears dirty state after successful save and submit actions", async () => 
     const requestBody = JSON.parse(request.body);
     expect(requestBody.data).toEqual({ start_date: "2026-09-15" });
     expect(requestBody.canonicalDateFields).toEqual(["start_date"]);
+  }
+});
+
+test("waits for native collection before saving a dirty draft and reporting completion", async () => {
+  const harness = createHarness({
+    action: "draft",
+    capabilityResponses: ["save-draft-capability"],
+    controls: [
+      {
+        GetClassType: () => "inlineLvlSdt",
+        GetRange: () => ({ GetText: () => "PDMS saved draft" }),
+        GetTag: () => "full_name",
+      },
+    ],
+    holdEditorSave: true,
+    responses: [
+      { operationCapability: "poll-capability", operationId: "draft-save" },
+      completedOperation({ responseId: "owned-draft" }),
+    ],
+  });
+  acknowledgeBridge(harness);
+  harness.emitEditorEvent("onChangeContentControl");
+  const save = harness.window.FormBridge.runAction("save-draft");
+  await flushPlugin();
+  const nativeSaveRequest = harness.messages.find(
+    ({ message }) => message.type === "editor-save-request"
+  ).message;
+  const savedResponse = {
+    ...nativeSaveRequest,
+    saved: true,
+    source: "folio-parent",
+    type: "editor-save-response",
+  };
+  for (const forged of [
+    { data: savedResponse, origin: harness.parentOrigin, source: {} },
+    {
+      data: savedResponse,
+      origin: "https://wrong.example.test",
+      source: harness.parentWindow,
+    },
+    {
+      data: { ...savedResponse, bridgeId: "another-document" },
+      origin: harness.parentOrigin,
+      source: harness.parentWindow,
+    },
+    {
+      data: { ...savedResponse, requestId: "earlier-save" },
+      origin: harness.parentOrigin,
+      source: harness.parentWindow,
+    },
+  ]) {
+    harness.dispatch(forged);
+  }
+  await flushPlugin();
+  // Api.Save has returned true, but typing has not reached the editing service.
+  expect(harness.requests).toHaveLength(0);
+  expect(
+    harness.messages.filter(({ message }) => message.type === "operation")
+  ).toEqual([]);
+  expect(
+    harness.messages
+      .filter(({ message }) => message.type === "dirty-state")
+      .at(-1).message.dirty
+  ).toBe(true);
+
+  harness.finishEditorSave();
+  await expect(save).resolves.toMatchObject({
+    ok: true,
+    operationId: "draft-save",
+  });
+  expect(JSON.parse(harness.requests[0].body).data).toEqual({
+    full_name: "PDMS saved draft",
+  });
+  expect(harness.requests.map(({ method }) => method)).toEqual(["POST", "GET"]);
+  expect(
+    harness.messages
+      .filter(({ message }) => message.type === "operation")
+      .map(({ message }) => message.status)
+  ).toEqual(["pending", "completed"]);
+  expect(
+    harness.messages
+      .filter(({ message }) => message.type === "dirty-state")
+      .at(-1).message.dirty
+  ).toBe(false);
+});
+
+test("failed or unavailable native collection preserves dirty work and blocks save completion", async () => {
+  for (const editorSaveSupported of [true, false]) {
+    const harness = createHarness({
+      action: "draft",
+      editorSaveSupported,
+      holdEditorSave: true,
+    });
+    acknowledgeBridge(harness);
+    harness.emitEditorEvent("onChangeContentControl");
+    const save = harness.window.FormBridge.runAction("save-draft");
+    await flushPlugin();
+    if (editorSaveSupported) {
+      harness.finishEditorSave(
+        "The native editor could not save document changes"
+      );
+    }
+    await expect(save).resolves.toMatchObject({ ok: false, operationId: null });
+    expect(harness.requests).toHaveLength(0);
+    expect(
+      harness.messages
+        .filter(({ message }) => message.type === "dirty-state")
+        .at(-1).message.dirty
+    ).toBe(true);
+    expect(
+      harness.messages
+        .filter(({ message }) => message.type === "operation")
+        .map(({ message }) => message.status)
+    ).toEqual(["failed"]);
   }
 });
 
@@ -782,19 +932,19 @@ test("extracts scalar form values with plugin contract semantics", async () => {
   const requestBody = JSON.parse(harness.requests[0].body);
   expect(requestBody.data).toEqual({
     accept_terms: "✓",
+    blank_empty: "",
+    blank_empty_combo: "",
     custom: "Custom value",
     department: "Engineering",
     inline_checkbox: true,
     inline_date: "2026-09-15",
     inline_department: "Engineering",
     notes: "line one\nline two",
-    start_date: "15/09/2026",
-    blank_empty: "",
-    blank_empty_combo: "",
     selected_combo_value_collision: "Choice B",
     selected_empty: "Empty option label",
     selected_empty_combo: "Empty combo label",
     selected_value_collision: "Choice B",
+    start_date: "15/09/2026",
   });
   expect(requestBody.canonicalDateFields).toEqual(["inline_date"]);
 });
@@ -878,9 +1028,9 @@ test("maps namespaced field tags during prefill and save", async () => {
     GetRange: () => ({ GetText: () => text }),
     GetTag: () => "metadata",
     IsCheckBox: () => false,
+    IsComboBox: () => false,
     IsDatePicker: () => false,
     IsDropDownList: () => false,
-    IsComboBox: () => false,
     RemoveAllElements() {
       text = "";
     },
@@ -922,7 +1072,7 @@ test("maps namespaced field tags during prefill and save", async () => {
     text: "Trusted value",
   });
 });
-test("applies a saved scalar response and reports Thai action status", async () => {
+test("applies a saved scalar response and rejects API failures", async () => {
   const createMutableControl = ({ kind, tag, items = [] }) => {
     let checked = false;
     let dateValue = null;
@@ -1017,7 +1167,6 @@ test("applies a saved scalar response and reports Thai action status", async () 
     notes: "line one\nline two",
     start_date: "2026-09-15",
   });
-  expect(harness.statusElement.textContent).toBe("บันทึกฉบับร่าง สำเร็จ");
 
   const errorHarness = createHarness({
     action: "draft",
@@ -1033,7 +1182,6 @@ test("applies a saved scalar response and reports Thai action status", async () 
   await expect(
     errorHarness.window.FormBridge.runAction("save-draft")
   ).resolves.toMatchObject({ ok: false });
-  expect(errorHarness.statusElement.textContent).toContain("ไม่สำเร็จ");
 });
 test("uses fresh capabilities and an exact acknowledged bridge", async () => {
   const harness = createHarness({
@@ -1226,6 +1374,7 @@ test("fails safely when capability renewal times out or returns an error", async
   acknowledgeBridge(timeoutHarness);
   const timedOutAction =
     timeoutHarness.window.FormBridge.runAction("save-template");
+  await flushPlugin();
 
   expect(timeoutHarness.requests).toHaveLength(0);
   timeoutHarness.expireCapabilityRequests();
@@ -1257,6 +1406,7 @@ test("ignores forged or malformed capability responses", async () => {
   acknowledgeBridge(harness);
 
   const action = harness.window.FormBridge.runAction("save-template");
+  await flushPlugin();
   const request = harness.messages.find(
     ({ message }) => message.type === "capability-request"
   );
@@ -1573,7 +1723,7 @@ test("keeps field configuration available only in template-edit mode", async () 
   ).toHaveLength(0);
 });
 
-test("reports field-rule API failures without exposing a value payload", async () => {
+test("keeps field-rule API failures outside selection value payloads", async () => {
   const harness = createHarness({
     action: "template-edit",
     capabilityResponses: ["field-capability"],
@@ -1583,9 +1733,6 @@ test("reports field-rule API failures without exposing a value payload", async (
   acknowledgeBridge(harness);
   await flushPlugin();
 
-  expect(harness.element("field-panel-status").textContent).toBe(
-    "ไม่สามารถโหลดนโยบายฟิลด์ได้"
-  );
   expect(harness.requests[0]?.body).toBeUndefined();
   expect(
     harness.messages

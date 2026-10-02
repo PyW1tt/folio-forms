@@ -30,10 +30,7 @@ import { Elysia } from "elysia";
 import { strToU8, unzipSync, zipSync } from "fflate";
 import { SaxesParser } from "saxes";
 
-import {
-  AiAuthoringSessions,
-  authoringDisclosure,
-} from "./ai-authoring";
+import { AiAuthoringSessions, authoringDisclosure } from "./ai-authoring";
 import type { GeneratedTemplate, OmniRouteConfig } from "./ai-authoring";
 import { AiAuthoringError } from "./ai-authoring-error";
 import {
@@ -213,6 +210,8 @@ const accountBodyMaximumBytes = 64 * 1024;
 const documentActionBodyMaximumBytes = 8 * 1024;
 const accountEmailMaximumLength = 254;
 const accountNameMaximumLength = 120;
+const legacyIdentityNameControlPattern = /\p{Cc}/u;
+const legacyReviewedGenerationPattern = /^[1-9][0-9]{0,18}$/u;
 // ponytail: one global account lock caps mutation throughput; shard locks only if needed.
 const accountMutationLockId = 1_604_619_418;
 const callbackInternalOrigin = originOf(env.ONLYOFFICE_INTERNAL_URL);
@@ -258,6 +257,7 @@ interface LegacySsoSwitchChallenge {
 const legacySsoSwitchLifetimeSeconds = 5 * 60;
 interface LegacyIdentity {
   email: string;
+  name?: string;
   subject: string;
 }
 interface Identity {
@@ -736,21 +736,27 @@ async function readJsonRecord(
   }
 }
 
+async function readAuthoringPromptInput(
+  request: Request
+): Promise<{ consent: unknown; prompt: string }> {
+  const input = await readJsonRecord(request, accountBodyMaximumBytes);
+  if (
+    Object.keys(input).length !== 2 ||
+    !Object.hasOwn(input, "consent") ||
+    !Object.hasOwn(input, "prompt") ||
+    typeof input.prompt !== "string"
+  ) {
+    fail(400, "invalid_request", "Only consent and prompt are accepted");
+  }
+  return { consent: input.consent, prompt: input.prompt };
+}
+
 async function readAuthoringCreationInput(
   request: Request
 ): Promise<{ consent: unknown; pdfBytes?: Uint8Array; prompt: string }> {
   const contentType = request.headers.get("content-type");
   if (!contentType || !/^multipart\/form-data(?:\s*;|$)/iu.test(contentType)) {
-    const input = await readJsonRecord(request, accountBodyMaximumBytes);
-    if (
-      Object.keys(input).length !== 2 ||
-      !Object.hasOwn(input, "consent") ||
-      !Object.hasOwn(input, "prompt") ||
-      typeof input.prompt !== "string"
-    ) {
-      fail(400, "invalid_request", "Only consent and prompt are accepted");
-    }
-    return { consent: input.consent, prompt: input.prompt };
+    return await readAuthoringPromptInput(request);
   }
 
   const requestBytes = await readRequestBytes(
@@ -769,7 +775,11 @@ async function readAuthoringCreationInput(
   const entries = new Map<string, unknown>();
   for (const [key, value] of formData.entries()) {
     if (key !== "prompt" && key !== "consent" && key !== "pdf") {
-      fail(400, "invalid_request", "Only prompt, consent, and pdf are accepted");
+      fail(
+        400,
+        "invalid_request",
+        "Only prompt, consent, and pdf are accepted"
+      );
     }
     if (entries.has(key)) {
       fail(400, "invalid_request", `${key} must be provided once`);
@@ -779,7 +789,10 @@ async function readAuthoringCreationInput(
   const prompt = entries.get("prompt");
   const consent = entries.get("consent");
   const pdf = entries.get("pdf");
-  if (typeof prompt !== "string" || (consent !== undefined && typeof consent !== "string")) {
+  if (
+    typeof prompt !== "string" ||
+    (consent !== undefined && typeof consent !== "string")
+  ) {
     fail(400, "invalid_request", "prompt and consent must be text");
   }
   if (!(pdf instanceof File)) {
@@ -1423,38 +1436,45 @@ function legacySsoConfigurationFromEnv(): LegacySsoConfig | null {
   });
 }
 
+function parseLegacySsoEndpoint(value: string, label: string): URL {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error(`${label} must be an absolute URL`);
+  }
+  if (
+    (url.protocol !== "https:" &&
+      !(
+        url.protocol === "http:" &&
+        (url.hostname === "localhost" ||
+          url.hostname === "127.0.0.1" ||
+          url.hostname === "[::1]")
+      )) ||
+    url.username ||
+    url.password ||
+    url.hash
+  ) {
+    throw new Error(`${label} must use HTTPS without URL credentials`);
+  }
+  return url;
+}
+
 function validatedLegacySsoConfiguration(
   config: LegacySsoConfig
 ): LegacySsoConfig {
-  const parseEndpoint = (value: string, label: string): URL => {
-    let url: URL;
-    try {
-      url = new URL(value);
-    } catch {
-      throw new Error(`${label} must be an absolute URL`);
-    }
-    if (
-      (url.protocol !== "https:" &&
-        !(
-          url.protocol === "http:" &&
-          (url.hostname === "localhost" ||
-            url.hostname === "127.0.0.1" ||
-            url.hostname === "[::1]")
-        )) ||
-      url.username ||
-      url.password ||
-      url.hash
-    ) {
-      throw new Error(`${label} must use HTTPS without URL credentials`);
-    }
-    return url;
-  };
-  const authorize = parseEndpoint(
+  const authorize = parseLegacySsoEndpoint(
     config.authorizeUrl,
     "LEGACY_SSO_AUTHORIZE_URL"
   );
-  const callback = parseEndpoint(config.callbackUrl, "LEGACY_SSO_CALLBACK_URL");
-  const exchange = parseEndpoint(config.exchangeUrl, "LEGACY_SSO_EXCHANGE_URL");
+  const callback = parseLegacySsoEndpoint(
+    config.callbackUrl,
+    "LEGACY_SSO_CALLBACK_URL"
+  );
+  const exchange = parseLegacySsoEndpoint(
+    config.exchangeUrl,
+    "LEGACY_SSO_EXCHANGE_URL"
+  );
   if (
     authorize.search ||
     exchange.search ||
@@ -1479,6 +1499,16 @@ function validatedLegacySsoConfiguration(
   };
 }
 
+function hasAsciiControlCharacters(value: string): boolean {
+  for (const character of value) {
+    const code = character.codePointAt(0);
+    if (code !== undefined && (code <= 0x1f || code === 0x7f)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function safeLegacyFormReturnPath(
   value: unknown,
   callbackUrl: string
@@ -1490,7 +1520,7 @@ function safeLegacyFormReturnPath(
     !value.startsWith("/") ||
     value.startsWith("//") ||
     value.includes("\\") ||
-    /[\u0000-\u001F\u007F]/u.test(value)
+    hasAsciiControlCharacters(value)
   ) {
     return null;
   }
@@ -1503,7 +1533,7 @@ function safeLegacyFormReturnPath(
   if (
     decoded.startsWith("//") ||
     decoded.includes("\\") ||
-    /[\u0000-\u001F\u007F]/u.test(decoded)
+    hasAsciiControlCharacters(decoded)
   ) {
     return null;
   }
@@ -1705,15 +1735,28 @@ async function readLegacyIdentityResponse(
     claims.sub.length === 0 ||
     claims.sub.length > 255 ||
     claims.sub.trim() !== claims.sub ||
-    /[\u0000-\u001F\u007F]/u.test(claims.sub) ||
+    hasAsciiControlCharacters(claims.sub) ||
     typeof claims.email !== "string" ||
     claims.email.length > accountEmailMaximumLength ||
     !accountEmailPattern.test(claims.email) ||
-    claims.email_verified !== true
+    typeof claims.email_verified !== "boolean"
   ) {
     return null;
   }
-  return { email: normalizeEmail(claims.email), subject: claims.sub };
+  let name: string | undefined;
+  if (
+    typeof claims.name === "string" &&
+    !legacyIdentityNameControlPattern.test(claims.name)
+  ) {
+    const trimmedName = claims.name.trim();
+    if (
+      trimmedName.length > 0 &&
+      trimmedName.length <= accountNameMaximumLength
+    ) {
+      name = trimmedName;
+    }
+  }
+  return { email: normalizeEmail(claims.email), name, subject: claims.sub };
 }
 
 async function exchangeLegacyCode(
@@ -1768,92 +1811,118 @@ async function nextLegacySsoGeneration(
   return row.generation;
 }
 
+async function invalidateLegacyAccountLinkReview(
+  tx: Prisma.TransactionClient,
+  requestId: string,
+  providerId: string,
+  email: string,
+  userId: string
+): Promise<void> {
+  const reviewedGeneration = await nextLegacySsoGeneration(tx, providerId);
+  await tx.legacyAccountLinkRequest.update({
+    data: {
+      email,
+      reviewedAt: null,
+      reviewedById: null,
+      reviewedGeneration,
+      status: LegacyAccountLinkStatus.pending,
+      userId,
+    },
+    where: { id: requestId },
+  });
+}
+
 async function linkApprovedLegacyAccount(
+  tx: Prisma.TransactionClient,
   config: LegacySsoConfig,
   identity: LegacyIdentity,
   requestId: string,
   userId: string,
   transactionGeneration: bigint
 ): Promise<LegacySsoAccountUser | null> {
-  return prisma.$transaction(async (tx) => {
-    const [lockedUser] = await tx.$queryRaw<{ id: string }[]>(
-      Prisma.sql`SELECT "id" FROM "user" WHERE "id" = ${userId} FOR UPDATE`
-    );
-    if (!lockedUser) {
-      return null;
-    }
-    const [lockedRequest] = await tx.$queryRaw<{ id: string }[]>(
-      Prisma.sql`SELECT "id" FROM "legacy_account_link_requests" WHERE "id" = ${requestId}::uuid FOR UPDATE`
-    );
-    if (!lockedRequest) {
-      return null;
-    }
-    const linkRequest = await tx.legacyAccountLinkRequest.findUnique({
-      where: { id: requestId },
-    });
-    if (
-      !linkRequest ||
-      (linkRequest.status !== LegacyAccountLinkStatus.approved &&
-        linkRequest.status !== LegacyAccountLinkStatus.linked) ||
-      !linkRequest.reviewedGeneration ||
-      transactionGeneration <= linkRequest.reviewedGeneration ||
-      linkRequest.providerId !== config.providerId ||
-      linkRequest.subject !== identity.subject ||
-      linkRequest.email !== identity.email
-    ) {
-      return null;
-    }
-    const user = await tx.user.findUnique({
-      select: { email: true, enabled: true, id: true, role: true },
-      where: { id: userId },
-    });
-    if (
-      !user ||
-      !user.enabled ||
-      user.role !== "user" ||
-      user.email !== linkRequest.email
-    ) {
-      return null;
-    }
-    const account = await tx.account.findUnique({
-      select: { userId: true },
-      where: {
-        providerId_accountId: {
-          accountId: identity.subject,
-          providerId: config.providerId,
-        },
-      },
-    });
-    if (account && account.userId !== user.id) {
-      return null;
-    }
-    if (!account) {
-      await tx.account.create({
-        data: {
-          accountId: identity.subject,
-          id: crypto.randomUUID(),
-          issuer: config.providerId,
-          providerId: config.providerId,
-          userId: user.id,
-        },
-      });
-    }
-    if (linkRequest.status === LegacyAccountLinkStatus.approved) {
-      await tx.legacyAccountLinkRequest.update({
-        data: { status: LegacyAccountLinkStatus.linked },
-        where: { id: requestId },
-      });
-    }
-    return user;
+  const [lockedUser] = await tx.$queryRaw<{ id: string }[]>(
+    Prisma.sql`SELECT "id" FROM "user" WHERE "id" = ${userId} FOR UPDATE`
+  );
+  if (!lockedUser) {
+    return null;
+  }
+  const [lockedRequest] = await tx.$queryRaw<{ id: string }[]>(
+    Prisma.sql`SELECT "id" FROM "legacy_account_link_requests" WHERE "id" = ${requestId}::uuid FOR UPDATE`
+  );
+  if (!lockedRequest) {
+    return null;
+  }
+  const linkRequest = await tx.legacyAccountLinkRequest.findUnique({
+    where: { id: requestId },
   });
+  if (
+    !linkRequest ||
+    linkRequest.status !== LegacyAccountLinkStatus.approved ||
+    linkRequest.reviewedGeneration === null ||
+    transactionGeneration <= linkRequest.reviewedGeneration ||
+    linkRequest.providerId !== config.providerId ||
+    linkRequest.subject !== identity.subject ||
+    linkRequest.email !== identity.email ||
+    linkRequest.userId !== userId
+  ) {
+    return null;
+  }
+  const user = await tx.user.findUnique({
+    select: { email: true, enabled: true, id: true, role: true },
+    where: { id: userId },
+  });
+  if (
+    !user ||
+    !user.enabled ||
+    user.role !== "user" ||
+    user.email !== linkRequest.email
+  ) {
+    return null;
+  }
+  const account = await tx.account.findUnique({
+    select: { userId: true },
+    where: {
+      providerId_accountId: {
+        accountId: identity.subject,
+        providerId: config.providerId,
+      },
+    },
+  });
+  if (account) {
+    return null;
+  }
+  await tx.account.create({
+    data: {
+      accountId: identity.subject,
+      id: crypto.randomUUID(),
+      issuer: config.providerId,
+      providerId: config.providerId,
+      userId: user.id,
+    },
+  });
+  await tx.legacyAccountLinkRequest.update({
+    data: { status: LegacyAccountLinkStatus.linked },
+    where: { id: requestId },
+  });
+  return user;
 }
 
 async function resolveLegacySsoLinkRequest(
+  tx: Prisma.TransactionClient,
   config: LegacySsoConfig,
   identity: LegacyIdentity,
   transactionGeneration: bigint
 ): Promise<LegacySsoAccountResolution | null> {
-  const linkRequest = await prisma.legacyAccountLinkRequest.findUnique({
+  const account = await tx.account.findUnique({
+    select: { userId: true },
+    where: {
+      providerId_accountId: {
+        accountId: identity.subject,
+        providerId: config.providerId,
+      },
+    },
+  });
+  const linkRequest = await tx.legacyAccountLinkRequest.findUnique({
     where: {
       providerId_subject: {
         providerId: config.providerId,
@@ -1861,26 +1930,110 @@ async function resolveLegacySsoLinkRequest(
       },
     },
   });
-  if (!linkRequest) {
-    return null;
-  }
-  if (linkRequest.email !== identity.email) {
-    return { kind: "failed" };
-  }
-  if (linkRequest.status === LegacyAccountLinkStatus.pending) {
-    return { kind: "pending" };
-  }
   if (
-    linkRequest.status !== LegacyAccountLinkStatus.approved &&
-    linkRequest.status !== LegacyAccountLinkStatus.linked
+    linkRequest &&
+    linkRequest.reviewedGeneration !== null &&
+    transactionGeneration <= linkRequest.reviewedGeneration
   ) {
     return { kind: "failed" };
   }
+  if (account) {
+    await tx.$queryRaw(
+      Prisma.sql`SELECT "id" FROM "user" WHERE "id" = ${account.userId} FOR UPDATE`
+    );
+    const user = await tx.user.findUnique({
+      select: { enabled: true, id: true, role: true },
+      where: { id: account.userId },
+    });
+    return user?.enabled && user.role === "user"
+      ? { kind: "linked", user }
+      : { kind: "failed" };
+  }
+  if (!linkRequest) {
+    return null;
+  }
+  if (
+    linkRequest.status !== LegacyAccountLinkStatus.pending &&
+    linkRequest.status !== LegacyAccountLinkStatus.approved
+  ) {
+    return { kind: "failed" };
+  }
+  const matchingSnapshot = await tx.user.findUnique({
+    select: { id: true },
+    where: { email: identity.email },
+  });
+  const userIds = [linkRequest.userId];
+  if (matchingSnapshot && matchingSnapshot.id !== linkRequest.userId) {
+    userIds.push(matchingSnapshot.id);
+  }
+  userIds.sort();
+  for (const userId of userIds) {
+    await tx.$queryRaw(
+      Prisma.sql`SELECT "id" FROM "user" WHERE "id" = ${userId} FOR UPDATE`
+    );
+  }
+  const [lockedRequest] = await tx.$queryRaw<{ id: string }[]>(
+    Prisma.sql`SELECT "id" FROM "legacy_account_link_requests" WHERE "id" = ${linkRequest.id}::uuid FOR UPDATE`
+  );
+  if (!lockedRequest) {
+    return { kind: "failed" };
+  }
+  const currentRequest = await tx.legacyAccountLinkRequest.findUnique({
+    where: { id: linkRequest.id },
+  });
+  if (
+    !currentRequest ||
+    currentRequest.userId !== linkRequest.userId ||
+    (currentRequest.status !== LegacyAccountLinkStatus.pending &&
+      currentRequest.status !== LegacyAccountLinkStatus.approved) ||
+    (currentRequest.reviewedGeneration !== null &&
+      transactionGeneration <= currentRequest.reviewedGeneration)
+  ) {
+    return { kind: "failed" };
+  }
+  const candidate = await tx.user.findUnique({
+    select: { email: true, enabled: true, id: true, role: true },
+    where: { id: currentRequest.userId },
+  });
+  const matchingCandidate = await tx.user.findUnique({
+    select: { enabled: true, id: true, role: true },
+    where: { email: identity.email },
+  });
+  const selectedUserId =
+    matchingCandidate?.enabled && matchingCandidate.role === "user"
+      ? matchingCandidate.id
+      : currentRequest.userId;
+  const candidateMatches =
+    candidate?.enabled &&
+    candidate.role === "user" &&
+    candidate.email === identity.email;
+  if (
+    currentRequest.email !== identity.email ||
+    selectedUserId !== currentRequest.userId ||
+    (candidate?.email !== currentRequest.email &&
+      currentRequest.reviewedGeneration === null) ||
+    (currentRequest.status === LegacyAccountLinkStatus.approved &&
+      !candidateMatches)
+  ) {
+    await invalidateLegacyAccountLinkReview(
+      tx,
+      currentRequest.id,
+      config.providerId,
+      identity.email,
+      selectedUserId
+    );
+    return { kind: "pending" };
+  }
+  // Unchanged blocked pending evidence stays visible without advancing its fence.
+  if (currentRequest.status === LegacyAccountLinkStatus.pending) {
+    return { kind: "pending" };
+  }
   const user = await linkApprovedLegacyAccount(
+    tx,
     config,
     identity,
-    linkRequest.id,
-    linkRequest.userId,
+    currentRequest.id,
+    currentRequest.userId,
     transactionGeneration
   );
   return user ? { kind: "linked", user } : { kind: "failed" };
@@ -1891,102 +2044,136 @@ async function resolveLegacySsoAccount(
   identity: LegacyIdentity,
   transactionGeneration: bigint
 ): Promise<LegacySsoAccountResolution | null> {
-  const existingRequest = await resolveLegacySsoLinkRequest(
-    config,
-    identity,
-    transactionGeneration
-  );
-  if (existingRequest) {
-    return existingRequest;
-  }
-  const linkedAccountLookup = {
-    include: {
-      user: {
-        select: { enabled: true, id: true, role: true },
-      },
-    },
-    where: {
-      providerId_accountId: {
-        accountId: identity.subject,
-        providerId: config.providerId,
-      },
-    },
-  } as const;
-  const linkedAccount = await prisma.account.findUnique(linkedAccountLookup);
-  if (linkedAccount) {
-    const latestRequest = await resolveLegacySsoLinkRequest(
-      config,
-      identity,
-      transactionGeneration
-    );
-    return latestRequest ?? { kind: "linked", user: linkedAccount.user };
-  }
   try {
-    const user = await prisma.user.create({
-      data: {
-        accounts: {
-          create: {
-            accountId: identity.subject,
-            id: crypto.randomUUID(),
-            issuer: config.providerId,
-            providerId: config.providerId,
+    return await prisma.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(${accountMutationLockId})`;
+      const existing = await resolveLegacySsoLinkRequest(
+        tx,
+        config,
+        identity,
+        transactionGeneration
+      );
+      if (existing) {
+        return existing;
+      }
+      const user = await tx.user.create({
+        data: {
+          accounts: {
+            create: {
+              accountId: identity.subject,
+              id: crypto.randomUUID(),
+              issuer: config.providerId,
+              providerId: config.providerId,
+            },
           },
+          email: identity.email,
+          emailVerified: false,
+          enabled: true,
+          id: crypto.randomUUID(),
+          mustChangePassword: false,
+          name: identity.name ?? identity.email,
+          role: "user",
         },
-        email: identity.email,
-        emailVerified: true,
-        enabled: true,
-        id: crypto.randomUUID(),
-        mustChangePassword: false,
-        name: identity.email,
-        role: "user",
-      },
-      select: { enabled: true, id: true, role: true },
+        select: { enabled: true, id: true, role: true },
+      });
+      return { kind: "linked" as const, user };
     });
-    return { kind: "linked", user };
   } catch (error) {
     if (databaseErrorCode(error) !== "P2002") {
       throw error;
     }
-    const racedAccount = await prisma.account.findUnique(linkedAccountLookup);
-    if (racedAccount) {
-      const latestRequest = await resolveLegacySsoLinkRequest(
+  }
+  // Reconcile only after the optimistic transaction has rolled back.
+  try {
+    return await prisma.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(${accountMutationLockId})`;
+      const existing = await resolveLegacySsoLinkRequest(
+        tx,
         config,
         identity,
         transactionGeneration
       );
-      return latestRequest ?? { kind: "linked", user: racedAccount.user };
-    }
-    const existingUser = await prisma.user.findUnique({
-      select: { id: true },
-      where: { email: identity.email },
-    });
-    if (!existingUser) {
-      return null;
-    }
-    try {
-      await prisma.legacyAccountLinkRequest.create({
-        data: {
+      if (existing) {
+        return existing;
+      }
+      const candidate = await tx.user.findUnique({
+        select: { id: true },
+        where: { email: identity.email },
+      });
+      if (!candidate) {
+        return { kind: "failed" as const };
+      }
+      const [lockedUser] = await tx.$queryRaw<{ id: string }[]>(
+        Prisma.sql`SELECT "id" FROM "user" WHERE "id" = ${candidate.id} FOR UPDATE`
+      );
+      if (!lockedUser) {
+        return { kind: "failed" as const };
+      }
+      await tx.legacyAccountLinkRequest.upsert({
+        create: {
           email: identity.email,
           providerId: config.providerId,
           subject: identity.subject,
-          userId: existingUser.id,
+          userId: candidate.id,
+        },
+        update: {},
+        where: {
+          providerId_subject: {
+            providerId: config.providerId,
+            subject: identity.subject,
+          },
         },
       });
-      return { kind: "pending" };
-    } catch (requestError) {
-      if (
-        databaseErrorCode(requestError) !== "P2002" &&
-        databaseErrorCode(requestError) !== "P2003"
-      ) {
-        throw requestError;
-      }
-      return resolveLegacySsoLinkRequest(
+      return await resolveLegacySsoLinkRequest(
+        tx,
         config,
         identity,
         transactionGeneration
       );
+    });
+  } catch (error) {
+    if (databaseErrorCode(error) !== "P2003") {
+      throw error;
     }
   }
+  return await prisma.$transaction(async (tx) => {
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(${accountMutationLockId})`;
+    const account = await tx.account.findUnique({
+      include: { user: { select: { enabled: true, id: true, role: true } } },
+      where: {
+        providerId_accountId: {
+          accountId: identity.subject,
+          providerId: config.providerId,
+        },
+      },
+    });
+    const request = await tx.legacyAccountLinkRequest.findUnique({
+      where: {
+        providerId_subject: {
+          providerId: config.providerId,
+          subject: identity.subject,
+        },
+      },
+    });
+    if (
+      request &&
+      request.reviewedGeneration !== null &&
+      transactionGeneration <= request.reviewedGeneration
+    ) {
+      return { kind: "failed" as const };
+    }
+    if (account) {
+      return account.user.enabled && account.user.role === "user"
+        ? { kind: "linked" as const, user: account.user }
+        : { kind: "failed" as const };
+    }
+    return request?.status === LegacyAccountLinkStatus.pending &&
+      request.email === identity.email &&
+      (request.reviewedGeneration === null ||
+        transactionGeneration > request.reviewedGeneration)
+      ? { kind: "pending" as const }
+      : { kind: "failed" as const };
+  });
 }
 
 async function createSsoSessionTransfer(
@@ -2372,6 +2559,23 @@ async function claimLegacySsoSession(
     },
   });
   if (consumed.count !== 1) {
+    return legacySsoSessionUnavailableResponse();
+  }
+  const session = await prisma.session.findUnique({
+    select: {
+      expiresAt: true,
+      isSso: true,
+      user: { select: { enabled: true, role: true } },
+    },
+    where: { token: transfer.value },
+  });
+  if (
+    !session ||
+    !session.isSso ||
+    session.expiresAt.getTime() <= now.getTime() ||
+    !session.user.enabled ||
+    session.user.role !== "user"
+  ) {
     return legacySsoSessionUnavailableResponse();
   }
   const headers = new Headers({ "Cache-Control": "no-store" });
@@ -2871,8 +3075,11 @@ async function withAiAuthoringSessionsEnding<T>(
     return await revokeOwnerSessions();
   }
   let revocation: Promise<T> | undefined;
-  const revokeOnce = (): Promise<T> =>
-    (revocation ??= Promise.resolve().then(revokeOwnerSessions));
+  const revokeDeferred = async (): Promise<T> => {
+    await Promise.resolve();
+    return await revokeOwnerSessions();
+  };
+  const revokeOnce = (): Promise<T> => (revocation ??= revokeDeferred());
   const endings = await Promise.allSettled(
     uniqueSessionIds.map((sessionId) =>
       aiAuthoring.endForSession(sessionId, revokeOnce)
@@ -2898,12 +3105,25 @@ async function endAiAuthoringSessions(
   aiAuthoring: AiAuthoringSessions,
   ownerSessionIds: readonly string[]
 ): Promise<void> {
-  await withAiAuthoringSessionsEnding(
-    aiAuthoring,
-    ownerSessionIds,
-    async () => {}
+  await withAiAuthoringSessionsEnding(aiAuthoring, ownerSessionIds, () =>
+    Promise.resolve()
   );
 }
+
+async function isAuthoringOwnerSessionCurrent(
+  request: Request,
+  owner: Identity
+): Promise<boolean> {
+  const currentIdentity = await identityFor(request);
+  return (
+    currentIdentity !== null &&
+    currentIdentity.id === owner.id &&
+    currentIdentity.sessionId === owner.sessionId &&
+    currentIdentity.role === "admin" &&
+    (!currentIdentity.mustChangePassword || currentIdentity.isSso)
+  );
+}
+
 async function handleEmailSignIn(
   request: Request,
   body: unknown,
@@ -3866,10 +4086,49 @@ async function withAdminMutation<T>(
   }
 }
 
+async function readLegacyAccountLinkReviewGeneration(
+  request: Request
+): Promise<bigint | null> {
+  let input: JsonRecord;
+  try {
+    input = await readJsonRecord(request, 1024);
+  } catch (error) {
+    if (error instanceof HttpError && error.httpStatus === 413) {
+      fail(400, "invalid_request", "Account link review body is too large");
+    }
+    throw error;
+  }
+  if (
+    Object.keys(input).length !== 1 ||
+    !Object.hasOwn(input, "reviewedGeneration")
+  ) {
+    fail(400, "invalid_request", "Only reviewedGeneration is accepted");
+  }
+  if (input.reviewedGeneration === null) {
+    return null;
+  }
+  if (
+    typeof input.reviewedGeneration !== "string" ||
+    !legacyReviewedGenerationPattern.test(input.reviewedGeneration)
+  ) {
+    fail(
+      400,
+      "invalid_request",
+      "reviewedGeneration must be a positive bigint decimal string or null"
+    );
+  }
+  const generation = BigInt(input.reviewedGeneration);
+  if (generation > 9_223_372_036_854_775_807n) {
+    fail(400, "invalid_request", "reviewedGeneration is out of range");
+  }
+  return generation;
+}
+
 async function reviewLegacyAccountLink(
   identity: Identity,
   requestId: string,
-  decision: "approved" | "rejected"
+  decision: "approved" | "rejected",
+  expectedReviewedGeneration: bigint | null
 ): Promise<{ ok: true }> {
   const action =
     decision === "approved"
@@ -3896,15 +4155,21 @@ async function reviewLegacyAccountLink(
     if (!linkRequest) {
       fail(404, "not_found", "Account link request was not found");
     }
-    const generation =
-      decision === "approved"
-        ? await nextLegacySsoGeneration(tx, linkRequest.providerId)
-        : null;
     if (linkRequest.status !== LegacyAccountLinkStatus.pending) {
       fail(
         409,
         "account_link_not_pending",
         "Account link request is not pending"
+      );
+    }
+    if (
+      linkRequest.reviewedGeneration !== expectedReviewedGeneration ||
+      linkRequest.userId !== user.id
+    ) {
+      fail(
+        409,
+        "account_link_changed",
+        "Account link request changed; reload and review it again"
       );
     }
     if (decision === "approved") {
@@ -3942,6 +4207,10 @@ async function reviewLegacyAccountLink(
     if (!databaseTime) {
       throw new Error("Database did not return current time");
     }
+    const generation =
+      decision === "approved"
+        ? await nextLegacySsoGeneration(tx, linkRequest.providerId)
+        : linkRequest.reviewedGeneration;
     const updated = await tx.legacyAccountLinkRequest.updateMany({
       data: {
         reviewedAt: databaseTime.currentTime,
@@ -4453,14 +4722,13 @@ async function deleteResponseData({
           ],
         },
       });
-      const ownerSessionIds = revokeOwnerSessions
-        ? (
-            await tx.session.findMany({
-              select: { id: true },
-              where: { userId: response.userId },
-            })
-          ).map(({ id }) => id)
+      const ownerSessions = revokeOwnerSessions
+        ? await tx.session.findMany({
+            select: { id: true },
+            where: { userId: response.userId },
+          })
         : [];
+      const ownerSessionIds = ownerSessions.map(({ id }) => id);
       if (revokeOwnerSessions) {
         await tx.session.deleteMany({ where: { userId: response.userId } });
       }
@@ -5801,7 +6069,10 @@ function parseTemplateFields(
         ) {
           controls.pop();
           if (content && frame.tag) {
-            content.fieldText.set(frame.tag.trim(), frame.placeholderText.trim());
+            content.fieldText.set(
+              frame.tag.trim(),
+              frame.placeholderText.trim()
+            );
           }
           fields.push({
             documentOrder: documentOrderBase + frame.documentOrder,
@@ -6008,10 +6279,18 @@ function parseTemplateFields(
       text: (value) => {
         const frame = controls.at(-1);
         if (content) {
-          if (alternateFallbackDepth > 0 || textDepth === 0 || propertyDepth > 0) {
+          if (
+            alternateFallbackDepth > 0 ||
+            textDepth === 0 ||
+            propertyDepth > 0
+          ) {
             return;
           }
-          if (frame && frame.inContentDepth > 0 && frame.inPropertiesDepth === 0) {
+          if (
+            frame &&
+            frame.inContentDepth > 0 &&
+            frame.inPropertiesDepth === 0
+          ) {
             frame.placeholderText += value;
           } else if (controls.length === 0) {
             const paragraph = paragraphs.at(-1);
@@ -6237,12 +6516,16 @@ function validateTemplateControls(
   expected?: Omit<GeneratedTemplate, "document">
 ): string[] {
   const content = expected
-    ? { paragraphs: [] as string[], fieldText: new Map<string, string>() }
+    ? { fieldText: new Map<string, string>(), paragraphs: [] as string[] }
     : undefined;
   const fields = parseTemplateFields(bytes, content);
   if (expected && content) {
     const remaining = new Map<string, number>();
-    for (const text of [expected.title, expected.description, ...expected.paragraphs]) {
+    for (const text of [
+      expected.title,
+      expected.description,
+      ...expected.paragraphs,
+    ]) {
       if (text) {
         remaining.set(text, (remaining.get(text) ?? 0) + 1);
       }
@@ -6251,20 +6534,32 @@ function validateTemplateControls(
       const count = remaining.get(text) ?? 0;
       if (count > 0) {
         remaining.set(text, count - 1);
-      } else if (!expected.fields.some((field) => text === field.label || text === `${field.label}:`)) {
-        throw new Error("Generated DOCX static text does not match its metadata");
+      } else if (
+        !expected.fields.some(
+          (field) => text === field.label || text === `${field.label}:`
+        )
+      ) {
+        throw new Error(
+          "Generated DOCX static text does not match its metadata"
+        );
       }
     }
     if ([...remaining.values()].some((count) => count > 0)) {
       throw new Error("Generated DOCX static text does not match its metadata");
     }
-    if (fields.some((field) => {
-      const declared = expected.fields.find((candidate) => candidate.tag === field.tag);
-      return !declared ||
-        field.type !== FieldType.text ||
-        field.label !== declared.label ||
-        content.fieldText.get(field.tag) !== declared.placeholder;
-    })) {
+    if (
+      fields.some((field) => {
+        const declared = expected.fields.find(
+          (candidate) => candidate.tag === field.tag
+        );
+        return (
+          !declared ||
+          field.type !== FieldType.text ||
+          field.label !== declared.label ||
+          content.fieldText.get(field.tag) !== declared.placeholder
+        );
+      })
+    ) {
       throw new Error("Generated DOCX controls do not match its metadata");
     }
   }
@@ -7596,38 +7891,40 @@ interface OnlyOfficeDateNames {
   weekdaysShort: string[];
 }
 const onlyOfficeDateNames = new Map<string, OnlyOfficeDateNames>();
+function utcDate(year: number, month: number, day: number): Date {
+  return new Date(Date.UTC(year, month, day));
+}
+
 function onlyOfficeDateNamesFor(locale: string): OnlyOfficeDateNames | null {
   const cached = onlyOfficeDateNames.get(locale);
   if (cached) {
     return cached;
   }
   try {
-    const date = (year: number, month: number, day: number) =>
-      new Date(Date.UTC(year, month, day));
     const names = {
       monthsLong: Array.from({ length: 12 }, (_, month) =>
         new Intl.DateTimeFormat(locale, {
           month: "long",
           timeZone: "UTC",
-        }).format(date(2024, month, 1))
+        }).format(utcDate(2024, month, 1))
       ),
       monthsShort: Array.from({ length: 12 }, (_, month) =>
         new Intl.DateTimeFormat(locale, {
           month: "short",
           timeZone: "UTC",
-        }).format(date(2024, month, 1))
+        }).format(utcDate(2024, month, 1))
       ),
       weekdaysLong: Array.from({ length: 7 }, (_, day) =>
         new Intl.DateTimeFormat(locale, {
           timeZone: "UTC",
           weekday: "long",
-        }).format(date(2024, 0, 7 + day))
+        }).format(utcDate(2024, 0, 7 + day))
       ),
       weekdaysShort: Array.from({ length: 7 }, (_, day) =>
         new Intl.DateTimeFormat(locale, {
           timeZone: "UTC",
           weekday: "short",
-        }).format(date(2024, 0, 7 + day))
+        }).format(utcDate(2024, 0, 7 + day))
       ),
     };
     onlyOfficeDateNames.set(locale, names);
@@ -7647,7 +7944,9 @@ function onlyOfficeDateDisplayValue(
   const calendar = metadata?.calendar;
   if (
     !format ||
-    /(^|[^y])yy([^y]|$)/u.test(format.replaceAll(/'[^']*'|"[^"]*"/gu, "")) ||
+    /(?:^|[^y])yy(?:[^y]|$)/u.test(
+      format.replaceAll(/'[^']*'|"[^"]*"/gu, "")
+    ) ||
     (calendar !== null &&
       calendar !== undefined &&
       calendar !== "gregorian" &&
@@ -7704,8 +8003,8 @@ function onlyOfficeDateDisplayValue(
               : [];
     if (tokenNames.length > 0) {
       captures.push(token);
-      pattern += `(${[...tokenNames]
-        .sort((left, right) => right.length - left.length)
+      pattern += `(${tokenNames
+        .toSorted((left, right) => right.length - left.length)
         .map(escapeDateMaskLiteral)
         .join("|")})`;
     } else {
@@ -9247,6 +9546,60 @@ function nativeNamespacedAttribute(
   }
   return { declaration: "", name: `${prefix}:${localName}` };
 }
+const nativeXmlAttributePattern =
+  /(?<whitespace>\s)(?<name>[^\s="'<>/]+)(?<assignment>\s*=\s*)(?<quote>["'])[\s\S]*?\k<quote>/gu;
+const nativeXmlTagEndPattern = /(?<selfClosing>\/?)>$/u;
+
+function nativeRemoveXmlAttribute(
+  openingTag: string,
+  attributeName: string
+): string {
+  return openingTag.replaceAll(
+    nativeXmlAttributePattern,
+    (match, _whitespace: string, name: string) =>
+      name === attributeName ? "" : match
+  );
+}
+
+function applyNativeXmlPatches(
+  xml: string,
+  patches: readonly { end: number; replacement: string; start: number }[]
+): string {
+  let result = xml;
+  for (const patch of patches.toSorted(
+    (left, right) => right.start - left.start
+  )) {
+    result =
+      result.slice(0, patch.start) +
+      patch.replacement +
+      result.slice(patch.end);
+  }
+  return result;
+}
+
+function nativeTextOpeningTag(openingTag: string, text: string): string {
+  const opening = openingTag.replace(/\/\s*>$/u, ">");
+  return text.trim() === text || /\bxml:space\s*=/u.test(opening)
+    ? opening
+    : opening.replace(/>$/u, ' xml:space="preserve">');
+}
+
+function nativeTextContentXml(
+  name: string,
+  openingTag: string,
+  text: string
+): string {
+  const prefix = name.includes(":")
+    ? name.slice(0, name.lastIndexOf(":") + 1)
+    : "";
+  const [firstPart = "", ...tabParts] = text.split("\t");
+  let replacement = htmlEscape(firstPart);
+  for (const part of tabParts) {
+    replacement += `</${name}><${prefix}tab/>${nativeTextOpeningTag(openingTag, part)}${htmlEscape(part)}`;
+  }
+  return replacement;
+}
+
 function nativeRunPropertiesXml(
   runProperties: string | null,
   contentPrefix: string,
@@ -9295,7 +9648,7 @@ function nativeRunPropertiesXml(
     ): string => {
       let replaced = false;
       const updated = openingTag.replaceAll(
-        /(\s)([^\s="'<>/]+)(\s*=\s*)(["'])[\s\S]*?\4/gu,
+        nativeXmlAttributePattern,
         (
           match,
           whitespace: string,
@@ -9313,19 +9666,10 @@ function nativeRunPropertiesXml(
       return replaced
         ? updated
         : updated.replace(
-            /(\/?)>$/u,
-            ` ${attributeName}="${htmlEscape(font)}"$1>`
+            nativeXmlTagEndPattern,
+            ` ${attributeName}="${htmlEscape(font)}"$<selfClosing>>`
           );
     };
-    const removeAttribute = (
-      openingTag: string,
-      attributeName: string
-    ): string =>
-      openingTag.replaceAll(
-        /(\s)([^\s="'<>/]+)(\s*=\s*)(["'])[\s\S]*?\4/gu,
-        (match, _whitespace: string, name: string) =>
-          name === attributeName ? "" : match
-      );
     fontOpeningTag = runProperties.slice(fontElementStart, fontElementOpenEnd);
     let fontAttributePrefix =
       fontAttributeNames?.ascii?.slice(
@@ -9344,8 +9688,8 @@ function nativeRunPropertiesXml(
       }
       fontAttributePrefix = `${prefix}:`;
       fontOpeningTag = fontOpeningTag.replace(
-        /(\/?)>$/u,
-        ` xmlns:${prefix}="${wordNamespace}"$1>`
+        nativeXmlTagEndPattern,
+        ` xmlns:${prefix}="${wordNamespace}"$<selfClosing>>`
       );
     }
     fontOpeningTag = setAttribute(
@@ -9362,12 +9706,21 @@ function nativeRunPropertiesXml(
         fontAttributeNames.hAnsiTheme,
       ]) {
         if (attributeName) {
-          fontOpeningTag = removeAttribute(fontOpeningTag, attributeName);
+          fontOpeningTag = nativeRemoveXmlAttribute(
+            fontOpeningTag,
+            attributeName
+          );
         }
       }
     } else if (fontAttributeNames === undefined) {
-      fontOpeningTag = removeAttribute(fontOpeningTag, `${prefix}asciiTheme`);
-      fontOpeningTag = removeAttribute(fontOpeningTag, `${prefix}hAnsiTheme`);
+      fontOpeningTag = nativeRemoveXmlAttribute(
+        fontOpeningTag,
+        `${prefix}asciiTheme`
+      );
+      fontOpeningTag = nativeRemoveXmlAttribute(
+        fontOpeningTag,
+        `${prefix}hAnsiTheme`
+      );
     }
     if (tag.isSelfClosing) {
       fontElementEnd = parser.position;
@@ -9400,7 +9753,8 @@ function nativeRunPropertiesXml(
     );
   }
   if (/\/\s*>$/u.test(runProperties)) {
-    const propertiesName = runProperties.match(/^<([^\s/>]+)/u)?.[1];
+    const propertiesName =
+      runProperties.match(/^<(?<name>[^\s/>]+)/u)?.groups?.name;
     if (propertiesName) {
       return `${runProperties.replace(/\/\s*>$/u, ">")}${fontXml}</${propertiesName}>`;
     }
@@ -9530,14 +9884,7 @@ function nativeApplyTextControlFontXml(
   } catch {
     fail(422, "invalid_template", "DOCX XML is malformed");
   }
-  let updated = xml;
-  for (const patch of patches.sort((left, right) => right.start - left.start)) {
-    updated =
-      updated.slice(0, patch.start) +
-      patch.replacement +
-      updated.slice(patch.end);
-  }
-  return updated;
+  return applyNativeXmlPatches(xml, patches);
 }
 
 const nativeDateMonths = [
@@ -9891,27 +10238,6 @@ function nativeRewriteTextControlContentXml(
       offset = end;
     }
   }
-  const textOpeningTag = (openingTag: string, text: string): string => {
-    const opening = openingTag.replace(/\/\s*>$/u, ">");
-    return text.trim() === text || /\bxml:space\s*=/u.test(opening)
-      ? opening
-      : opening.replace(/>$/u, ' xml:space="preserve">');
-  };
-  const textContentXml = (
-    name: string,
-    openingTag: string,
-    text: string
-  ): string => {
-    const prefix = name.includes(":")
-      ? name.slice(0, name.lastIndexOf(":") + 1)
-      : "";
-    const [firstPart = "", ...tabParts] = text.split("\t");
-    let replacement = htmlEscape(firstPart);
-    for (const part of tabParts) {
-      replacement += `</${name}><${prefix}tab/>${textOpeningTag(openingTag, part)}${htmlEscape(part)}`;
-    }
-    return replacement;
-  };
   const patches: { end: number; replacement: string; start: number }[] = [];
   for (const paragraph of removedParagraphRanges) {
     patches.push({
@@ -9943,13 +10269,13 @@ function nativeRewriteTextControlContentXml(
     if (node.selfClosing && !assigned && appended.length === 0) {
       continue;
     }
-    const opening = textOpeningTag(node.openingTag, assigned);
+    const opening = nativeTextOpeningTag(node.openingTag, assigned);
     const prefix = node.name.includes(":")
       ? node.name.slice(0, node.name.lastIndexOf(":") + 1)
       : "";
-    let replacement = textContentXml(node.name, opening, assigned);
+    let replacement = nativeTextContentXml(node.name, opening, assigned);
     for (const line of appended) {
-      replacement += `</${node.name}><${prefix}br/>${textOpeningTag(node.openingTag, line)}${textContentXml(node.name, opening, line)}`;
+      replacement += `</${node.name}><${prefix}br/>${nativeTextOpeningTag(node.openingTag, line)}${nativeTextContentXml(node.name, opening, line)}`;
     }
     if (node.selfClosing) {
       patches.push({
@@ -9991,22 +10317,18 @@ function nativeRewriteTextControlContentXml(
       continue;
     }
     const name = `${prefix}t`;
-    const opening = textOpeningTag(`<${name} xml:space="preserve">`, assigned);
-    let replacement = `${opening}${textContentXml(name, opening, assigned)}</${name}>`;
+    const opening = nativeTextOpeningTag(
+      `<${name} xml:space="preserve">`,
+      assigned
+    );
+    let replacement = `${opening}${nativeTextContentXml(name, opening, assigned)}</${name}>`;
     for (const line of appended) {
-      const lineOpening = textOpeningTag(opening, line);
-      replacement += `<${prefix}br/>${lineOpening}${textContentXml(name, lineOpening, line)}</${name}>`;
+      const lineOpening = nativeTextOpeningTag(opening, line);
+      replacement += `<${prefix}br/>${lineOpening}${nativeTextContentXml(name, lineOpening, line)}</${name}>`;
     }
     patches.push({ end: node.end, replacement, start: node.start });
   }
-  let updated = xml;
-  for (const patch of patches.sort((left, right) => right.start - left.start)) {
-    updated =
-      updated.slice(0, patch.start) +
-      patch.replacement +
-      updated.slice(patch.end);
-  }
-  return updated;
+  return applyNativeXmlPatches(xml, patches);
 }
 
 function nativeFieldControlXml(
@@ -10139,9 +10461,10 @@ function nativeFieldControlXml(
         runProperties: null,
         runPropertiesFontAttributeNames: undefined,
         runPropertiesStart: null,
-        tag: controlTags[controlIndex++] ?? null,
+        tag: controlTags[controlIndex] ?? null,
         uncheckedState: null,
       });
+      controlIndex += 1;
     } else {
       const frame = controls.at(-1);
       if (frame) {
@@ -10213,7 +10536,7 @@ function nativeFieldControlXml(
                   patches.push({
                     end: parser.position,
                     replacement: openingTag.replaceAll(
-                      /(\s)([^\s="'<>/]+)(\s*=\s*)(["'])[\s\S]*?\4/gu,
+                      nativeXmlAttributePattern,
                       (match, whitespace, attributeName, assignment, quote) =>
                         attributeName === tagValueAttributeName
                           ? `${whitespace}${attributeName}${assignment}${quote}${htmlEscape(normalizedTag)}${quote}`
@@ -10281,7 +10604,7 @@ function nativeFieldControlXml(
               let replacement: string;
               if (propertyAttributeName) {
                 replacement = openingTag.replaceAll(
-                  /(\s)([^\s="'<>/]+)(\s*=\s*)(["'])[\s\S]*?\4/gu,
+                  nativeXmlAttributePattern,
                   (match, whitespace, name, assignment, quote) =>
                     name === propertyAttributeName
                       ? replacementValue === null
@@ -10312,8 +10635,8 @@ function nativeFieldControlXml(
                   namespaceDeclaration = ` xmlns:${localPrefix}="${tag.uri}"`;
                 }
                 replacement = openingTag.replace(
-                  /(\/?)>$/u,
-                  ` ${prefix}${propertyName}="${htmlEscape(replacementValue ?? "")}"${namespaceDeclaration}$1>`
+                  nativeXmlTagEndPattern,
+                  ` ${prefix}${propertyName}="${htmlEscape(replacementValue ?? "")}"${namespaceDeclaration}$<selfClosing>>`
                 );
               }
               patches.push({
@@ -10408,7 +10731,7 @@ function nativeFieldControlXml(
               const replacement =
                 checkedAttributeName || unqualifiedValueName
                   ? openingTag.replaceAll(
-                      /(\s)([^\s="'<>/]+)(\s*=\s*)(["'])[\s\S]*?\4/gu,
+                      nativeXmlAttributePattern,
                       (match, whitespace, name, assignment, quote) =>
                         name === checkedAttributeName ||
                         name === unqualifiedValueName
@@ -10416,8 +10739,8 @@ function nativeFieldControlXml(
                           : match
                     )
                   : openingTag.replace(
-                      /(\/?)>$/u,
-                      ` ${qualifiedAttribute.name}="${checkedValue}"${qualifiedAttribute.declaration}$1>`
+                      nativeXmlTagEndPattern,
+                      ` ${qualifiedAttribute.name}="${checkedValue}"${qualifiedAttribute.declaration}$<selfClosing>>`
                     );
               patches.push({
                 end: parser.position,
@@ -10654,19 +10977,17 @@ function nativeFieldControlXml(
           } else {
             fail(422, "invalid_template", "A native field is incomplete");
           }
-        } else {
-          if (preservedContent !== existingContent) {
-            const contentStart = completed.contentStart;
-            const contentEnd = completed.contentEnd;
-            if (contentStart === null || contentEnd === null) {
-              fail(422, "invalid_template", "A native field is incomplete");
-            }
-            patches.push({
-              end: contentEnd,
-              replacement: preservedContent,
-              start: contentStart,
-            });
+        } else if (preservedContent !== existingContent) {
+          const contentStart = completed.contentStart;
+          const contentEnd = completed.contentEnd;
+          if (contentStart === null || contentEnd === null) {
+            fail(422, "invalid_template", "A native field is incomplete");
           }
+          patches.push({
+            end: contentEnd,
+            replacement: preservedContent,
+            start: contentStart,
+          });
         }
       }
     }
@@ -10677,14 +10998,7 @@ function nativeFieldControlXml(
   } catch {
     fail(422, "invalid_template", "The DOCX package contains invalid XML");
   }
-  let result = xml;
-  for (const patch of patches.sort((left, right) => right.start - left.start)) {
-    result =
-      result.slice(0, patch.start) +
-      patch.replacement +
-      result.slice(patch.end);
-  }
-  return result;
+  return applyNativeXmlPatches(xml, patches);
 }
 function nativePreserveAlternateNamespaceDeclarations(
   xml: string,
@@ -10712,8 +11026,8 @@ function nativePreserveAlternateNamespaceDeclarations(
         for (const declaration of declarations) {
           if (!Object.hasOwn(tag.attributes, declaration.name)) {
             replacement = replacement.replace(
-              /(\/?)>$/u,
-              ` ${declaration.name}="${htmlEscape(declaration.value)}"$1>`
+              nativeXmlTagEndPattern,
+              ` ${declaration.name}="${htmlEscape(declaration.value)}"$<selfClosing>>`
             );
           }
         }
@@ -10736,14 +11050,7 @@ function nativePreserveAlternateNamespaceDeclarations(
   } catch {
     fail(422, "invalid_template", "DOCX XML is malformed");
   }
-  let result = xml;
-  for (const patch of patches.sort((left, right) => right.start - left.start)) {
-    result =
-      result.slice(0, patch.start) +
-      patch.replacement +
-      result.slice(patch.end);
-  }
-  return result;
+  return applyNativeXmlPatches(xml, patches);
 }
 
 // PDF conversion omits AlternateContent fields; retain compatible Choice content and namespace bindings.
@@ -10754,6 +11061,7 @@ function nativeFlattenAlternateFieldsXml(
 ): { xml: string; supported: boolean } {
   let result = xml;
   while (result.includes("AlternateContent")) {
+    const sourceXml = result;
     interface AlternateContentFrame {
       branch: "choice" | "fallback" | null;
       choiceContentStart: number | null;
@@ -10832,7 +11140,7 @@ function nativeFlattenAlternateFieldsXml(
           hasNestedField: false,
           namespaceDeclarations: declarations,
           parent: alternates.at(-1) ?? null,
-          start: result.lastIndexOf("<", parser.position - 1),
+          start: sourceXml.lastIndexOf("<", parser.position - 1),
           unsupported: false,
         });
       } else if (
@@ -10883,7 +11191,7 @@ function nativeFlattenAlternateFieldsXml(
           alternate,
           branch: alternate?.branch ?? null,
           inPropertiesDepth: 0,
-          start: result.lastIndexOf("<", parser.position - 1),
+          start: sourceXml.lastIndexOf("<", parser.position - 1),
           tag: null,
         });
       } else if (control) {
@@ -10950,7 +11258,7 @@ function nativeFlattenAlternateFieldsXml(
             alternate.choiceContentStart !== null
           ) {
             alternate.choiceFieldStart = alternate.choiceContentStart;
-            alternate.choiceFieldEnd = result.lastIndexOf(
+            alternate.choiceFieldEnd = sourceXml.lastIndexOf(
               "</",
               parser.position - 1
             );
@@ -11000,7 +11308,7 @@ function nativeFlattenAlternateFieldsXml(
             patches.push({
               end: parser.position,
               replacement: nativePreserveAlternateNamespaceDeclarations(
-                result.slice(
+                sourceXml.slice(
                   completed.choiceFieldStart,
                   completed.choiceFieldEnd
                 ),
@@ -11021,7 +11329,7 @@ function nativeFlattenAlternateFieldsXml(
       }
     });
     try {
-      parser.write(result).close();
+      parser.write(sourceXml).close();
     } catch {
       fail(422, "invalid_template", "The DOCX package contains invalid XML");
     }
@@ -11031,15 +11339,7 @@ function nativeFlattenAlternateFieldsXml(
     if (validateOnly) {
       return { supported: true, xml: result };
     }
-    let flattened = result;
-    for (const patch of patches.sort(
-      (left, right) => right.start - left.start
-    )) {
-      flattened =
-        flattened.slice(0, patch.start) +
-        patch.replacement +
-        flattened.slice(patch.end);
-    }
+    const flattened = applyNativeXmlPatches(sourceXml, patches);
     if (flattened === result) {
       return { supported: true, xml: result };
     }
@@ -11086,7 +11386,10 @@ function overlayNativeResponseDocument(
     const xml = flattened.xml;
     if (xml !== originalXml) {
       archive[archivePath] = strToU8(
-        xml.replace(/encoding=(["'])UTF-16(?:LE|BE)?\1/iu, 'encoding="UTF-8"')
+        xml.replace(
+          /encoding=(?<quote>["'])UTF-16(?:LE|BE)?\k<quote>/iu,
+          'encoding="UTF-8"'
+        )
       );
     }
   }
@@ -12092,26 +12395,41 @@ function fieldRulePrefillPolicy(policy: FieldRulePolicy): PrefillPolicy {
     : PrefillPolicy.editable;
 }
 
-function requireTemplateDraft(
-  form: FormWithDocuments,
-  missingMessage = "No template DOCX is configured"
-): TemplateDraft {
-  if (!form.templateDraft) {
-    fail(409, "document_unavailable", missingMessage);
+async function requireFieldRuleContext(
+  request: Request,
+  publicId: string
+): Promise<{
+  authorization: ActionEditorAuthorization;
+  capabilityScope: Omit<EditorCapabilityScope, "action" | "operationId">;
+  form: FormWithDocuments;
+  templateDraft: TemplateDraft;
+}> {
+  const authorization = await requireActionEditorAuthorization(request);
+  requireAdmin(authorization.actor);
+  const form = await findFormByPublicId(publicId);
+  if (form.status === FormStatus.published || form.publishedTemplate) {
+    fail(
+      409,
+      "published_immutable",
+      "Published forms cannot change Field rules"
+    );
   }
-  return form.templateDraft;
-}
-
-function fieldRuleCapabilityScope(
-  form: FormWithDocuments,
-  templateDraft: TemplateDraft
-): Omit<EditorCapabilityScope, "action" | "operationId"> {
-  return {
+  const templateDraft = form.templateDraft;
+  if (!templateDraft) {
+    fail(409, "document_unavailable", "No template DOCX is configured");
+  }
+  const capabilityScope = {
     documentKey: templateDraft.documentKey,
     formId: form.id,
     targetId: templateDraft.id,
     targetType: "template-draft",
-  };
+  } as const;
+  requireEditorScope(authorization, {
+    ...capabilityScope,
+    action: "configure-fields",
+  });
+  await requireActiveEditorLease(authorization, capabilityScope);
+  return { authorization, capabilityScope, form, templateDraft };
 }
 
 function validateFieldRulePointer(prefillPointer: string | null): void {
@@ -13310,7 +13628,7 @@ function revisionSelector(value: unknown): RevisionSelector {
   if (value === "original") {
     return 0;
   }
-  if (typeof value === "string" && /^(0|[1-9]\d*)$/u.test(value)) {
+  if (typeof value === "string" && /^(?:0|[1-9]\d*)$/u.test(value)) {
     const revision = Number(value);
     if (Number.isSafeInteger(revision)) {
       return revision;
@@ -13421,7 +13739,7 @@ async function receiptManifestFields(submission: SubmissionWithManifest) {
   if (!manifest || !publishedTemplate) {
     return [];
   }
-  return manifestFieldsWithDocumentMetadata(
+  return await manifestFieldsWithDocumentMetadata(
     publishedTemplate.objectKey,
     manifest.displayMetadataVersion,
     manifest.fields
@@ -13950,6 +14268,7 @@ export function createApp(options: AppOptions = {}) {
           email: true,
           id: true,
           providerId: true,
+          reviewedGeneration: true,
           status: true,
           subject: true,
           user: { select: adminUserSelect },
@@ -13963,6 +14282,8 @@ export function createApp(options: AppOptions = {}) {
           rows.length > accountUserPageSize ? (page.at(-1)?.id ?? null) : null,
         requests: page.map(({ user, ...linkRequest }) => ({
           ...linkRequest,
+          reviewedGeneration:
+            linkRequest.reviewedGeneration?.toString() ?? null,
           user: accountUserSummary(user),
         })),
       };
@@ -13988,7 +14309,13 @@ export function createApp(options: AppOptions = {}) {
             }
             return linkRequest.userId;
           },
-          (identity) => reviewLegacyAccountLink(identity, requestId, "approved")
+          async (identity) =>
+            reviewLegacyAccountLink(
+              identity,
+              requestId,
+              "approved",
+              await readLegacyAccountLinkReviewGeneration(request)
+            )
         );
       },
       { parse: "none" }
@@ -14014,7 +14341,13 @@ export function createApp(options: AppOptions = {}) {
             }
             return linkRequest.userId;
           },
-          (identity) => reviewLegacyAccountLink(identity, requestId, "rejected")
+          async (identity) =>
+            reviewLegacyAccountLink(
+              identity,
+              requestId,
+              "rejected",
+              await readLegacyAccountLinkReviewGeneration(request)
+            )
         );
       },
       { parse: "none" }
@@ -14250,20 +14583,52 @@ export function createApp(options: AppOptions = {}) {
                     where: { id: { in: staleHandoffIds } },
                   });
                 }
+                const incompleteRequests =
+                  await tx.legacyAccountLinkRequest.findMany({
+                    orderBy: { id: "asc" },
+                    select: {
+                      email: true,
+                      id: true,
+                      providerId: true,
+                      userId: true,
+                    },
+                    where: {
+                      status: {
+                        in: [
+                          LegacyAccountLinkStatus.pending,
+                          LegacyAccountLinkStatus.approved,
+                        ],
+                      },
+                      userId: target.id,
+                    },
+                  });
+                for (const linkRequest of incompleteRequests) {
+                  await tx.$queryRaw(
+                    Prisma.sql`SELECT "id" FROM "legacy_account_link_requests" WHERE "id" = ${linkRequest.id}::uuid FOR UPDATE`
+                  );
+                }
+                for (const linkRequest of incompleteRequests) {
+                  await invalidateLegacyAccountLinkReview(
+                    tx,
+                    linkRequest.id,
+                    linkRequest.providerId,
+                    linkRequest.email,
+                    linkRequest.userId
+                  );
+                }
               }
               const updated = await tx.user.update({
                 data: updateData,
                 select: adminUserSelect,
                 where: { id: target.id },
               });
-              const ownerSessionIds = revokeSessions
-                ? (
-                    await tx.session.findMany({
-                      select: { id: true },
-                      where: { userId: target.id },
-                    })
-                  ).map(({ id }) => id)
+              const ownerSessions = revokeSessions
+                ? await tx.session.findMany({
+                    select: { id: true },
+                    where: { userId: target.id },
+                  })
                 : [];
+              const ownerSessionIds = ownerSessions.map(({ id }) => id);
               if (revokeSessions) {
                 await tx.session.deleteMany({ where: { userId: target.id } });
               }
@@ -14414,12 +14779,11 @@ export function createApp(options: AppOptions = {}) {
                 select: adminUserSelect,
                 where: { id: target.id },
               });
-              const ownerSessionIds = (
-                await tx.session.findMany({
-                  select: { id: true },
-                  where: { userId: target.id },
-                })
-              ).map(({ id }) => id);
+              const ownerSessions = await tx.session.findMany({
+                select: { id: true },
+                where: { userId: target.id },
+              });
+              const ownerSessionIds = ownerSessions.map(({ id }) => id);
               await tx.session.deleteMany({ where: { userId: target.id } });
               await createAccountAudit(tx, {
                 action: "reset_user_password",
@@ -14493,18 +14857,10 @@ export function createApp(options: AppOptions = {}) {
             { authSessionId: identity.sessionId, userId: identity.id },
             input.prompt,
             input.consent,
-            (document, expected) => validateTemplateControls(document, expected),
+            (document, expected) =>
+              validateTemplateControls(document, expected),
             reservation,
-            async () => {
-              const currentIdentity = await identityFor(request);
-              return (
-                currentIdentity !== null &&
-                currentIdentity.id === identity.id &&
-                currentIdentity.sessionId === identity.sessionId &&
-                currentIdentity.role === "admin" &&
-                (!currentIdentity.mustChangePassword || currentIdentity.isSso)
-              );
-            },
+            () => isAuthoringOwnerSessionCurrent(request, identity),
             input.pdfBytes
           );
           return Response.json(
@@ -14518,21 +14874,18 @@ export function createApp(options: AppOptions = {}) {
       },
       { parse: "none" }
     )
-    .get(
-      "/api/admin/ai-authoring/sessions/current",
-      async ({ request }) => {
-        const identity = await requireIdentity(request);
-        requireAdmin(identity);
-        const session = await aiAuthoring.current({
-          authSessionId: identity.sessionId,
-          userId: identity.id,
-        });
-        return Response.json(
-          { session },
-          { headers: { "Cache-Control": "private, no-store" } }
-        );
-      }
-    )
+    .get("/api/admin/ai-authoring/sessions/current", async ({ request }) => {
+      const identity = await requireIdentity(request);
+      requireAdmin(identity);
+      const session = await aiAuthoring.current({
+        authSessionId: identity.sessionId,
+        userId: identity.id,
+      });
+      return Response.json(
+        { session },
+        { headers: { "Cache-Control": "private, no-store" } }
+      );
+    })
     .post(
       "/api/admin/ai-authoring/sessions/:sessionId/revisions",
       async ({ request, params }) => {
@@ -14540,36 +14893,16 @@ export function createApp(options: AppOptions = {}) {
         requireAdmin(identity);
         const reservation = aiAuthoring.reserveRequest(identity.sessionId);
         try {
-          const input = await readJsonRecord(request, accountBodyMaximumBytes);
-          if (
-            Object.keys(input).length !== 2 ||
-            !Object.hasOwn(input, "consent") ||
-            !Object.hasOwn(input, "prompt") ||
-            typeof input.prompt !== "string"
-          ) {
-            fail(
-              400,
-              "invalid_request",
-              "Only consent and prompt are accepted"
-            );
-          }
+          const input = await readAuthoringPromptInput(request);
           const session = await aiAuthoring.revise(
             params.sessionId,
             { authSessionId: identity.sessionId, userId: identity.id },
             input.prompt,
             input.consent,
-            (document, expected) => validateTemplateControls(document, expected),
+            (document, expected) =>
+              validateTemplateControls(document, expected),
             reservation,
-            async () => {
-              const currentIdentity = await identityFor(request);
-              return (
-                currentIdentity !== null &&
-                currentIdentity.id === identity.id &&
-                currentIdentity.sessionId === identity.sessionId &&
-                currentIdentity.role === "admin" &&
-                (!currentIdentity.mustChangePassword || currentIdentity.isSso)
-              );
-            }
+            () => isAuthoringOwnerSessionCurrent(request, identity)
           );
           return Response.json(
             { session },
@@ -15365,24 +15698,7 @@ export function createApp(options: AppOptions = {}) {
     .get(
       "/api/admin/forms/:publicId/schema",
       async ({ request, params, query }) => {
-        const authorization = await requireActionEditorAuthorization(request);
-        const { actor: identity } = authorization;
-        requireAdmin(identity);
-        const form = await findFormByPublicId(params.publicId);
-        if (form.status === FormStatus.published || form.publishedTemplate) {
-          fail(
-            409,
-            "published_immutable",
-            "Published forms cannot change Field rules"
-          );
-        }
-        const templateDraft = requireTemplateDraft(form);
-        const capabilityScope = fieldRuleCapabilityScope(form, templateDraft);
-        requireEditorScope(authorization, {
-          ...capabilityScope,
-          action: "configure-fields",
-        });
-        await requireActiveEditorLease(authorization, capabilityScope);
+        await requireFieldRuleContext(request, params.publicId);
         const queryRecord = query as unknown as JsonRecord;
         return schemaPage(queryRecord.q, queryRecord.cursor);
       }
@@ -15390,24 +15706,10 @@ export function createApp(options: AppOptions = {}) {
     .get(
       "/api/admin/forms/:publicId/field-rules",
       async ({ request, params }) => {
-        const authorization = await requireActionEditorAuthorization(request);
-        const { actor: identity } = authorization;
-        requireAdmin(identity);
-        const form = await findFormByPublicId(params.publicId);
-        if (form.status === FormStatus.published || form.publishedTemplate) {
-          fail(
-            409,
-            "published_immutable",
-            "Published forms cannot change Field rules"
-          );
-        }
-        const templateDraft = requireTemplateDraft(form);
-        const capabilityScope = fieldRuleCapabilityScope(form, templateDraft);
-        requireEditorScope(authorization, {
-          ...capabilityScope,
-          action: "configure-fields",
-        });
-        await requireActiveEditorLease(authorization, capabilityScope);
+        const { templateDraft } = await requireFieldRuleContext(
+          request,
+          params.publicId
+        );
         const rules = await prisma.draftFieldRule.findMany({
           orderBy: { tag: "asc" },
           select: {
@@ -15424,24 +15726,9 @@ export function createApp(options: AppOptions = {}) {
     .patch(
       "/api/admin/forms/:publicId/field-rules",
       async ({ request, params }) => {
-        const authorization = await requireActionEditorAuthorization(request);
+        const { authorization, capabilityScope, form, templateDraft } =
+          await requireFieldRuleContext(request, params.publicId);
         const { actor: identity } = authorization;
-        requireAdmin(identity);
-        const form = await findFormByPublicId(params.publicId);
-        if (form.status === FormStatus.published || form.publishedTemplate) {
-          fail(
-            409,
-            "published_immutable",
-            "Published forms cannot change Field rules"
-          );
-        }
-        const templateDraft = requireTemplateDraft(form);
-        const capabilityScope = fieldRuleCapabilityScope(form, templateDraft);
-        requireEditorScope(authorization, {
-          ...capabilityScope,
-          action: "configure-fields",
-        });
-        await requireActiveEditorLease(authorization, capabilityScope);
         const input = fieldRuleInput(
           await readJsonRecord(request, fieldRuleBodyMaximumBytes)
         );

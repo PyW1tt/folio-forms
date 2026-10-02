@@ -20,6 +20,89 @@ import { Button, Notice, Spinner } from "@/components/ui";
 import { ApiError } from "@/lib/api";
 import { roleFor, useAuth } from "@/lib/auth";
 
+const AdminNavigation = ({
+  pathname,
+  onNavigate,
+}: {
+  pathname: string;
+  onNavigate: () => void;
+}) => {
+  const formsAreActive =
+    pathname === "/admin" || pathname.startsWith("/admin/forms/");
+  const auditAreActive = pathname.startsWith("/admin/audit");
+  const resultsAreActive = pathname.startsWith("/admin/results");
+  const authoringIsActive = pathname.startsWith("/admin/ai-authoring");
+
+  return (
+    <>
+      <Link
+        to="/admin"
+        className={`rounded-lg px-3 py-2 text-sm font-semibold text-[var(--ink-soft)] hover:bg-[var(--accent-soft)] ${
+          formsAreActive ? "bg-[var(--accent-soft)] text-[var(--ink)]" : ""
+        }`}
+        activeOptions={{ exact: true }}
+        aria-current={formsAreActive ? "page" : undefined}
+        onClick={onNavigate}
+      >
+        แบบฟอร์ม
+      </Link>
+      <Link
+        to="/admin/results"
+        search={{ form: undefined }}
+        className={`rounded-lg px-3 py-2 text-sm font-semibold text-[var(--ink-soft)] hover:bg-[var(--accent-soft)] ${
+          resultsAreActive ? "bg-[var(--accent-soft)] text-[var(--ink)]" : ""
+        }`}
+        aria-current={resultsAreActive ? "page" : undefined}
+        onClick={onNavigate}
+      >
+        <ClipboardList className="mr-1 inline" size={15} />
+        ผลลัพธ์
+      </Link>
+      <Link
+        to="/admin/audit"
+        className={`rounded-lg px-3 py-2 text-sm font-semibold text-[var(--ink-soft)] hover:bg-[var(--accent-soft)] ${
+          auditAreActive ? "bg-[var(--accent-soft)] text-[var(--ink)]" : ""
+        }`}
+        aria-current={auditAreActive ? "page" : undefined}
+        onClick={onNavigate}
+      >
+        <ScrollText className="mr-1 inline" size={15} />
+        Audit Trail
+      </Link>
+      <Link
+        to="/admin/users"
+        className="rounded-lg px-3 py-2 text-sm font-semibold text-[var(--ink-soft)] hover:bg-[var(--accent-soft)]"
+        activeProps={{
+          className: "bg-[var(--accent-soft)] text-[var(--ink)]",
+        }}
+        onClick={onNavigate}
+      >
+        <UsersRound className="mr-1 inline" size={15} />
+        จัดการผู้ใช้
+      </Link>
+      <Link
+        to="/admin/forms/new"
+        className="rounded-lg px-3 py-2 text-sm font-semibold text-[var(--ink-soft)] hover:bg-[var(--accent-soft)]"
+        onClick={onNavigate}
+      >
+        <FilePlus2 className="mr-1 inline" size={15} />
+        สร้างแบบฟอร์ม
+      </Link>
+      <Link
+        to="/admin/ai-authoring"
+        className={`rounded-lg px-3 py-2 text-sm font-semibold text-[var(--ink-soft)] hover:bg-[var(--accent-soft)] ${
+          authoringIsActive ? "bg-[var(--accent-soft)] text-[var(--ink)]" : ""
+        }`}
+        aria-current={authoringIsActive ? "page" : undefined}
+        onClick={onNavigate}
+      >
+        <WandSparkles className="mr-1 inline" size={15} />
+        AI Authoring
+      </Link>
+    </>
+  );
+};
+
 export const AppShell = ({ children }: { children: React.ReactNode }) => {
   const { user, signOut } = useAuth();
   const [logoutError, setLogoutError] = useState<"cleanup" | "sign-out" | null>(
@@ -30,12 +113,6 @@ export const AppShell = ({ children }: { children: React.ReactNode }) => {
   const navigate = useNavigate();
   const location = useLocation();
   const role = roleFor(user);
-  const formsAreActive =
-    location.pathname === "/admin" ||
-    location.pathname.startsWith("/admin/forms/");
-  const auditAreActive = location.pathname.startsWith("/admin/audit");
-  const resultsAreActive = location.pathname.startsWith("/admin/results");
-  const authoringIsActive = location.pathname.startsWith("/admin/ai-authoring");
   const [legacySsoError, setLegacySsoError] = useState(false);
 
   const logout = async () => {
@@ -94,80 +171,10 @@ export const AppShell = ({ children }: { children: React.ReactNode }) => {
             aria-label="เมนูหลัก"
           >
             {role === "admin" ? (
-              <>
-                <Link
-                  to="/admin"
-                  className={`rounded-lg px-3 py-2 text-sm font-semibold text-[var(--ink-soft)] hover:bg-[var(--accent-soft)] ${
-                    formsAreActive
-                      ? "bg-[var(--accent-soft)] text-[var(--ink)]"
-                      : ""
-                  }`}
-                  activeOptions={{ exact: true }}
-                  aria-current={formsAreActive ? "page" : undefined}
-                  onClick={() => setOpen(false)}
-                >
-                  แบบฟอร์ม
-                </Link>
-                <Link
-                  to="/admin/results"
-                  search={{ form: undefined }}
-                  className={`rounded-lg px-3 py-2 text-sm font-semibold text-[var(--ink-soft)] hover:bg-[var(--accent-soft)] ${
-                    resultsAreActive
-                      ? "bg-[var(--accent-soft)] text-[var(--ink)]"
-                      : ""
-                  }`}
-                  aria-current={resultsAreActive ? "page" : undefined}
-                  onClick={() => setOpen(false)}
-                >
-                  <ClipboardList className="mr-1 inline" size={15} />
-                  ผลลัพธ์
-                </Link>
-                <Link
-                  to="/admin/audit"
-                  className={`rounded-lg px-3 py-2 text-sm font-semibold text-[var(--ink-soft)] hover:bg-[var(--accent-soft)] ${
-                    auditAreActive
-                      ? "bg-[var(--accent-soft)] text-[var(--ink)]"
-                      : ""
-                  }`}
-                  aria-current={auditAreActive ? "page" : undefined}
-                  onClick={() => setOpen(false)}
-                >
-                  <ScrollText className="mr-1 inline" size={15} />
-                  Audit Trail
-                </Link>
-                <Link
-                  to="/admin/users"
-                  className="rounded-lg px-3 py-2 text-sm font-semibold text-[var(--ink-soft)] hover:bg-[var(--accent-soft)]"
-                  activeProps={{
-                    className: "bg-[var(--accent-soft)] text-[var(--ink)]",
-                  }}
-                  onClick={() => setOpen(false)}
-                >
-                  <UsersRound className="mr-1 inline" size={15} />
-                  จัดการผู้ใช้
-                </Link>
-                <Link
-                  to="/admin/forms/new"
-                  className="rounded-lg px-3 py-2 text-sm font-semibold text-[var(--ink-soft)] hover:bg-[var(--accent-soft)]"
-                  onClick={() => setOpen(false)}
-                >
-                  <FilePlus2 className="mr-1 inline" size={15} />
-                  สร้างแบบฟอร์ม
-                </Link>
-                <Link
-                  to="/admin/ai-authoring"
-                  className={`rounded-lg px-3 py-2 text-sm font-semibold text-[var(--ink-soft)] hover:bg-[var(--accent-soft)] ${
-                    authoringIsActive
-                      ? "bg-[var(--accent-soft)] text-[var(--ink)]"
-                      : ""
-                  }`}
-                  aria-current={authoringIsActive ? "page" : undefined}
-                  onClick={() => setOpen(false)}
-                >
-                  <WandSparkles className="mr-1 inline" size={15} />
-                  AI Authoring
-                </Link>
-              </>
+              <AdminNavigation
+                pathname={location.pathname}
+                onNavigate={() => setOpen(false)}
+              />
             ) : (
               <Link
                 to="/dashboard"

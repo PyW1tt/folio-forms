@@ -19,9 +19,9 @@ runtime/
 graphify-out/
 
 # Environment variables
-.env
-.env*.local
-.env.production
+.env*
+!.env.example
+!.env.*.example
 # IDEs and editors
 .vscode/*
 !.vscode/settings.json

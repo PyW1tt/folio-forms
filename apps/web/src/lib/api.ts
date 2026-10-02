@@ -76,6 +76,7 @@ export interface AdminLegacyAccountLinkRequest {
   email: string;
   id: string;
   providerId: string;
+  reviewedGeneration: string | null;
   status: "pending";
   subject: string;
   user: AdminUser;

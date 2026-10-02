@@ -31,6 +31,9 @@ interface EditorLease {
 
 const leaseRenewalIntervalMs = 30_000;
 
+const editorConfigPath = (configUrl: string): string =>
+  configUrl.startsWith("http") ? configUrl.replace(API_ORIGIN, "") : configUrl;
+
 interface EditorConfig {
   apiScriptUrl?: string;
   apiUrl?: string;
@@ -226,12 +229,14 @@ export type EditorBridgeMessage =
 const acknowledgeBridge = (
   source: MessageEventSource,
   pluginOrigin: string,
-  bridgeId: string
+  bridgeId: string,
+  editorSaveSupported: boolean
 ) => {
   try {
     (source as Window).postMessage(
       {
         bridgeId,
+        editorSaveSupported,
         source: "folio-parent",
         type: "bridge-ack",
       },
@@ -532,9 +537,7 @@ export const OnlyOfficeEditor = ({
       };
     }
 
-    const path = configUrl.startsWith("http")
-      ? configUrl.replace(API_ORIGIN, "")
-      : configUrl;
+    const path = editorConfigPath(configUrl);
     loadedConfigUrlRef.current = null;
     setConfig(null);
     setError(null);
@@ -611,6 +614,31 @@ export const OnlyOfficeEditor = ({
     );
     pinnedSourceRef.current = null;
     terminalOperationIdsRef.current.clear();
+    let nativeDocumentDirty: boolean | null = null;
+    let nativeSaveError: string | null = null;
+    let pendingEditorSaveId: string | null = null;
+    const respondToEditorSave = (saveFailure?: string) => {
+      const requestId = pendingEditorSaveId;
+      const source = pinnedSourceRef.current;
+      if (!requestId || !source || cancelled) {
+        return;
+      }
+      pendingEditorSaveId = null;
+      try {
+        (source as Window).postMessage(
+          {
+            bridgeId,
+            requestId,
+            source: "folio-parent",
+            type: "editor-save-response",
+            ...(saveFailure ? { error: saveFailure } : { saved: true }),
+          },
+          pluginOrigin
+        );
+      } catch {
+        // The plugin may close its frame while native saving is in flight.
+      }
+    };
     const respondToCapabilityRequest = (
       request: CapabilityRequestMessage,
       response: { capability: string } | { error: string }
@@ -649,9 +677,7 @@ export const OnlyOfficeEditor = ({
 
       const requestedLeaseId = leaseRef.current?.id;
       try {
-        const path = configUrl.startsWith("http")
-          ? configUrl.replace(API_ORIGIN, "")
-          : configUrl;
+        const path = editorConfigPath(configUrl);
         const fresh = await apiGet<EditorConfig>(path);
         if (cancelled) {
           return;
@@ -700,13 +726,38 @@ export const OnlyOfficeEditor = ({
           return;
         }
         pinnedSourceRef.current = event.source;
-        acknowledgeBridge(event.source, pluginOrigin, bridgeId);
+        acknowledgeBridge(
+          event.source,
+          pluginOrigin,
+          bridgeId,
+          !config.editorUrl && !readOnly
+        );
         setBridgeReadyVersion((value) => value + 1);
         return;
       }
 
       const pinnedSource = pinnedSourceRef.current;
       if (!pinnedSource || event.source !== pinnedSource) {
+        return;
+      }
+
+      if (
+        isRecord(data) &&
+        data.bridgeId === bridgeId &&
+        data.source === "form-bridge" &&
+        data.type === "editor-save-request" &&
+        isNonEmptyString(data.requestId)
+      ) {
+        pendingEditorSaveId = data.requestId;
+        if (config.editorUrl || readOnly || nativeDocumentDirty === null) {
+          respondToEditorSave(
+            "Native editor save synchronization is unavailable"
+          );
+        } else if (nativeSaveError) {
+          respondToEditorSave(nativeSaveError);
+        } else if (!nativeDocumentDirty) {
+          respondToEditorSave();
+        }
         return;
       }
 
@@ -747,23 +798,21 @@ export const OnlyOfficeEditor = ({
     if (hasBridge) {
       window.addEventListener("message", handleBridgeMessage);
     }
+    const detachBridge = () => {
+      respondToEditorSave("The native editor closed before changes were saved");
+      cancelled = true;
+      window.removeEventListener("message", handleBridgeMessage);
+      pinnedSourceRef.current = null;
+    };
 
     if (config.editorUrl || !hostRef.current) {
-      return () => {
-        cancelled = true;
-        window.removeEventListener("message", handleBridgeMessage);
-        pinnedSourceRef.current = null;
-      };
+      return detachBridge;
     }
 
     if (!isRecord(config.config)) {
       setError("การตั้งค่าตัวแก้ไขเอกสารไม่ถูกต้อง");
       reportState("error");
-      return () => {
-        cancelled = true;
-        window.removeEventListener("message", handleBridgeMessage);
-        pinnedSourceRef.current = null;
-      };
+      return detachBridge;
     }
 
     const documentEditorConfig = recordOrEmpty(config.config.editorConfig);
@@ -778,6 +827,28 @@ export const OnlyOfficeEditor = ({
       },
       events: {
         ...recordOrEmpty(config.config.events),
+        onDocumentReady: () => {
+          // A newly loaded, untouched document has no pending local changes.
+          nativeDocumentDirty ??= false;
+        },
+        onDocumentStateChange: (event: unknown) => {
+          if (!isRecord(event) || typeof event.data !== "boolean") {
+            respondToEditorSave(
+              "The native editor returned an invalid save state"
+            );
+            return;
+          }
+          nativeDocumentDirty = event.data;
+          if (!nativeDocumentDirty) {
+            // ONLYOFFICE defines false as changes sent to its editing service.
+            nativeSaveError = null;
+            respondToEditorSave();
+          }
+        },
+        onError: () => {
+          nativeSaveError = "The native editor could not save document changes";
+          respondToEditorSave(nativeSaveError);
+        },
         onRequestClose: restore,
       },
     };
@@ -821,9 +892,7 @@ export const OnlyOfficeEditor = ({
     }
 
     return () => {
-      cancelled = true;
-      window.removeEventListener("message", handleBridgeMessage);
-      pinnedSourceRef.current = null;
+      detachBridge();
       const editor = editorRef.current;
       editorRef.current = null;
       try {
@@ -842,7 +911,8 @@ export const OnlyOfficeEditor = ({
   };
 
   const renderEditorContent = () => {
-    if (editorState === "blocked") {
+    const blocked = editorState === "blocked";
+    if (blocked || editorState === "error" || error) {
       return (
         <div
           ref={feedbackRef}
@@ -853,31 +923,16 @@ export const OnlyOfficeEditor = ({
         >
           <Notice tone="danger">
             <div className="space-y-3">
-              <p className="font-semibold">เอกสารนี้กำลังถูกแก้ไขโดยผู้ใช้รายอื่น</p>
-              <p>ยังไม่เปิดตัวแก้ไขจนกว่าจะเชื่อมต่อใหม่ได้</p>
+              {blocked ? (
+                <>
+                  <p className="font-semibold">เอกสารนี้กำลังถูกแก้ไขโดยผู้ใช้รายอื่น</p>
+                  <p>ยังไม่เปิดตัวแก้ไขจนกว่าจะเชื่อมต่อใหม่ได้</p>
+                </>
+              ) : (
+                <p>{error ?? "ไม่สามารถเปิดตัวแก้ไขเอกสารได้"}</p>
+              )}
               <Button type="button" variant="secondary" onClick={retry}>
-                ลองเชื่อมต่อใหม่
-              </Button>
-            </div>
-          </Notice>
-        </div>
-      );
-    }
-
-    if (editorState === "error" || error) {
-      return (
-        <div
-          ref={feedbackRef}
-          className={`grid ${
-            expanded ? "h-full min-h-0" : "min-h-[520px]"
-          } place-items-center p-8`}
-          tabIndex={-1}
-        >
-          <Notice tone="danger">
-            <div className="space-y-3">
-              <p>{error ?? "ไม่สามารถเปิดตัวแก้ไขเอกสารได้"}</p>
-              <Button type="button" variant="secondary" onClick={retry}>
-                ลองใหม่
+                {blocked ? "ลองเชื่อมต่อใหม่" : "ลองใหม่"}
               </Button>
             </div>
           </Notice>

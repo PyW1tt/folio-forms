@@ -10,15 +10,15 @@ An authenticated person who fills Forms and can inspect only their own Drafts an
 
 ## Legacy Identity
 
-A person identified by a stable subject in the old system and an explicit provider. A Legacy Identity links to at most one Folio User; a matching email alone never establishes the link.
+A person authenticated by PDMS, identified by a stable subject and an explicit provider, whose stored email does not establish mailbox ownership. A Legacy Identity links to at most one Folio User; matching email alone never establishes a link, and changed email does not replace a completed link's owner.
 
 ## SSO Bridge
 
-The login handoff in which the old system verifies a Legacy Identity and Folio creates its own session for the linked User. The systems do not share passwords or login tokens.
+The login handoff in which PDMS authenticates a Legacy Identity and Folio creates its own session for an eligible linked User, using authenticated identity evidence rather than verified mailbox ownership. The systems do not share passwords or login tokens.
 
 ## Pending Account Link
 
-A verified Legacy Identity awaiting an Admin's explicit approval to associate it with an existing Folio User. It does not grant access before the link is approved.
+An authenticated Legacy Identity awaiting an Admin's review of current identity evidence and ownership of an existing Folio User; changed incomplete evidence requires new review. Approval alone grants no access: a fresh SSO attempt after approval must complete the binding.
 
 ## Form
 

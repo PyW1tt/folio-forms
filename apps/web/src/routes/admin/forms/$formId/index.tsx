@@ -273,7 +273,26 @@ const FormEditorRoute = () => {
   const metadataCanAct = !busy && !metadataBusy && !operationBusy;
   const canDuplicate =
     loadedForm.status === "draft" || loadedForm.status === "published";
+  let fillMethodHelp =
+    "Native supports text, checkbox, date, dropdown, and combo Fields; Pictures remain ONLYOFFICE-only.";
+  if (loadedForm.status === "draft") {
+    fillMethodHelp = "Fill Method can be changed after publishing.";
+  } else if (loadedForm.nativeFillAvailable) {
+    fillMethodHelp = "This method applies to new and existing Draft responses.";
+  }
 
+  const refreshFormAfterOperation = async () => {
+    try {
+      setForm(await loadFormDetail(publicId));
+    } catch (refreshError) {
+      setError(
+        detailErrorMessage(
+          refreshError,
+          "ดำเนินการสำเร็จแล้ว แต่โหลดข้อมูลล่าสุดไม่สำเร็จ กรุณาลองใหม่"
+        )
+      );
+    }
+  };
   const perform = async (action: "save" | "publish") => {
     if (!canAct || busyGuardRef.current || !editorConfigUrl) {
       return;
@@ -314,16 +333,7 @@ const FormEditorRoute = () => {
           ? "เผยแพร่แบบฟอร์มแล้ว คำตอบใหม่จะใช้เอกสารฉบับนี้"
           : "บันทึกแบบร่างเรียบร้อยแล้ว"
       );
-      try {
-        setForm(await loadFormDetail(publicId));
-      } catch (refreshError) {
-        setError(
-          detailErrorMessage(
-            refreshError,
-            "ดำเนินการสำเร็จแล้ว แต่โหลดข้อมูลล่าสุดไม่สำเร็จ กรุณาลองใหม่"
-          )
-        );
-      }
+      await refreshFormAfterOperation();
     } catch (caughtError) {
       setOperationStatus("failed");
       setError(
@@ -537,16 +547,7 @@ const FormEditorRoute = () => {
         ? "เผยแพร่แบบฟอร์มแล้ว คำตอบใหม่จะใช้เอกสารฉบับนี้"
         : "บันทึกแบบร่างเรียบร้อยแล้ว"
     );
-    try {
-      setForm(await loadFormDetail(publicId));
-    } catch (refreshError) {
-      setError(
-        detailErrorMessage(
-          refreshError,
-          "ดำเนินการสำเร็จแล้ว แต่โหลดข้อมูลล่าสุดไม่สำเร็จ กรุณาลองใหม่"
-        )
-      );
-    }
+    await refreshFormAfterOperation();
   };
 
   const copyLink = async () => {
@@ -788,10 +789,7 @@ const FormEditorRoute = () => {
             className="mt-5 space-y-2"
             aria-busy={metadataBusy === "fill-method"}
           >
-            <label
-              className="text-sm font-semibold"
-              htmlFor="form-fill-method"
-            >
+            <label className="text-sm font-semibold" htmlFor="form-fill-method">
               Fill Method
             </label>
             <select
@@ -799,7 +797,7 @@ const FormEditorRoute = () => {
               disabled={!metadataCanAct || loadedForm.status === "draft"}
               id="form-fill-method"
               onChange={(event) => {
-                const value = event.target.value;
+                const { value } = event.target;
                 if (value === "native" || value === "onlyoffice") {
                   void updateFillMethod(value);
                 }
@@ -807,10 +805,7 @@ const FormEditorRoute = () => {
               value={loadedForm.fillMethod}
             >
               <option value="onlyoffice">ONLYOFFICE</option>
-              <option
-                disabled={!loadedForm.nativeFillAvailable}
-                value="native"
-              >
+              <option disabled={!loadedForm.nativeFillAvailable} value="native">
                 Native form
               </option>
             </select>
@@ -818,14 +813,13 @@ const FormEditorRoute = () => {
               className="text-xs text-[var(--ink-soft)]"
               id="form-fill-method-help"
             >
-              {loadedForm.status === "draft"
-                ? "Fill Method can be changed after publishing."
-                : loadedForm.nativeFillAvailable
-                  ? "This method applies to new and existing Draft responses."
-                  : "Native supports text, checkbox, date, dropdown, and combo Fields; Pictures remain ONLYOFFICE-only."}
+              {fillMethodHelp}
             </p>
             {metadataBusy === "fill-method" ? (
-              <p className="inline-flex items-center gap-2 text-xs" role="status">
+              <p
+                className="inline-flex items-center gap-2 text-xs"
+                role="status"
+              >
                 <Spinner />
                 Updating Fill Method…
               </p>

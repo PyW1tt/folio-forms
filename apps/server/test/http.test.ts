@@ -3,7 +3,7 @@ import { afterEach, expect, test, vi } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import nodePath from "node:path";
 
 import { AgentSession } from "@earendil-works/pi-coding-agent";
 import { auth, ensureBootstrapAdmin } from "@onlyoffice/auth";
@@ -45,6 +45,8 @@ import {
   readObject,
 } from "../src/storage";
 
+const { basename, join } = nodePath;
+
 const databaseUrl = process.env.DATABASE_URL;
 if (!databaseUrl) {
   throw new Error(
@@ -76,6 +78,19 @@ afterEach(() => {
   legacySsoMock = undefined;
 });
 const jsonHeaders = { "Content-Type": "application/json" };
+const onlyOfficeSaveCapabilityFor = (config: {
+  bridge?: { capabilities?: Record<"save-draft" | "submit", string> };
+}): string => {
+  const capability = config.bridge?.capabilities?.["save-draft"];
+  if (!capability) {
+    throw new Error("The ONLYOFFICE save capability is missing");
+  }
+  return capability;
+};
+const temporaryDirectories = async () => {
+  const entries = await readdir(tmpdir());
+  return entries.filter((entry) => entry.startsWith("folio-authoring-"));
+};
 const editorCapabilityHeaders = (capability: string) => ({
   "X-Editor-Capability": capability,
 });
@@ -654,6 +669,154 @@ const completeLegacySsoCallback = async (
     })
   );
 };
+
+interface LegacyAccountLinkReviewSnapshot {
+  email: string;
+  id: string;
+  providerId: string;
+  reviewedGeneration: string | null;
+  subject: string;
+  user: {
+    email: string;
+    enabled: boolean;
+    id: string;
+    name: string;
+    role: string;
+  };
+}
+
+const legacyAccountLinkSnapshot = async (
+  handle: LegacySsoHttpHandler,
+  bearer: string,
+  requestId: string
+): Promise<LegacyAccountLinkReviewSnapshot> => {
+  let cursor: string | null = null;
+  do {
+    const url = new URL("/api/admin/account-links", legacySsoCallbackUrl);
+    if (cursor) {
+      url.searchParams.set("cursor", cursor);
+    }
+    const response = await handle(
+      new Request(url.href, {
+        headers: { Authorization: `Bearer ${bearer}` },
+      })
+    );
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as {
+      nextCursor: string | null;
+      requests: LegacyAccountLinkReviewSnapshot[];
+    };
+    const snapshot = body.requests.find((request) => request.id === requestId);
+    if (snapshot) {
+      return snapshot;
+    }
+    cursor = body.nextCursor;
+  } while (cursor);
+  throw new Error("The pending account link is missing from Admin review");
+};
+
+const submitLegacyAccountLinkReview = (
+  handle: LegacySsoHttpHandler,
+  bearer: string,
+  snapshot: LegacyAccountLinkReviewSnapshot,
+  decision: "approve" | "reject"
+): Promise<Response> =>
+  Promise.resolve(
+    handle(
+      new Request(
+        new URL(
+          `/api/admin/account-links/${snapshot.id}/${decision}`,
+          legacySsoCallbackUrl
+        ).href,
+        {
+          body: JSON.stringify({
+            reviewedGeneration: snapshot.reviewedGeneration,
+          }),
+          headers: { ...jsonHeaders, Authorization: `Bearer ${bearer}` },
+          method: "POST",
+        }
+      )
+    )
+  );
+
+const createPdmsReviewFixture = async () => {
+  const password = "PDMS-review-fixture-password";
+  const candidate = await createCredentialFixture({
+    email: `pdms-review-${crypto.randomUUID()}@example.com`,
+    name: "Original review candidate",
+    password,
+  });
+  const reviewer = await createCredentialFixture({
+    email: `pdms-review-admin-${crypto.randomUUID()}@example.com`,
+    name: "PDMS reviewer",
+    password,
+    role: "admin",
+  });
+  const reviewerBearer = await bearerFor(reviewer.email, password);
+  const identity = {
+    email: candidate.email,
+    email_verified: false,
+    sub: `pdms-${crypto.randomUUID()}`,
+  };
+  const providerId = `pdms-${crypto.randomUUID()}`;
+  const clientId = `folio-${crypto.randomUUID()}`;
+  const clientSecret = `pdms-secret-${crypto.randomUUID()}`;
+  let nextExchange: (() => Promise<Response>) | undefined;
+  const mock = startLegacySsoMock({
+    callbackUrl: legacySsoCallbackUrl,
+    clientId,
+    clientSecret,
+    codeLifetimeMs: 60_000,
+    exchangeResponse: () => {
+      const delayed = nextExchange;
+      nextExchange = undefined;
+      return delayed ? delayed() : Response.json(identity);
+    },
+    identity,
+  });
+  legacySsoMock = mock;
+  const config = {
+    authorizeUrl: mock.authorizeUrl,
+    callbackUrl: legacySsoCallbackUrl,
+    clientId,
+    clientSecret,
+    exchangeUrl: mock.exchangeUrl,
+    providerId,
+  };
+  const ssoApp = createLegacySsoTestApp(config);
+  const handle: LegacySsoHttpHandler = (request) => ssoApp.handle(request);
+  const initialCallback = await completeLegacySsoCallback(handle);
+  expect(initialCallback.headers.get("location")).toBe(
+    legacySsoPendingLocation
+  );
+  const request = await prisma.legacyAccountLinkRequest.findUniqueOrThrow({
+    where: { providerId_subject: { providerId, subject: identity.sub } },
+  });
+  return {
+    candidate,
+    config,
+    delayNextExchange: () => {
+      const entered = Promise.withResolvers<undefined>();
+      const release = Promise.withResolvers<undefined>();
+      nextExchange = async () => {
+        const claims = { ...identity };
+        entered.resolve();
+        await release.promise;
+        return Response.json(claims);
+      };
+      return {
+        entered: entered.promise,
+        release: () => release.resolve(),
+      };
+    },
+    handle,
+    identity,
+    password,
+    request,
+    reviewer,
+    reviewerBearer,
+  };
+};
 const completeAuthenticatedLegacySsoCallback = async (
   handle: LegacySsoHttpHandler,
   bearer: string,
@@ -705,6 +868,995 @@ const claimLegacySsoBearer = async (
   return claimBody.token;
 };
 
+const pdmsInitialNameCases: {
+  label: string;
+  name: unknown;
+  expectedName?: string;
+}[] = [
+  {
+    expectedName: "PDMS Test User",
+    label: "trimmed name",
+    name: "  PDMS Test User  ",
+  },
+  {
+    expectedName: "n".repeat(120),
+    label: "120-unit name",
+    name: "n".repeat(120),
+  },
+  {
+    expectedName: "\u{1F600}".repeat(60),
+    label: "120 UTF-16-unit name",
+    name: "\u{1F600}".repeat(60),
+  },
+  { label: "absent name", name: undefined },
+  { label: "nonstring name", name: 123 },
+  { label: "null name", name: null },
+  { label: "blank name", name: "   " },
+  { label: "121-unit name", name: "n".repeat(121) },
+  { label: "over-limit UTF-16 name", name: "\u{1F600}".repeat(61) },
+  { label: "newline name", name: "\nPDMS Test User\n" },
+  { label: "tab name", name: "\tPDMS Test User\t" },
+  { label: "NUL name", name: "PDMS\u0000Test User" },
+  { label: "DEL name", name: "PDMS\u007FTest User" },
+  { label: "C1-control name", name: "PDMS\u0085Test User" },
+];
+
+const registerPdmsNameCase = (
+  nameCase: (typeof pdmsInitialNameCases)[number]
+): void => {
+  const currentNameCase = nameCase;
+  test(`PDMS truthful identity provisions ${currentNameCase.label} without mailbox verification or provider privileges`, async () => {
+    let assertedName = currentNameCase.name;
+    const identity = {
+      email: `PDMS-Name-${crypto.randomUUID()}@EXAMPLE.COM`,
+      email_verified: false,
+      sub: "12345",
+    };
+    const email = identity.email.toLowerCase();
+    const clientId = `folio-${crypto.randomUUID()}`;
+    const clientSecret = `pdms-secret-${crypto.randomUUID()}`;
+    const providerId = `pdms-${crypto.randomUUID()}`;
+    legacySsoMock = startLegacySsoMock({
+      callbackUrl: legacySsoCallbackUrl,
+      clientId,
+      clientSecret,
+      codeLifetimeMs: 60_000,
+      exchangeResponse: () =>
+        Response.json({
+          ...identity,
+          access_token: "not-a-folio-credential",
+          name: assertedName,
+          role: "admin",
+        }),
+      identity,
+    });
+    const ssoApp = createLegacySsoTestApp({
+      authorizeUrl: legacySsoMock.authorizeUrl,
+      callbackUrl: legacySsoCallbackUrl,
+      clientId,
+      clientSecret,
+      exchangeUrl: legacySsoMock.exchangeUrl,
+      providerId,
+    });
+    const handle: LegacySsoHttpHandler = (request) => ssoApp.handle(request);
+    const callback = await completeLegacySsoCallback(handle);
+    expect(callback.status).toBe(303);
+    expect(callback.headers.get("location")).toBe(
+      new URL("/dashboard", legacySsoWebOrigin).href
+    );
+    const bearer = await claimLegacySsoBearer(handle, callback);
+    const user = await prisma.user.findUniqueOrThrow({ where: { email } });
+    expect(user).toMatchObject({
+      email,
+      emailVerified: false,
+      enabled: true,
+      mustChangePassword: false,
+      name: currentNameCase.expectedName ?? email,
+      role: "user",
+    });
+    expect(await prisma.user.count({ where: { email } })).toBe(1);
+    expect(
+      await prisma.account.findMany({ where: { userId: user.id } })
+    ).toEqual([
+      expect.objectContaining({
+        accessToken: null,
+        accessTokenExpiresAt: null,
+        accountId: identity.sub,
+        idToken: null,
+        issuer: providerId,
+        password: null,
+        providerId,
+        refreshToken: null,
+        refreshTokenExpiresAt: null,
+        userId: user.id,
+      }),
+    ]);
+    const session = await handle(
+      new Request("https://folio.example.test/api/session", {
+        headers: { Authorization: `Bearer ${bearer}` },
+      })
+    );
+    expect(session.status).toBe(200);
+    expect(await session.json()).toMatchObject({
+      user: {
+        email,
+        id: user.id,
+        name: currentNameCase.expectedName ?? email,
+        role: "user",
+      },
+    });
+    const forbiddenAdmin = await handle(
+      new Request("https://folio.example.test/api/admin/users", {
+        headers: { Authorization: `Bearer ${bearer}` },
+      })
+    );
+    expect(forbiddenAdmin.status).toBe(403);
+
+    identity.email = `PDMS-Changed-${crypto.randomUUID()}@EXAMPLE.COM`;
+    identity.email_verified = true;
+    assertedName = "A later PDMS name must not replace the local profile";
+    const repeatedCallback = await completeLegacySsoCallback(handle);
+    const repeatedBearer = await claimLegacySsoBearer(handle, repeatedCallback);
+    const repeatedSession = await handle(
+      new Request("https://folio.example.test/api/session", {
+        headers: { Authorization: `Bearer ${repeatedBearer}` },
+      })
+    );
+    expect(repeatedSession.status).toBe(200);
+    expect(await repeatedSession.json()).toMatchObject({
+      user: { email, id: user.id, name: user.name, role: "user" },
+    });
+    expect(
+      await prisma.user.findUnique({ where: { id: user.id } })
+    ).toMatchObject({
+      email,
+      emailVerified: false,
+      mustChangePassword: false,
+      name: user.name,
+    });
+  });
+};
+
+for (const nameCase of pdmsInitialNameCases) {
+  registerPdmsNameCase(nameCase);
+}
+
+const pdmsInvalidExchangeCases: {
+  label: string;
+  response: (identity: {
+    email: string;
+    email_verified: boolean;
+    sub: string;
+  }) => Response | Promise<Response>;
+}[] = [
+  {
+    label: "missing sub",
+    response: (identity) => Response.json({ ...identity, sub: undefined }),
+  },
+  {
+    label: "subject-only payload",
+    response: (identity) =>
+      Response.json({ ...identity, sub: undefined, subject: identity.sub }),
+  },
+  {
+    label: "nonstring sub",
+    response: (identity) => Response.json({ ...identity, sub: 12_345 }),
+  },
+  {
+    label: "empty sub",
+    response: (identity) => Response.json({ ...identity, sub: "" }),
+  },
+  {
+    label: "over-limit sub",
+    response: (identity) =>
+      Response.json({ ...identity, sub: "s".repeat(256) }),
+  },
+  {
+    label: "untrimmed sub",
+    response: (identity) => Response.json({ ...identity, sub: " 12345" }),
+  },
+  {
+    label: "control-character sub",
+    response: (identity) => Response.json({ ...identity, sub: "123\u007F45" }),
+  },
+  {
+    label: "missing email",
+    response: (identity) => Response.json({ ...identity, email: undefined }),
+  },
+  {
+    label: "nonstring email",
+    response: (identity) => Response.json({ ...identity, email: 123 }),
+  },
+  {
+    label: "malformed email",
+    response: (identity) =>
+      Response.json({ ...identity, email: "not-an-email" }),
+  },
+  {
+    label: "over-limit email",
+    response: (identity) =>
+      Response.json({ ...identity, email: `${"e".repeat(243)}@example.com` }),
+  },
+  {
+    label: "missing email_verified",
+    response: (identity) =>
+      Response.json({ ...identity, email_verified: undefined }),
+  },
+  {
+    label: "string email_verified",
+    response: (identity) =>
+      Response.json({ ...identity, email_verified: "false" }),
+  },
+  {
+    label: "numeric email_verified",
+    response: (identity) => Response.json({ ...identity, email_verified: 1 }),
+  },
+  {
+    label: "null email_verified",
+    response: (identity) =>
+      Response.json({ ...identity, email_verified: null }),
+  },
+  { label: "array payload", response: (identity) => Response.json([identity]) },
+  { label: "null payload", response: () => Response.json(null) },
+  {
+    label: "malformed JSON",
+    response: () => new Response("{", { headers: jsonHeaders }),
+  },
+  {
+    label: "non-JSON content",
+    response: (identity) =>
+      Response.json(identity, { headers: { "Content-Type": "text/plain" } }),
+  },
+  {
+    label: "oversized streamed JSON",
+    response: (identity) => {
+      const body = new TextEncoder().encode(
+        JSON.stringify({ ...identity, padding: "x".repeat(8192) })
+      );
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(body.subarray(0, 4096));
+            controller.enqueue(body.subarray(4096));
+            controller.close();
+          },
+        }),
+        { headers: jsonHeaders }
+      );
+    },
+  },
+  {
+    label: "exchange failure",
+    response: (identity) => Response.json(identity, { status: 503 }),
+  },
+  {
+    label: "redirecting exchange",
+    response: () =>
+      Response.redirect("https://attacker.example.test/exchange", 302),
+  },
+  {
+    label: "exchange timeout",
+    // Exercise the real fetch AbortSignal.timeout(5000); fake timers cannot drive the platform timeout.
+    response: () => Promise.withResolvers<Response>().promise,
+  },
+];
+
+const registerPdmsInvalidExchangeCase = (
+  exchangeCase: (typeof pdmsInvalidExchangeCases)[number]
+): void => {
+  const currentExchangeCase = exchangeCase;
+  test(`PDMS denies ${currentExchangeCase.label} without provisioning or granting a Session`, async () => {
+    const identity = {
+      email: `pdms-invalid-${crypto.randomUUID()}@example.com`,
+      email_verified: false,
+      sub: `pdms-${crypto.randomUUID()}`,
+    };
+    const clientId = `folio-${crypto.randomUUID()}`;
+    const clientSecret = `pdms-secret-${crypto.randomUUID()}`;
+    const providerId = `pdms-${crypto.randomUUID()}`;
+    legacySsoMock = startLegacySsoMock({
+      callbackUrl: legacySsoCallbackUrl,
+      clientId,
+      clientSecret,
+      codeLifetimeMs: 60_000,
+      exchangeResponse: () => currentExchangeCase.response(identity),
+      identity,
+    });
+    const ssoApp = createLegacySsoTestApp({
+      authorizeUrl: legacySsoMock.authorizeUrl,
+      callbackUrl: legacySsoCallbackUrl,
+      clientId,
+      clientSecret,
+      exchangeUrl: legacySsoMock.exchangeUrl,
+      providerId,
+    });
+    const handle: LegacySsoHttpHandler = (request) => ssoApp.handle(request);
+    const initialCounts = {
+      accounts: await prisma.account.count(),
+      requests: await prisma.legacyAccountLinkRequest.count(),
+      sessions: await prisma.session.count(),
+      users: await prisma.user.count(),
+    };
+    const callback = await completeLegacySsoCallback(handle);
+    expect(callback.status).toBe(303);
+    expect(callback.headers.get("location")).toBe(legacySsoFailedLocation);
+    expect(cookiePairFrom(callback, "__Host-folio-sso-session")).toBe(
+      "__Host-folio-sso-session="
+    );
+    const claim = await handle(
+      new Request("https://folio.example.test/api/legacy-sso/session", {
+        headers: {
+          Cookie: "__Host-folio-sso-session=",
+          Origin: "https://folio.example.test",
+        },
+        method: "POST",
+      })
+    );
+    expect(claim.status).toBe(401);
+    expect(await prisma.user.count()).toBe(initialCounts.users);
+    expect(await prisma.account.count()).toBe(initialCounts.accounts);
+    expect(await prisma.session.count()).toBe(initialCounts.sessions);
+    expect(await prisma.legacyAccountLinkRequest.count()).toBe(
+      initialCounts.requests
+    );
+  }, 15_000);
+};
+
+for (const exchangeCase of pdmsInvalidExchangeCases) {
+  registerPdmsInvalidExchangeCase(exchangeCase);
+}
+
+test("PDMS accepts JSON at the 8 KiB boundary and a 255-unit stable subject", async () => {
+  const identity = {
+    email: `pdms-boundary-${crypto.randomUUID()}@example.com`,
+    email_verified: true,
+    sub: "s".repeat(255),
+  };
+  const clientId = `folio-${crypto.randomUUID()}`;
+  const clientSecret = `pdms-secret-${crypto.randomUUID()}`;
+  const providerId = `pdms-${crypto.randomUUID()}`;
+  const unpadded = JSON.stringify({ ...identity, padding: "" });
+  const body = JSON.stringify({
+    ...identity,
+    padding: "x".repeat(8192 - unpadded.length),
+  });
+  legacySsoMock = startLegacySsoMock({
+    callbackUrl: legacySsoCallbackUrl,
+    clientId,
+    clientSecret,
+    codeLifetimeMs: 60_000,
+    exchangeResponse: () =>
+      new Response(body, {
+        headers: { "Content-Type": "application/json; charset=utf-8" },
+      }),
+    identity,
+  });
+  const ssoApp = createLegacySsoTestApp({
+    authorizeUrl: legacySsoMock.authorizeUrl,
+    callbackUrl: legacySsoCallbackUrl,
+    clientId,
+    clientSecret,
+    exchangeUrl: legacySsoMock.exchangeUrl,
+    providerId,
+  });
+  const handle: LegacySsoHttpHandler = (request) => ssoApp.handle(request);
+  const callback = await completeLegacySsoCallback(handle);
+  expect(callback.headers.get("location")).toBe(
+    new URL("/dashboard", legacySsoWebOrigin).href
+  );
+  const bearer = await claimLegacySsoBearer(handle, callback);
+  const user = await prisma.user.findUniqueOrThrow({
+    where: { email: identity.email },
+  });
+  expect(user).toMatchObject({
+    emailVerified: false,
+    name: identity.email,
+    role: "user",
+  });
+  const session = await handle(
+    new Request("https://folio.example.test/api/session", {
+      headers: { Authorization: `Bearer ${bearer}` },
+    })
+  );
+  expect(session.status).toBe(200);
+  expect(await session.json()).toMatchObject({
+    user: { id: user.id, role: "user" },
+  });
+});
+
+test("PDMS rejects failed Basic authentication without provisioning or granting a Session", async () => {
+  const identity = {
+    email: `pdms-basic-${crypto.randomUUID()}@example.com`,
+    email_verified: false,
+    sub: `pdms-${crypto.randomUUID()}`,
+  };
+  const clientId = `folio-${crypto.randomUUID()}`;
+  const clientSecret = `pdms-secret-${crypto.randomUUID()}`;
+  const providerId = `pdms-${crypto.randomUUID()}`;
+  legacySsoMock = startLegacySsoMock({
+    callbackUrl: legacySsoCallbackUrl,
+    clientId,
+    clientSecret,
+    codeLifetimeMs: 60_000,
+    exchangeResponse: () => Response.json(identity),
+    identity,
+  });
+  const ssoApp = createLegacySsoTestApp({
+    authorizeUrl: legacySsoMock.authorizeUrl,
+    callbackUrl: legacySsoCallbackUrl,
+    clientId,
+    clientSecret: `${clientSecret}-wrong`,
+    exchangeUrl: legacySsoMock.exchangeUrl,
+    providerId,
+  });
+  const initialCounts = {
+    accounts: await prisma.account.count(),
+    sessions: await prisma.session.count(),
+    users: await prisma.user.count(),
+  };
+  const callback = await completeLegacySsoCallback((request) =>
+    ssoApp.handle(request)
+  );
+  expect(callback.headers.get("location")).toBe(legacySsoFailedLocation);
+  expect(cookiePairFrom(callback, "__Host-folio-sso-session")).toBe(
+    "__Host-folio-sso-session="
+  );
+  expect(await prisma.user.count()).toBe(initialCounts.users);
+  expect(await prisma.account.count()).toBe(initialCounts.accounts);
+  expect(await prisma.session.count()).toBe(initialCounts.sessions);
+});
+
+test("PDMS changed-email completed mapping retains historical linked ownership and local profile", async () => {
+  const owner = await createCredentialFixture({
+    email: `pdms-owner-${crypto.randomUUID()}@example.com`,
+    mustChangePassword: true,
+    name: "Original local profile",
+    password: "PDMS-local-temporary-password",
+  });
+  const other = await createCredentialFixture({
+    email: `pdms-other-${crypto.randomUUID()}@example.com`,
+    name: "Other local profile",
+    password: "PDMS-other-local-password",
+  });
+  const identity = {
+    email: `pdms-free-${crypto.randomUUID()}@example.com`,
+    email_verified: false,
+    name: "Changed PDMS profile",
+    sub: `pdms-${crypto.randomUUID()}`,
+  };
+  const freeEmail = identity.email;
+  const clientId = `folio-${crypto.randomUUID()}`;
+  const clientSecret = `pdms-secret-${crypto.randomUUID()}`;
+  const providerId = `pdms-${crypto.randomUUID()}`;
+  await prisma.account.create({
+    data: {
+      accountId: identity.sub,
+      id: crypto.randomUUID(),
+      issuer: providerId,
+      providerId,
+      userId: owner.id,
+    },
+  });
+  await prisma.legacyAccountLinkRequest.create({
+    data: {
+      email: owner.email,
+      providerId,
+      reviewedAt: new Date(),
+      reviewedGeneration: 1n,
+      status: "linked",
+      subject: identity.sub,
+      userId: owner.id,
+    },
+  });
+  const credentialBefore = await prisma.account.findFirstOrThrow({
+    where: { providerId: "credential", userId: owner.id },
+  });
+  const formId = crypto.randomUUID();
+  const publishedTemplateId = crypto.randomUUID();
+  const document = docxFixture(`pdms-ownership-${crypto.randomUUID()}`);
+  const templateObjectKey = objectKey(
+    "forms",
+    formId,
+    "published",
+    crypto.randomUUID(),
+    "pdms.docx"
+  );
+  await putObject(templateObjectKey, document, DOCX_CONTENT_TYPE);
+  await prisma.form.create({
+    data: {
+      createdBy: owner.id,
+      id: formId,
+      publicId: crypto.randomUUID().replaceAll("-", ""),
+      publishedTemplate: {
+        create: {
+          contentHash: createHash("sha256").update(document).digest("hex"),
+          documentKey: `pdms-template-${crypto.randomUUID()}`,
+          id: publishedTemplateId,
+          objectKey: templateObjectKey,
+          version: 1,
+        },
+      },
+      status: "published",
+      title: "PDMS completed mapping ownership",
+      version: 1,
+    },
+  });
+  const responses = [];
+  for (const responseOwner of [owner, other]) {
+    const responseId = crypto.randomUUID();
+    const draftObjectKey = objectKey(
+      "responses",
+      responseId,
+      "draft",
+      crypto.randomUUID(),
+      "pdms.docx"
+    );
+    await putObject(draftObjectKey, document, DOCX_CONTENT_TYPE);
+    responses.push(
+      await prisma.response.create({
+        data: {
+          draftData: {
+            full_name:
+              responseOwner.id === owner.id
+                ? "Original owner values"
+                : "Other owner private values",
+          },
+          draftDocumentKey: `pdms-draft-${crypto.randomUUID()}`,
+          draftObjectKey,
+          formId,
+          id: responseId,
+          publishedTemplateId,
+          publishedVersion: 1,
+          userId: responseOwner.id,
+        },
+      })
+    );
+  }
+  legacySsoMock = startLegacySsoMock({
+    callbackUrl: legacySsoCallbackUrl,
+    clientId,
+    clientSecret,
+    codeLifetimeMs: 60_000,
+    identity,
+  });
+  const ssoApp = createLegacySsoTestApp({
+    authorizeUrl: legacySsoMock.authorizeUrl,
+    callbackUrl: legacySsoCallbackUrl,
+    clientId,
+    clientSecret,
+    exchangeUrl: legacySsoMock.exchangeUrl,
+    providerId,
+  });
+  const handle: LegacySsoHttpHandler = (request) => ssoApp.handle(request);
+  // Reserve a generation so real callbacks are newer than the historical cutoff, even in an empty database.
+  await startLegacySsoBrowser(handle);
+  for (const emailVerified of [true, false]) {
+    await prisma.user.update({
+      data: { emailVerified },
+      where: { id: owner.id },
+    });
+    for (const email of [freeEmail, other.email]) {
+      identity.email = email;
+      const callback = await completeLegacySsoCallback(handle);
+      expect(callback.status).toBe(303);
+      expect(callback.headers.get("location")).toBe(
+        new URL("/dashboard", legacySsoWebOrigin).href
+      );
+      const bearer = await claimLegacySsoBearer(handle, callback);
+      const session = await handle(
+        new Request("https://folio.example.test/api/session", {
+          headers: { Authorization: `Bearer ${bearer}` },
+        })
+      );
+      expect(session.status).toBe(200);
+      expect(await session.json()).toMatchObject({
+        user: {
+          email: owner.email,
+          id: owner.id,
+          name: "Original local profile",
+          role: "user",
+        },
+      });
+      expect(
+        await prisma.user.findUnique({ where: { id: owner.id } })
+      ).toMatchObject({
+        email: owner.email,
+        emailVerified,
+        enabled: true,
+        mustChangePassword: true,
+        name: "Original local profile",
+        role: "user",
+      });
+      expect(
+        await prisma.account.findUnique({
+          where: {
+            providerId_accountId: { accountId: identity.sub, providerId },
+          },
+        })
+      ).toMatchObject({ userId: owner.id });
+      expect(
+        await prisma.account.findUnique({ where: { id: credentialBefore.id } })
+      ).toEqual(credentialBefore);
+      for (const response of responses) {
+        const isOwned = response.userId === owner.id;
+        const exportedJson = await handle(
+          new Request(
+            `https://folio.example.test/api/responses/${response.id}/draft/json`,
+            {
+              headers: { Authorization: `Bearer ${bearer}` },
+            }
+          )
+        );
+        expect(exportedJson.status).toBe(isOwned ? 200 : 403);
+        if (isOwned) {
+          expect(await exportedJson.json()).toEqual({
+            full_name: "Original owner values",
+          });
+        }
+        const exportedDocx = await handle(
+          new Request(
+            `https://folio.example.test/api/responses/${response.id}/draft/docx`,
+            {
+              headers: { Authorization: `Bearer ${bearer}` },
+            }
+          )
+        );
+        expect(exportedDocx.status).toBe(isOwned ? 200 : 403);
+        if (isOwned) {
+          expect([...new Uint8Array(await exportedDocx.arrayBuffer())]).toEqual(
+            [...document]
+          );
+        }
+      }
+    }
+  }
+  expect(
+    await prisma.user.findUnique({ where: { id: other.id } })
+  ).toMatchObject({
+    email: other.email,
+    name: "Other local profile",
+  });
+});
+
+test("PDMS completed mapping ignores review metadata but retains immutable stale-attempt cutoff", async () => {
+  const owner = await createCredentialFixture({
+    email: `pdms-mapped-${crypto.randomUUID()}@example.com`,
+    name: "Mapped owner",
+    password: "PDMS-mapped-owner-password",
+  });
+  const candidate = await createCredentialFixture({
+    email: `pdms-history-${crypto.randomUUID()}@example.com`,
+    name: "Historical candidate",
+    password: "PDMS-historical-candidate-password",
+  });
+  const identity = {
+    email: `pdms-current-${crypto.randomUUID()}@example.com`,
+    email_verified: false,
+    sub: `pdms-${crypto.randomUUID()}`,
+  };
+  const providerId = `pdms-${crypto.randomUUID()}`;
+  const clientId = `folio-${crypto.randomUUID()}`;
+  const clientSecret = `pdms-secret-${crypto.randomUUID()}`;
+  const mapping = await prisma.account.create({
+    data: {
+      accountId: identity.sub,
+      id: crypto.randomUUID(),
+      issuer: providerId,
+      providerId,
+      userId: owner.id,
+    },
+  });
+  legacySsoMock = startLegacySsoMock({
+    callbackUrl: legacySsoCallbackUrl,
+    clientId,
+    clientSecret,
+    codeLifetimeMs: 60_000,
+    identity,
+  });
+  const ssoApp = createLegacySsoTestApp({
+    authorizeUrl: legacySsoMock.authorizeUrl,
+    callbackUrl: legacySsoCallbackUrl,
+    clientId,
+    clientSecret,
+    exchangeUrl: legacySsoMock.exchangeUrl,
+    providerId,
+  });
+  const handle: LegacySsoHttpHandler = (request) => ssoApp.handle(request);
+  const noReviewCallback = await completeLegacySsoCallback(handle);
+  expect(noReviewCallback.headers.get("location")).toBe(
+    new URL("/dashboard", legacySsoWebOrigin).href
+  );
+  const noReviewBearer = await claimLegacySsoBearer(handle, noReviewCallback);
+  const noReviewSession = await handle(
+    new Request("https://folio.example.test/api/session", {
+      headers: { Authorization: `Bearer ${noReviewBearer}` },
+    })
+  );
+  expect(await noReviewSession.json()).toMatchObject({
+    user: { id: owner.id },
+  });
+  const request = await prisma.legacyAccountLinkRequest.create({
+    data: {
+      email: candidate.email,
+      providerId,
+      status: "linked",
+      subject: identity.sub,
+      userId: candidate.id,
+    },
+  });
+  for (const status of ["pending", "approved", "rejected", "linked"] as const) {
+    await prisma.legacyAccountLinkRequest.update({
+      data: { status },
+      where: { id: request.id },
+    });
+    const callback = await completeLegacySsoCallback(handle);
+    expect(callback.headers.get("location")).toBe(
+      new URL("/dashboard", legacySsoWebOrigin).href
+    );
+    const bearer = await claimLegacySsoBearer(handle, callback);
+    const session = await handle(
+      new Request("https://folio.example.test/api/session", {
+        headers: { Authorization: `Bearer ${bearer}` },
+      })
+    );
+    expect(session.status).toBe(200);
+    expect(await session.json()).toMatchObject({
+      user: { email: owner.email, id: owner.id },
+    });
+    expect(
+      await prisma.legacyAccountLinkRequest.findUnique({
+        where: { id: request.id },
+      })
+    ).toMatchObject({
+      email: candidate.email,
+      reviewedGeneration: null,
+      status,
+      userId: candidate.id,
+    });
+  }
+  const browsers = [
+    await startLegacySsoBrowser(handle),
+    await startLegacySsoBrowser(handle),
+  ] as const;
+  const [, equalBrowser] = browsers;
+  const [, transactionId] = equalBrowser.preLoginCookie.split("=", 2);
+  if (!transactionId) {
+    throw new Error("Equal-generation SSO transaction is missing");
+  }
+  const transaction = await prisma.verification.findUniqueOrThrow({
+    where: { id: transactionId },
+  });
+  const { generation } = JSON.parse(transaction.value) as {
+    generation: string;
+  };
+  await prisma.legacyAccountLinkRequest.update({
+    data: { reviewedGeneration: BigInt(generation) },
+    where: { id: request.id },
+  });
+  const fencedRequest = await prisma.legacyAccountLinkRequest.findUniqueOrThrow(
+    { where: { id: request.id } }
+  );
+  const sessionCountBefore = await prisma.session.count({
+    where: { userId: owner.id },
+  });
+  for (const browser of browsers) {
+    const authorization = await fetch(browser.authorizationUrl, {
+      redirect: "manual",
+    });
+    const location = authorization.headers.get("location");
+    if (!location) {
+      throw new Error("Fenced SSO authorization did not return a callback");
+    }
+    const callback = await handle(
+      new Request(location, { headers: { Cookie: browser.preLoginCookie } })
+    );
+    expect(callback.headers.get("location")).toBe(legacySsoFailedLocation);
+    expect(cookiePairFrom(callback, "__Host-folio-sso-session")).toBe(
+      "__Host-folio-sso-session="
+    );
+  }
+  expect(await prisma.session.count({ where: { userId: owner.id } })).toBe(
+    sessionCountBefore
+  );
+  expect(
+    await prisma.legacyAccountLinkRequest.findUnique({
+      where: { id: request.id },
+    })
+  ).toEqual(fencedRequest);
+  expect(
+    await prisma.account.findUnique({ where: { id: mapping.id } })
+  ).toEqual(mapping);
+  const newerCallback = await completeLegacySsoCallback(handle);
+  expect(newerCallback.headers.get("location")).toBe(
+    new URL("/dashboard", legacySsoWebOrigin).href
+  );
+  const newerBearer = await claimLegacySsoBearer(handle, newerCallback);
+  const newerSession = await handle(
+    new Request("https://folio.example.test/api/session", {
+      headers: { Authorization: `Bearer ${newerBearer}` },
+    })
+  );
+  expect(await newerSession.json()).toMatchObject({ user: { id: owner.id } });
+  await prisma.account.delete({ where: { id: mapping.id } });
+  identity.email = candidate.email;
+  const sessionCountAfterFresh = await prisma.session.count({
+    where: { userId: { in: [owner.id, candidate.id] } },
+  });
+  const missingMappingCallback = await completeLegacySsoCallback(handle);
+  expect(missingMappingCallback.headers.get("location")).toBe(
+    legacySsoFailedLocation
+  );
+  expect(
+    await prisma.account.findUnique({
+      where: { providerId_accountId: { accountId: identity.sub, providerId } },
+    })
+  ).toBeNull();
+  expect(
+    await prisma.session.count({
+      where: { userId: { in: [owner.id, candidate.id] } },
+    })
+  ).toBe(sessionCountAfterFresh);
+});
+
+test("PDMS mapped owner eligibility is rechecked at callback, claim, and switch confirmation", async () => {
+  const owner = await createCredentialFixture({
+    email: `pdms-eligible-${crypto.randomUUID()}@example.com`,
+    name: "Mapped target",
+    password: "PDMS-eligible-target-password",
+  });
+  const initiatorPassword = "PDMS-switch-initiator-password";
+  const initiator = await createCredentialFixture({
+    email: `pdms-initiator-${crypto.randomUUID()}@example.com`,
+    name: "Switch initiator",
+    password: initiatorPassword,
+  });
+  const initiatingBearer = await bearerFor(initiator.email, initiatorPassword);
+  const identity = {
+    email: `pdms-changed-${crypto.randomUUID()}@example.com`,
+    email_verified: false,
+    sub: `pdms-${crypto.randomUUID()}`,
+  };
+  const providerId = `pdms-${crypto.randomUUID()}`;
+  const clientId = `folio-${crypto.randomUUID()}`;
+  const clientSecret = `pdms-secret-${crypto.randomUUID()}`;
+  await prisma.account.create({
+    data: {
+      accountId: identity.sub,
+      id: crypto.randomUUID(),
+      issuer: providerId,
+      providerId,
+      userId: owner.id,
+    },
+  });
+  legacySsoMock = startLegacySsoMock({
+    callbackUrl: legacySsoCallbackUrl,
+    clientId,
+    clientSecret,
+    codeLifetimeMs: 60_000,
+    identity,
+  });
+  const ssoApp = createLegacySsoTestApp({
+    authorizeUrl: legacySsoMock.authorizeUrl,
+    callbackUrl: legacySsoCallbackUrl,
+    clientId,
+    clientSecret,
+    exchangeUrl: legacySsoMock.exchangeUrl,
+    providerId,
+  });
+  const handle: LegacySsoHttpHandler = (request) => ssoApp.handle(request);
+  for (const ineligible of [
+    { enabled: false, role: "user" },
+    { enabled: true, role: "admin" },
+  ] as const) {
+    await prisma.user.update({
+      data: { enabled: true, role: "user" },
+      where: { id: owner.id },
+    });
+    const claimCallback = await completeLegacySsoCallback(handle);
+    expect(claimCallback.headers.get("location")).toBe(
+      new URL("/dashboard", legacySsoWebOrigin).href
+    );
+    const switchFlow = await completeAuthenticatedLegacySsoCallback(
+      handle,
+      initiatingBearer,
+      "/dashboard"
+    );
+    expect(switchFlow.callback.headers.get("location")).toBe(
+      new URL("/legacy-sso/confirm", legacySsoWebOrigin).href
+    );
+    const switchCookie = cookiePairFrom(
+      switchFlow.callback,
+      "__Host-folio-sso-switch"
+    );
+    const details = await handle(
+      new Request("https://folio.example.test/api/legacy-sso/switch", {
+        headers: {
+          Authorization: `Bearer ${initiatingBearer}`,
+          Cookie: switchCookie,
+        },
+      })
+    );
+    expect(details.status).toBe(200);
+    const { confirmationFingerprint } = (await details.json()) as {
+      confirmationFingerprint: string;
+    };
+    const ownerSessionCount = await prisma.session.count({
+      where: { userId: owner.id },
+    });
+    await prisma.user.update({ data: ineligible, where: { id: owner.id } });
+    const deniedCallback = await completeLegacySsoCallback(handle);
+    expect(deniedCallback.headers.get("location")).toBe(
+      legacySsoFailedLocation
+    );
+    const deniedClaim = await handle(
+      new Request("https://folio.example.test/api/legacy-sso/session", {
+        headers: {
+          Cookie: cookiePairFrom(claimCallback, "__Host-folio-sso-session"),
+          Origin: legacySsoWebOrigin,
+        },
+        method: "POST",
+      })
+    );
+    expect(deniedClaim.status).toBe(401);
+    const deniedSwitch = await handle(
+      new Request("https://folio.example.test/api/legacy-sso/switch/confirm", {
+        body: JSON.stringify({ confirmationFingerprint }),
+        headers: {
+          ...jsonHeaders,
+          Authorization: `Bearer ${initiatingBearer}`,
+          Cookie: switchCookie,
+          Origin: legacySsoWebOrigin,
+        },
+        method: "POST",
+      })
+    );
+    expect(deniedSwitch.status).toBe(401);
+    expect(
+      await prisma.session.count({ where: { userId: owner.id } })
+    ).toBeLessThanOrEqual(ownerSessionCount);
+    const retainedSession = await handle(
+      new Request("https://folio.example.test/api/session", {
+        headers: { Authorization: `Bearer ${initiatingBearer}` },
+      })
+    );
+    expect(retainedSession.status).toBe(200);
+    expect(await retainedSession.json()).toMatchObject({
+      user: { id: initiator.id },
+    });
+  }
+  await prisma.user.update({
+    data: { enabled: true, role: "user" },
+    where: { id: owner.id },
+  });
+  for (const sessionChange of ["expired", "revoked"]) {
+    const callback = await completeLegacySsoCallback(handle);
+    expect(callback.headers.get("location")).toBe(
+      new URL("/dashboard", legacySsoWebOrigin).href
+    );
+    const transferCookie = cookiePairFrom(callback, "__Host-folio-sso-session");
+    const [, transferId] = transferCookie.split("=", 2);
+    if (!transferId) {
+      throw new Error("SSO Session transfer is missing");
+    }
+    const transfer = await prisma.verification.findUniqueOrThrow({
+      where: { id: transferId },
+    });
+    await (sessionChange === "expired"
+      ? prisma.session.update({
+          data: { expiresAt: new Date(0) },
+          where: { token: transfer.value },
+        })
+      : prisma.session.delete({ where: { token: transfer.value } }));
+    const deniedClaim = await handle(
+      new Request("https://folio.example.test/api/legacy-sso/session", {
+        headers: { Cookie: transferCookie, Origin: legacySsoWebOrigin },
+        method: "POST",
+      })
+    );
+    expect(deniedClaim.status).toBe(401);
+  }
+});
+
 test("expired SSO re-entry restores the owned draft", async () => {
   const email = `Ticket-13-${crypto.randomUUID()}@EXAMPLE.COM`;
   const normalizedEmail = email.toLowerCase();
@@ -720,6 +1872,7 @@ test("expired SSO re-entry restores the owned draft", async () => {
     callbackUrl: legacySsoCallbackUrl,
     clientId,
     clientSecret,
+    codeLifetimeMs: 60_000,
     identity,
   });
   const ssoApp = createLegacySsoTestApp({
@@ -747,7 +1900,7 @@ test("expired SSO re-entry restores the owned draft", async () => {
   }
   expect(user).toMatchObject({
     email: normalizedEmail,
-    emailVerified: true,
+    emailVerified: false,
     enabled: true,
     mustChangePassword: false,
     name: normalizedEmail,
@@ -786,7 +1939,16 @@ test("expired SSO re-entry restores the owned draft", async () => {
 
   const formId = crypto.randomUUID();
   const publicId = crypto.randomUUID().replaceAll("-", "");
-  const templateBytes = docxFixture(`ticket-13-${crypto.randomUUID()}`);
+  const templateBytes = docxXmlFixture({
+    document: contentControlDocument(
+      contentControl({
+        alias: "Full name",
+        placeholderText: "Enter full name",
+        tag: "full_name",
+        type: "<w:text/>",
+      })
+    ),
+  });
   const templateObjectKey = objectKey(
     "forms",
     formId,
@@ -798,6 +1960,7 @@ test("expired SSO re-entry restores the owned draft", async () => {
   await prisma.form.create({
     data: {
       createdBy: user.id,
+      fillMethod: "native",
       id: formId,
       publicId,
       publishedTemplate: {
@@ -805,6 +1968,22 @@ test("expired SSO re-entry restores the owned draft", async () => {
           contentHash: createHash("sha256").update(templateBytes).digest("hex"),
           documentKey: `ticket-13-template-${crypto.randomUUID()}`,
           id: crypto.randomUUID(),
+          manifest: {
+            create: {
+              configurationHash: createHash("sha256")
+                .update(templateBytes)
+                .digest("hex"),
+              fields: {
+                create: {
+                  label: "Full name",
+                  placeholder: "Enter full name",
+                  position: 0,
+                  tag: "full_name",
+                  type: "text",
+                },
+              },
+            },
+          },
           objectKey: templateObjectKey,
           version: 1,
         },
@@ -831,6 +2010,69 @@ test("expired SSO re-entry restores the owned draft", async () => {
   expect(
     await prisma.response.findUnique({ where: { id: responseId } })
   ).toMatchObject({ formId, userId: user.id });
+  const editorResponse = await handle(
+    new Request(
+      `https://folio.example.test/api/forms/${publicId}/editor-config?responseId=${responseId}&action=fill`,
+      { headers: { Authorization: `Bearer ${firstBearer}` } }
+    )
+  );
+  expect(editorResponse.status).toBe(200);
+  const editor = (await editorResponse.json()) as {
+    capabilities: Record<"save-draft", string>;
+    documentKey: string;
+  };
+  const savedData = { full_name: "PDMS saved draft" };
+  const saveResponse = await handle(
+    new Request(`https://folio.example.test/api/forms/${publicId}/draft`, {
+      body: JSON.stringify({
+        data: savedData,
+        documentKey: editor.documentKey,
+        fillMethod: "native",
+        responseId,
+      }),
+      headers: {
+        ...jsonHeaders,
+        "X-Editor-Capability": editor.capabilities["save-draft"],
+      },
+      method: "POST",
+    })
+  );
+  expect(saveResponse.status).toBe(202);
+  const save = (await saveResponse.json()) as {
+    operationId?: string;
+    operationCapability?: string;
+  };
+  if (!save.operationId || !save.operationCapability) {
+    throw new Error("SSO Draft save did not create an Operation");
+  }
+  expect(
+    await waitForOperation(save.operationId, {
+      "X-Editor-Capability": save.operationCapability,
+    })
+  ).toMatchObject({ status: "completed" });
+  const savedResponse = await prisma.response.findUniqueOrThrow({
+    where: { id: responseId },
+  });
+  expect(savedResponse.draftData).toEqual(savedData);
+  if (!savedResponse.draftObjectKey) {
+    throw new Error("SSO Draft save did not persist its document");
+  }
+  const savedDocument = await readObject(savedResponse.draftObjectKey);
+  expect(
+    new TextDecoder().decode(unzipSync(savedDocument)["word/document.xml"])
+  ).toContain("PDMS saved draft");
+  const saveClaims = verifyEditorCapability(editor.capabilities["save-draft"]);
+  if (!saveClaims?.leaseId) {
+    throw new Error("SSO Draft editor lease is missing");
+  }
+  // Close the editor after its completed save before leaving for SSO.
+  const editorExit = await handle(
+    new Request(
+      `https://folio.example.test/api/editor-leases/${saveClaims.leaseId}`,
+      { headers: { Authorization: `Bearer ${firstBearer}` }, method: "DELETE" }
+    )
+  );
+  expect(editorExit.status).toBe(200);
 
   const retainedEmail = `ticket-13-profile-${crypto.randomUUID()}@example.com`;
   await prisma.user.update({
@@ -902,11 +2144,48 @@ test("expired SSO re-entry restores the owned draft", async () => {
   expect(
     await prisma.response.findUnique({ where: { id: responseId } })
   ).toMatchObject({ formId, userId: user.id });
+  const resumedEditor = await handle(
+    new Request(
+      `https://folio.example.test/api/forms/${publicId}/editor-config?responseId=${responseId}&action=fill`,
+      { headers: { Authorization: `Bearer ${repeatedBearer}` } }
+    )
+  );
+  expect(resumedEditor.status).toBe(200);
+  expect(await resumedEditor.json()).toMatchObject({
+    data: savedData,
+    fillMethod: "native",
+    responseId,
+  });
+  const resumedDocument = await handle(
+    new Request(
+      `https://folio.example.test/api/responses/${responseId}/draft/docx`,
+      {
+        headers: { Authorization: `Bearer ${repeatedBearer}` },
+      }
+    )
+  );
+  expect(resumedDocument.status).toBe(200);
+  expect([...new Uint8Array(await resumedDocument.arrayBuffer())]).toEqual([
+    ...savedDocument,
+  ]);
   const target = await createCredentialFixture({
     email: `ticket-16-target-${crypto.randomUUID()}@example.com`,
     name: "Ticket 16 different User",
     password: "Ticket16-different-user-password",
   });
+  const targetBearer = await bearerFor(
+    target.email,
+    "Ticket16-different-user-password"
+  );
+  for (const format of ["json", "docx"]) {
+    const foreignExport = await handle(
+      new Request(
+        `https://folio.example.test/api/responses/${responseId}/draft/${format}`,
+        { headers: { Authorization: `Bearer ${targetBearer}` } }
+      )
+    );
+    expect(foreignExport.status).toBe(403);
+  }
   const targetSubject = `legacy-${crypto.randomUUID()}`;
   await prisma.account.create({
     data: {
@@ -958,9 +2237,9 @@ test("expired SSO re-entry restores the owned draft", async () => {
   expect(crossAccountLocation.pathname).toBe("/login");
   expect(crossAccountLocation.searchParams.get("legacySso")).toBe("failed");
   expect(crossAccountLocation.searchParams.get("returnTo")).toBe(returnTo);
-  expect(
-    await prisma.session.count({ where: { userId: target.id } })
-  ).toBe(targetSessionCount);
+  expect(await prisma.session.count({ where: { userId: target.id } })).toBe(
+    targetSessionCount
+  );
 });
 
 test("first Legacy SSO rejects invalid claims and queues email collisions for review", async () => {
@@ -974,6 +2253,7 @@ test("first Legacy SSO rejects invalid claims and queues email collisions for re
     callbackUrl: legacySsoCallbackUrl,
     clientId,
     clientSecret,
+    codeLifetimeMs: 60_000,
     identity,
   });
   const ssoApp = createLegacySsoTestApp({
@@ -1001,7 +2281,7 @@ test("first Legacy SSO rejects invalid claims and queues email collisions for re
   Reflect.deleteProperty(identity, "email");
   await expectRejectedLogin();
   identity.email = email;
-  identity.email_verified = false;
+  Reflect.deleteProperty(identity, "email_verified");
   await expectRejectedLogin();
   expect(await prisma.account.count()).toBe(initialCounts.accounts);
   expect(await prisma.session.count()).toBe(initialCounts.sessions);
@@ -1020,7 +2300,7 @@ test("first Legacy SSO rejects invalid claims and queues email collisions for re
     users: await prisma.user.count(),
   };
   identity.email = duplicateEmail;
-  identity.email_verified = true;
+  identity.email_verified = false;
   const collision = await completeLegacySsoCallback(handle);
   expect(collision.status).toBe(303);
   expect(collision.headers.get("location")).toBe(legacySsoPendingLocation);
@@ -1064,6 +2344,7 @@ test("racing first Legacy SSO logins create one User and identity binding", asyn
     callbackUrl: legacySsoCallbackUrl,
     clientId,
     clientSecret,
+    codeLifetimeMs: 60_000,
     identity,
   });
   const ssoApp = createLegacySsoTestApp({
@@ -1128,6 +2409,7 @@ test("failed first Legacy SSO persistence leaves no partial User or identity bin
     callbackUrl: legacySsoCallbackUrl,
     clientId,
     clientSecret,
+    codeLifetimeMs: 60_000,
     identity,
   });
   const ssoApp = createLegacySsoTestApp({
@@ -1176,6 +2458,943 @@ test("failed first Legacy SSO persistence leaves no partial User or identity bin
       `ALTER TABLE "account" DROP CONSTRAINT IF EXISTS "${constraintName}"`
     );
   }
+});
+
+for (const initialStatus of ["pending", "approved"] as const) {
+  test(`PDMS ${initialStatus} review refresh retargets eligible email and fences displayed decisions and delayed callbacks`, async () => {
+    const fixture = await createPdmsReviewFixture();
+    const { candidate, handle, identity, request, reviewerBearer } = fixture;
+    const target = await createCredentialFixture({
+      email: `pdms-retarget-${crypto.randomUUID()}@example.com`,
+      name: "Current PDMS candidate",
+      password: fixture.password,
+    });
+    const displayed = await legacyAccountLinkSnapshot(
+      handle,
+      reviewerBearer,
+      request.id
+    );
+    if (initialStatus === "approved") {
+      const initialApproval = await submitLegacyAccountLinkReview(
+        handle,
+        reviewerBearer,
+        displayed,
+        "approve"
+      );
+      expect(initialApproval.status).toBe(200);
+    }
+    const before = await prisma.legacyAccountLinkRequest.findUniqueOrThrow({
+      where: { id: request.id },
+    });
+    const gate = fixture.delayNextExchange();
+    const delayedCallback = completeLegacySsoCallback(handle);
+    try {
+      await gate.entered;
+      identity.email = target.email.toUpperCase();
+      const refreshedCallback = await completeLegacySsoCallback(handle);
+      expect(refreshedCallback.headers.get("location")).toBe(
+        legacySsoPendingLocation
+      );
+      expect(
+        cookiePairFrom(refreshedCallback, "__Host-folio-sso-session")
+      ).toBe("__Host-folio-sso-session=");
+      const refreshed = await prisma.legacyAccountLinkRequest.findUniqueOrThrow(
+        { where: { id: request.id } }
+      );
+      expect(refreshed).toMatchObject({
+        email: target.email,
+        reviewedAt: null,
+        reviewedById: null,
+        status: "pending",
+        userId: target.id,
+      });
+      expect(refreshed.reviewedGeneration).not.toBeNull();
+      expect(refreshed.reviewedGeneration).toBeGreaterThan(
+        before.reviewedGeneration ?? 0n
+      );
+      const current = await legacyAccountLinkSnapshot(
+        handle,
+        reviewerBearer,
+        request.id
+      );
+      expect(current).toMatchObject({
+        email: target.email,
+        reviewedGeneration: refreshed.reviewedGeneration?.toString(),
+        user: { email: target.email, id: target.id },
+      });
+      for (const decision of ["approve", "reject"] as const) {
+        const staleDecision = await submitLegacyAccountLinkReview(
+          handle,
+          reviewerBearer,
+          displayed,
+          decision
+        );
+        expect(staleDecision.status).toBe(409);
+        expect(await staleDecision.json()).toMatchObject({
+          error: "account_link_changed",
+          message: "Account link request changed; reload and review it again",
+        });
+        expect(
+          await prisma.legacyAccountLinkRequest.findUnique({
+            where: { id: request.id },
+          })
+        ).toEqual(refreshed);
+      }
+      const olderBrowser = await startLegacySsoBrowser(handle);
+      const equalBrowser = await startLegacySsoBrowser(handle);
+      const approval = await submitLegacyAccountLinkReview(
+        handle,
+        reviewerBearer,
+        current,
+        "approve"
+      );
+      expect(approval.status).toBe(200);
+      const approved = await prisma.legacyAccountLinkRequest.findUniqueOrThrow({
+        where: { id: request.id },
+      });
+      expect(approved).toMatchObject({
+        email: target.email,
+        status: "approved",
+        userId: target.id,
+      });
+      expect(approved.reviewedGeneration).toBeGreaterThan(
+        refreshed.reviewedGeneration ?? 0n
+      );
+      gate.release();
+      const delayedResponse = await delayedCallback;
+      expect(delayedResponse.headers.get("location")).toBe(
+        legacySsoFailedLocation
+      );
+      expect(
+        await prisma.legacyAccountLinkRequest.findUnique({
+          where: { id: request.id },
+        })
+      ).toEqual(approved);
+      const [, equalTransactionId] = equalBrowser.preLoginCookie.split("=", 2);
+      if (!equalTransactionId || approved.reviewedGeneration === null) {
+        throw new Error(
+          "The approved generation or browser transaction is missing"
+        );
+      }
+      const equalTransaction = await prisma.verification.findUniqueOrThrow({
+        where: { id: equalTransactionId },
+      });
+      await prisma.verification.update({
+        data: {
+          value: JSON.stringify({
+            ...(JSON.parse(equalTransaction.value) as Record<string, unknown>),
+            generation: approved.reviewedGeneration.toString(),
+          }),
+        },
+        where: { id: equalTransactionId },
+      });
+      for (const browser of [olderBrowser, equalBrowser]) {
+        const authorization = await fetch(browser.authorizationUrl, {
+          redirect: "manual",
+        });
+        const location = authorization.headers.get("location");
+        if (!location) {
+          throw new Error("The stale authorization did not return a callback");
+        }
+        const callback = await handle(
+          new Request(location, { headers: { Cookie: browser.preLoginCookie } })
+        );
+        expect(callback.headers.get("location")).toBe(legacySsoFailedLocation);
+        expect(cookiePairFrom(callback, "__Host-folio-sso-session")).toBe(
+          "__Host-folio-sso-session="
+        );
+      }
+      expect(
+        await prisma.legacyAccountLinkRequest.findUnique({
+          where: { id: request.id },
+        })
+      ).toEqual(approved);
+      expect(
+        await prisma.account.count({
+          where: {
+            accountId: identity.sub,
+            providerId: fixture.config.providerId,
+          },
+        })
+      ).toBe(0);
+      expect(
+        await prisma.session.count({
+          where: { isSso: true, userId: { in: [candidate.id, target.id] } },
+        })
+      ).toBe(0);
+      const freshCallback = await completeLegacySsoCallback(handle);
+      expect(freshCallback.headers.get("location")).toBe(
+        new URL("/dashboard", legacySsoWebOrigin).href
+      );
+      const bearer = await claimLegacySsoBearer(handle, freshCallback);
+      const session = await handle(
+        new Request(new URL("/api/session", legacySsoCallbackUrl).href, {
+          headers: { Authorization: `Bearer ${bearer}` },
+        })
+      );
+      expect(session.status).toBe(200);
+      expect(await session.json()).toMatchObject({
+        user: { email: target.email, id: target.id },
+      });
+      expect(
+        await prisma.account.findUnique({
+          where: {
+            providerId_accountId: {
+              accountId: identity.sub,
+              providerId: fixture.config.providerId,
+            },
+          },
+        })
+      ).toMatchObject({ userId: target.id });
+      expect(
+        await prisma.legacyAccountLinkRequest.findUnique({
+          where: { id: request.id },
+        })
+      ).toMatchObject({
+        email: target.email,
+        reviewedGeneration: approved.reviewedGeneration,
+        status: "linked",
+        userId: target.id,
+      });
+      expect(
+        await prisma.session.count({
+          where: { isSso: true, userId: candidate.id },
+        })
+      ).toBe(0);
+    } finally {
+      gate.release();
+      await delayedCallback.catch(() => {});
+    }
+  });
+
+  for (const blockedKind of ["unused", "admin", "disabled"] as const) {
+    test(`PDMS ${initialStatus} changed ${blockedKind} email stays visibly blocked without provisioning or fence churn`, async () => {
+      const fixture = await createPdmsReviewFixture();
+      const { candidate, handle, identity, request, reviewerBearer } = fixture;
+      const displayed = await legacyAccountLinkSnapshot(
+        handle,
+        reviewerBearer,
+        request.id
+      );
+      if (initialStatus === "approved") {
+        const initialApproval = await submitLegacyAccountLinkReview(
+          handle,
+          reviewerBearer,
+          displayed,
+          "approve"
+        );
+        expect(initialApproval.status).toBe(200);
+      }
+      const blockedEmail = `pdms-blocked-${crypto.randomUUID()}@example.com`;
+      let blockedUser: { email: string; id: string } | undefined;
+      if (blockedKind !== "unused") {
+        blockedUser = await createCredentialFixture({
+          email: blockedEmail,
+          name: "Initially ineligible candidate",
+          password: fixture.password,
+          role: blockedKind === "admin" ? "admin" : "user",
+        });
+        if (blockedKind === "disabled") {
+          await prisma.user.update({
+            data: { enabled: false },
+            where: { id: blockedUser.id },
+          });
+        }
+      }
+      identity.email = blockedEmail;
+      const userCountBefore = await prisma.user.count({
+        where: { email: blockedEmail },
+      });
+      const callback = await completeLegacySsoCallback(handle);
+      expect(callback.headers.get("location")).toBe(legacySsoPendingLocation);
+      expect(cookiePairFrom(callback, "__Host-folio-sso-session")).toBe(
+        "__Host-folio-sso-session="
+      );
+      const blocked = await prisma.legacyAccountLinkRequest.findUniqueOrThrow({
+        where: { id: request.id },
+      });
+      expect(blocked).toMatchObject({
+        email: blockedEmail,
+        reviewedAt: null,
+        reviewedById: null,
+        status: "pending",
+        userId: candidate.id,
+      });
+      expect(blocked.reviewedGeneration).not.toBeNull();
+      const blockedSnapshot = await legacyAccountLinkSnapshot(
+        handle,
+        reviewerBearer,
+        request.id
+      );
+      expect(blockedSnapshot).toMatchObject({
+        email: blockedEmail,
+        reviewedGeneration: blocked.reviewedGeneration?.toString(),
+        user: { email: candidate.email, id: candidate.id },
+      });
+      const approval = await submitLegacyAccountLinkReview(
+        handle,
+        reviewerBearer,
+        blockedSnapshot,
+        "approve"
+      );
+      expect(approval.status).toBe(409);
+      expect(await approval.json()).toMatchObject({
+        error: "account_link_not_eligible",
+      });
+      const blockedCallback = await completeLegacySsoCallback(handle);
+      expect(blockedCallback.headers.get("location")).toBe(
+        legacySsoPendingLocation
+      );
+      expect(
+        await prisma.legacyAccountLinkRequest.findUnique({
+          where: { id: request.id },
+        })
+      ).toEqual(blocked);
+      expect(await prisma.user.count({ where: { email: blockedEmail } })).toBe(
+        userCountBefore
+      );
+      expect(
+        await prisma.account.count({
+          where: { providerId: fixture.config.providerId },
+        })
+      ).toBe(0);
+      expect(
+        await prisma.session.count({
+          where: {
+            isSso: true,
+            userId: {
+              in: [candidate.id, ...(blockedUser ? [blockedUser.id] : [])],
+            },
+          },
+        })
+      ).toBe(0);
+      if (blockedUser) {
+        const eligibility = await handle(
+          new Request(
+            new URL(`/api/admin/users/${blockedUser.id}`, legacySsoCallbackUrl)
+              .href,
+            {
+              body: JSON.stringify(
+                blockedKind === "admin" ? { role: "user" } : { enabled: true }
+              ),
+              headers: {
+                ...jsonHeaders,
+                Authorization: `Bearer ${reviewerBearer}`,
+              },
+              method: "PATCH",
+            }
+          )
+        );
+        expect(eligibility.status).toBe(200);
+      } else {
+        blockedUser = await createCredentialFixture({
+          email: blockedEmail,
+          name: "Newly available candidate",
+          password: fixture.password,
+        });
+      }
+      const reboundCallback = await completeLegacySsoCallback(handle);
+      expect(reboundCallback.headers.get("location")).toBe(
+        legacySsoPendingLocation
+      );
+      expect(cookiePairFrom(reboundCallback, "__Host-folio-sso-session")).toBe(
+        "__Host-folio-sso-session="
+      );
+      const rebound = await prisma.legacyAccountLinkRequest.findUniqueOrThrow({
+        where: { id: request.id },
+      });
+      expect(rebound).toMatchObject({
+        email: blockedEmail,
+        reviewedAt: null,
+        reviewedById: null,
+        status: "pending",
+        userId: blockedUser.id,
+      });
+      expect(rebound.reviewedGeneration).toBeGreaterThan(
+        blocked.reviewedGeneration ?? 0n
+      );
+      for (const decision of ["approve", "reject"] as const) {
+        const staleDecision = await submitLegacyAccountLinkReview(
+          handle,
+          reviewerBearer,
+          blockedSnapshot,
+          decision
+        );
+        expect(staleDecision.status).toBe(409);
+      }
+      expect(
+        await prisma.legacyAccountLinkRequest.findUnique({
+          where: { id: request.id },
+        })
+      ).toEqual(rebound);
+      expect(
+        await prisma.account.count({
+          where: { providerId: fixture.config.providerId },
+        })
+      ).toBe(0);
+      expect(
+        await prisma.session.count({
+          where: { isSso: true, userId: blockedUser.id },
+        })
+      ).toBe(0);
+      const current = await legacyAccountLinkSnapshot(
+        handle,
+        reviewerBearer,
+        request.id
+      );
+      const currentApproval = await submitLegacyAccountLinkReview(
+        handle,
+        reviewerBearer,
+        current,
+        "approve"
+      );
+      expect(currentApproval.status).toBe(200);
+      const fresh = await completeLegacySsoCallback(handle);
+      const bearer = await claimLegacySsoBearer(handle, fresh);
+      const currentSession = await handle(
+        new Request(new URL("/api/session", legacySsoCallbackUrl).href, {
+          headers: { Authorization: `Bearer ${bearer}` },
+        })
+      );
+      expect(await currentSession.json()).toMatchObject({
+        user: { id: blockedUser.id },
+      });
+    });
+  }
+}
+
+for (const loss of ["disabled", "admin"] as const) {
+  test(`PDMS approved candidate becoming ${loss} invalidates unchanged identity evidence once`, async () => {
+    const fixture = await createPdmsReviewFixture();
+    const { candidate, handle, request, reviewerBearer } = fixture;
+    const displayed = await legacyAccountLinkSnapshot(
+      handle,
+      reviewerBearer,
+      request.id
+    );
+    const approval = await submitLegacyAccountLinkReview(
+      handle,
+      reviewerBearer,
+      displayed,
+      "approve"
+    );
+    expect(approval.status).toBe(200);
+    const approved = await prisma.legacyAccountLinkRequest.findUniqueOrThrow({
+      where: { id: request.id },
+    });
+    const patch = await handle(
+      new Request(
+        new URL(`/api/admin/users/${candidate.id}`, legacySsoCallbackUrl).href,
+        {
+          body: JSON.stringify(
+            loss === "disabled" ? { enabled: false } : { role: "admin" }
+          ),
+          headers: {
+            ...jsonHeaders,
+            Authorization: `Bearer ${reviewerBearer}`,
+          },
+          method: "PATCH",
+        }
+      )
+    );
+    expect(patch.status).toBe(200);
+    const callback = await completeLegacySsoCallback(handle);
+    expect(callback.headers.get("location")).toBe(legacySsoPendingLocation);
+    expect(cookiePairFrom(callback, "__Host-folio-sso-session")).toBe(
+      "__Host-folio-sso-session="
+    );
+    const invalidated = await prisma.legacyAccountLinkRequest.findUniqueOrThrow(
+      { where: { id: request.id } }
+    );
+    expect(invalidated).toMatchObject({
+      email: candidate.email,
+      reviewedAt: null,
+      reviewedById: null,
+      status: "pending",
+      userId: candidate.id,
+    });
+    expect(invalidated.reviewedGeneration).toBeGreaterThan(
+      approved.reviewedGeneration ?? 0n
+    );
+    const current = await legacyAccountLinkSnapshot(
+      handle,
+      reviewerBearer,
+      request.id
+    );
+    expect(current.user).toMatchObject(
+      loss === "disabled" ? { enabled: false } : { role: "admin" }
+    );
+    const blockedApproval = await submitLegacyAccountLinkReview(
+      handle,
+      reviewerBearer,
+      current,
+      "approve"
+    );
+    expect(blockedApproval.status).toBe(409);
+    expect(await blockedApproval.json()).toMatchObject({
+      error: "account_link_not_eligible",
+    });
+    const blockedCallback = await completeLegacySsoCallback(handle);
+    expect(blockedCallback.headers.get("location")).toBe(
+      legacySsoPendingLocation
+    );
+    expect(
+      await prisma.legacyAccountLinkRequest.findUnique({
+        where: { id: request.id },
+      })
+    ).toEqual(invalidated);
+    expect(
+      await prisma.account.count({
+        where: { providerId: fixture.config.providerId },
+      })
+    ).toBe(0);
+    expect(
+      await prisma.session.count({
+        where: { isSso: true, userId: candidate.id },
+      })
+    ).toBe(0);
+  });
+}
+
+test("PDMS candidate email PATCH and restore invalidate approval and delayed callback without touching terminal reviews", async () => {
+  const fixture = await createPdmsReviewFixture();
+  const { candidate, handle, identity, request, reviewerBearer } = fixture;
+  const displayed = await legacyAccountLinkSnapshot(
+    handle,
+    reviewerBearer,
+    request.id
+  );
+  const approval = await submitLegacyAccountLinkReview(
+    handle,
+    reviewerBearer,
+    displayed,
+    "approve"
+  );
+  expect(approval.status).toBe(200);
+  const approved = await prisma.legacyAccountLinkRequest.findUniqueOrThrow({
+    where: { id: request.id },
+  });
+  const terminal = await Promise.all(
+    ["linked", "rejected"].map((status) =>
+      prisma.legacyAccountLinkRequest.create({
+        data: {
+          email: candidate.email,
+          providerId: fixture.config.providerId,
+          reviewedAt: new Date(),
+          reviewedById: fixture.reviewer.id,
+          reviewedGeneration: approved.reviewedGeneration,
+          status: status === "linked" ? "linked" : "rejected",
+          subject: `pdms-terminal-${crypto.randomUUID()}`,
+          userId: candidate.id,
+        },
+      })
+    )
+  );
+  const pendingSibling = await prisma.legacyAccountLinkRequest.create({
+    data: {
+      email: `pdms-asserted-${crypto.randomUUID()}@example.com`,
+      providerId: fixture.config.providerId,
+      subject: `pdms-pending-${crypto.randomUUID()}`,
+      userId: candidate.id,
+    },
+  });
+  const gate = fixture.delayNextExchange();
+  const delayedCallback = completeLegacySsoCallback(handle);
+  try {
+    await gate.entered;
+    let lastGeneration = approved.reviewedGeneration;
+    let siblingGeneration = pendingSibling.reviewedGeneration;
+    for (const email of [
+      `pdms-renamed-${crypto.randomUUID()}@example.com`,
+      candidate.email,
+    ]) {
+      const patch = await handle(
+        new Request(
+          new URL(`/api/admin/users/${candidate.id}`, legacySsoCallbackUrl)
+            .href,
+          {
+            body: JSON.stringify({ email }),
+            headers: {
+              ...jsonHeaders,
+              Authorization: `Bearer ${reviewerBearer}`,
+            },
+            method: "PATCH",
+          }
+        )
+      );
+      expect(patch.status).toBe(200);
+      const invalidated =
+        await prisma.legacyAccountLinkRequest.findUniqueOrThrow({
+          where: { id: request.id },
+        });
+      expect(invalidated).toMatchObject({
+        email: candidate.email,
+        reviewedAt: null,
+        reviewedById: null,
+        status: "pending",
+        userId: candidate.id,
+      });
+      expect(invalidated.reviewedGeneration).toBeGreaterThan(
+        lastGeneration ?? 0n
+      );
+      lastGeneration = invalidated.reviewedGeneration;
+      const invalidatedSibling =
+        await prisma.legacyAccountLinkRequest.findUniqueOrThrow({
+          where: { id: pendingSibling.id },
+        });
+      expect(invalidatedSibling).toMatchObject({
+        email: pendingSibling.email,
+        providerId: pendingSibling.providerId,
+        reviewedAt: null,
+        reviewedById: null,
+        status: "pending",
+        subject: pendingSibling.subject,
+        userId: candidate.id,
+      });
+      expect(invalidatedSibling.reviewedGeneration).toBeGreaterThan(
+        siblingGeneration ?? 0n
+      );
+      siblingGeneration = invalidatedSibling.reviewedGeneration;
+    }
+    const restored = await prisma.legacyAccountLinkRequest.findUniqueOrThrow({
+      where: { id: request.id },
+    });
+    for (const decision of ["approve", "reject"] as const) {
+      const staleDecision = await submitLegacyAccountLinkReview(
+        handle,
+        reviewerBearer,
+        displayed,
+        decision
+      );
+      expect(staleDecision.status).toBe(409);
+    }
+    gate.release();
+    const delayedResponse = await delayedCallback;
+    expect(delayedResponse.headers.get("location")).toBe(
+      legacySsoFailedLocation
+    );
+    expect(
+      await prisma.legacyAccountLinkRequest.findUnique({
+        where: { id: request.id },
+      })
+    ).toEqual(restored);
+    for (const unchanged of terminal) {
+      expect(
+        await prisma.legacyAccountLinkRequest.findUnique({
+          where: { id: unchanged.id },
+        })
+      ).toEqual(unchanged);
+    }
+    expect(
+      await prisma.account.count({
+        where: {
+          accountId: identity.sub,
+          providerId: fixture.config.providerId,
+        },
+      })
+    ).toBe(0);
+    expect(
+      await prisma.session.count({
+        where: { isSso: true, userId: candidate.id },
+      })
+    ).toBe(0);
+    const current = await legacyAccountLinkSnapshot(
+      handle,
+      reviewerBearer,
+      request.id
+    );
+    const currentApproval = await submitLegacyAccountLinkReview(
+      handle,
+      reviewerBearer,
+      current,
+      "approve"
+    );
+    expect(currentApproval.status).toBe(200);
+    const fresh = await completeLegacySsoCallback(handle);
+    const bearer = await claimLegacySsoBearer(handle, fresh);
+    const currentSession = await handle(
+      new Request(new URL("/api/session", legacySsoCallbackUrl).href, {
+        headers: { Authorization: `Bearer ${bearer}` },
+      })
+    );
+    expect(await currentSession.json()).toMatchObject({
+      user: { id: candidate.id },
+    });
+  } finally {
+    gate.release();
+    await delayedCallback.catch(() => {});
+  }
+});
+
+test("PDMS current rejection remains terminal against delayed callbacks and changed identity namespaces", async () => {
+  const fixture = await createPdmsReviewFixture();
+  const { candidate, handle, identity, request, reviewerBearer } = fixture;
+  const target = await createCredentialFixture({
+    email: `pdms-rejected-target-${crypto.randomUUID()}@example.com`,
+    name: "Other candidate",
+    password: fixture.password,
+  });
+  const displayed = await legacyAccountLinkSnapshot(
+    handle,
+    reviewerBearer,
+    request.id
+  );
+  const gate = fixture.delayNextExchange();
+  const delayedCallback = completeLegacySsoCallback(handle);
+  try {
+    await gate.entered;
+    identity.email = target.email;
+    const changedCallback = await completeLegacySsoCallback(handle);
+    expect(changedCallback.headers.get("location")).toBe(
+      legacySsoPendingLocation
+    );
+    const staleRejection = await submitLegacyAccountLinkReview(
+      handle,
+      reviewerBearer,
+      displayed,
+      "reject"
+    );
+    expect(staleRejection.status).toBe(409);
+    const current = await legacyAccountLinkSnapshot(
+      handle,
+      reviewerBearer,
+      request.id
+    );
+    const currentRejection = await submitLegacyAccountLinkReview(
+      handle,
+      reviewerBearer,
+      current,
+      "reject"
+    );
+    expect(currentRejection.status).toBe(200);
+    const rejected = await prisma.legacyAccountLinkRequest.findUniqueOrThrow({
+      where: { id: request.id },
+    });
+    expect(rejected).toMatchObject({
+      email: target.email,
+      status: "rejected",
+      userId: target.id,
+    });
+    const originalCandidate = await prisma.user.findUniqueOrThrow({
+      where: { id: candidate.id },
+    });
+    gate.release();
+    const delayedResponse = await delayedCallback;
+    expect(delayedResponse.headers.get("location")).toBe(
+      legacySsoFailedLocation
+    );
+    for (const email of [
+      candidate.email,
+      `pdms-rejected-unused-${crypto.randomUUID()}@example.com`,
+    ]) {
+      identity.email = email;
+      const rejectedCallback = await completeLegacySsoCallback(handle);
+      expect(rejectedCallback.headers.get("location")).toBe(
+        legacySsoFailedLocation
+      );
+      expect(await prisma.user.findUnique({ where: { email } })).toEqual(
+        email === candidate.email ? originalCandidate : null
+      );
+      expect(
+        await prisma.legacyAccountLinkRequest.findUnique({
+          where: { id: request.id },
+        })
+      ).toEqual(rejected);
+    }
+    identity.email = target.email;
+    const subject = identity.sub;
+    identity.sub = `pdms-other-${crypto.randomUUID()}`;
+    const otherIdentityCallback = await completeLegacySsoCallback(handle);
+    expect(otherIdentityCallback.headers.get("location")).toBe(
+      legacySsoPendingLocation
+    );
+    const otherSubject =
+      await prisma.legacyAccountLinkRequest.findUniqueOrThrow({
+        where: {
+          providerId_subject: {
+            providerId: fixture.config.providerId,
+            subject: identity.sub,
+          },
+        },
+      });
+    expect(otherSubject).toMatchObject({
+      email: target.email,
+      status: "pending",
+      userId: target.id,
+    });
+    expect(otherSubject.id).not.toBe(request.id);
+    identity.sub = subject;
+    const otherProviderId = `pdms-other-provider-${crypto.randomUUID()}`;
+    const otherApp = createLegacySsoTestApp({
+      ...fixture.config,
+      providerId: otherProviderId,
+    });
+    const otherProviderCallback = await completeLegacySsoCallback((incoming) =>
+      otherApp.handle(incoming)
+    );
+    expect(otherProviderCallback.headers.get("location")).toBe(
+      legacySsoPendingLocation
+    );
+    const otherProvider =
+      await prisma.legacyAccountLinkRequest.findUniqueOrThrow({
+        where: { providerId_subject: { providerId: otherProviderId, subject } },
+      });
+    expect(otherProvider).toMatchObject({
+      email: target.email,
+      status: "pending",
+      userId: target.id,
+    });
+    expect(otherProvider.id).not.toBe(request.id);
+    expect(
+      await prisma.legacyAccountLinkRequest.findUnique({
+        where: { id: request.id },
+      })
+    ).toEqual(rejected);
+    expect(
+      await prisma.account.count({
+        where: {
+          providerId: { in: [fixture.config.providerId, otherProviderId] },
+        },
+      })
+    ).toBe(0);
+    expect(
+      await prisma.session.count({
+        where: { isSso: true, userId: { in: [candidate.id, target.id] } },
+      })
+    ).toBe(0);
+  } finally {
+    gate.release();
+    await delayedCallback.catch(() => {});
+  }
+});
+
+test("PDMS Admin decisions require exact canonical generation bodies after authorization", async () => {
+  const fixture = await createPdmsReviewFixture();
+  const { candidate, handle, request, reviewerBearer } = fixture;
+  const localBearer = await bearerFor(candidate.email, fixture.password);
+  const displayed = await legacyAccountLinkSnapshot(
+    handle,
+    reviewerBearer,
+    request.id
+  );
+  expect(displayed.reviewedGeneration).toBeNull();
+  const invalidBodies = [
+    undefined,
+    "",
+    "{",
+    "null",
+    "[]",
+    "true",
+    '"1"',
+    "{}",
+    JSON.stringify({ reviewedGeneration: "1".repeat(1100) }),
+    '{"reviewedGeneration":null,"extra":true}',
+    ...[
+      false,
+      true,
+      1,
+      0,
+      {},
+      [],
+      "",
+      "0",
+      "-1",
+      "+1",
+      "01",
+      " 1",
+      "1 ",
+      "1.0",
+      "1e3",
+      "１２",
+      "9223372036854775808",
+      "10000000000000000000",
+    ].map((reviewedGeneration) => JSON.stringify({ reviewedGeneration })),
+  ];
+  for (const decision of ["approve", "reject"] as const) {
+    const url = new URL(
+      `/api/admin/account-links/${request.id}/${decision}`,
+      legacySsoCallbackUrl
+    );
+    for (const [bearer, status] of [
+      [undefined, 401],
+      [localBearer, 403],
+    ] as const) {
+      const unauthorized = await handle(
+        new Request(url.href, {
+          body: "{}",
+          headers: bearer
+            ? { ...jsonHeaders, Authorization: `Bearer ${bearer}` }
+            : jsonHeaders,
+          method: "POST",
+        })
+      );
+      expect(unauthorized.status).toBe(status);
+    }
+    for (const body of invalidBodies) {
+      const response = await handle(
+        new Request(url.href, {
+          body,
+          headers: {
+            ...jsonHeaders,
+            Authorization: `Bearer ${reviewerBearer}`,
+          },
+          method: "POST",
+        })
+      );
+      expect(response.status).toBe(400);
+      expect(await response.json()).toMatchObject({ error: "invalid_request" });
+      expect(
+        await prisma.legacyAccountLinkRequest.findUnique({
+          where: { id: request.id },
+        })
+      ).toEqual(request);
+    }
+  }
+  const maximum = await prisma.legacyAccountLinkRequest.create({
+    data: {
+      email: candidate.email,
+      providerId: fixture.config.providerId,
+      reviewedGeneration: 9_223_372_036_854_775_807n,
+      subject: `pdms-maximum-${crypto.randomUUID()}`,
+      userId: candidate.id,
+    },
+  });
+  const maximumSnapshot = await legacyAccountLinkSnapshot(
+    handle,
+    reviewerBearer,
+    maximum.id
+  );
+  expect(maximumSnapshot.reviewedGeneration).toBe("9223372036854775807");
+  const rejection = await submitLegacyAccountLinkReview(
+    handle,
+    reviewerBearer,
+    maximumSnapshot,
+    "reject"
+  );
+  expect(rejection.status).toBe(200);
+  expect(
+    await prisma.legacyAccountLinkRequest.findUnique({
+      where: { id: maximum.id },
+    })
+  ).toMatchObject({
+    reviewedGeneration: 9_223_372_036_854_775_807n,
+    status: "rejected",
+  });
+  const approval = await submitLegacyAccountLinkReview(
+    handle,
+    reviewerBearer,
+    displayed,
+    "approve"
+  );
+  expect(approval.status).toBe(200);
+  expect(
+    await prisma.legacyAccountLinkRequest.findUnique({
+      where: { id: request.id },
+    })
+  ).toMatchObject({
+    status: "approved",
+    userId: candidate.id,
+  });
 });
 
 test("Ticket 14 Legacy SSO collision requires fresh Admin-approved identity link", async () => {
@@ -1245,6 +3464,7 @@ test("Ticket 14 Legacy SSO collision requires fresh Admin-approved identity link
     callbackUrl: legacySsoCallbackUrl,
     clientId,
     clientSecret,
+    codeLifetimeMs: 60_000,
     identity,
   });
   const ssoApp = createLegacySsoTestApp(
@@ -1307,42 +3527,34 @@ test("Ticket 14 Legacy SSO collision requires fresh Admin-approved identity link
   });
   const adminBearer = await bearerFor(adminEmail, adminPassword);
   const requestPath = `/api/admin/account-links/${linkRequest.id}/approve`;
+  const displayedReview = await legacyAccountLinkSnapshot(
+    handle,
+    adminBearer,
+    linkRequest.id
+  );
   const forbiddenApproval = await handle(
     new Request(`https://folio.example.test${requestPath}`, {
-      headers: { Authorization: `Bearer ${localBearer}` },
+      body: JSON.stringify({
+        reviewedGeneration: displayedReview.reviewedGeneration,
+      }),
+      headers: { ...jsonHeaders, Authorization: `Bearer ${localBearer}` },
       method: "POST",
     })
   );
   expect(forbiddenApproval.status).toBe(403);
-  const accountLinksResponse = await handle(
-    new Request("https://folio.example.test/api/admin/account-links", {
-      headers: { Authorization: `Bearer ${adminBearer}` },
-    })
-  );
-  expect(accountLinksResponse.status).toBe(200);
-  const accountLinksBody = (await accountLinksResponse.json()) as {
-    requests: {
-      email: string;
-      id: string;
-      providerId: string;
-      subject: string;
-      user: { email: string; id: string; name: string; role: string };
-    }[];
-  };
-  expect(accountLinksBody.requests).toContainEqual(
-    expect.objectContaining({
+  expect(displayedReview).toMatchObject({
+    email,
+    id: linkRequest.id,
+    providerId,
+    reviewedGeneration: null,
+    subject,
+    user: {
       email,
-      id: linkRequest.id,
-      providerId,
-      subject,
-      user: expect.objectContaining({
-        email,
-        id: candidate.id,
-        name: "Ticket 14 Local User",
-        role: "user",
-      }),
-    })
-  );
+      id: candidate.id,
+      name: "Ticket 14 Local User",
+      role: "user",
+    },
+  });
 
   const staleBrowser = await startLegacySsoBrowser(handle);
   const staleBackendResponse = await fetch(staleBrowser.authorizationUrl, {
@@ -1359,7 +3571,10 @@ test("Ticket 14 Legacy SSO collision requires fresh Admin-approved identity link
     const approvalPromise = Promise.resolve(
       handle(
         new Request(`https://folio.example.test${requestPath}`, {
-          headers: { Authorization: `Bearer ${adminBearer}` },
+          body: JSON.stringify({
+            reviewedGeneration: displayedReview.reviewedGeneration,
+          }),
+          headers: { ...jsonHeaders, Authorization: `Bearer ${adminBearer}` },
           method: "POST",
         })
       )
@@ -1423,7 +3638,7 @@ test("Ticket 14 Legacy SSO collision requires fresh Admin-approved identity link
         redirect: "manual",
       });
       const callbackLocation = oldBackendResponse.headers.get("location");
-      const transactionId = browser.preLoginCookie.split("=", 2)[1];
+      const [, transactionId] = browser.preLoginCookie.split("=", 2);
       if (!callbackLocation || !transactionId) {
         throw new Error("Fresh SSO transaction did not return a callback");
       }
@@ -1440,12 +3655,38 @@ test("Ticket 14 Legacy SSO collision requires fresh Admin-approved identity link
   );
   expect(freshCallbacks).toHaveLength(2);
   expect(
-    freshCallbacks.map((callback) => callback.headers.get("location"))
+    freshCallbacks.map((response) => response.headers.get("location"))
   ).toEqual([
     new URL("/dashboard", legacySsoWebOrigin).href,
     new URL("/dashboard", legacySsoWebOrigin).href,
   ]);
-  const linkedBearer = await claimLegacySsoBearer(handle, freshCallbacks[0]!);
+  const freshBearers: string[] = [];
+  for (const callback of freshCallbacks) {
+    freshBearers.push(await claimLegacySsoBearer(handle, callback));
+  }
+  const [linkedBearer] = freshBearers;
+  if (!linkedBearer) {
+    throw new Error("Fresh SSO callbacks did not yield a bearer");
+  }
+  for (const bearer of freshBearers) {
+    const session = await handle(
+      new Request("https://folio.example.test/api/session", {
+        headers: { Authorization: `Bearer ${bearer}` },
+      })
+    );
+    expect(session.status).toBe(200);
+    expect(await session.json()).toMatchObject({ user: { id: candidate.id } });
+  }
+  expect(
+    await prisma.account.count({
+      where: { accountId: subject, providerId },
+    })
+  ).toBe(1);
+  expect(
+    await prisma.session.count({
+      where: { isSso: true, userId: candidate.id },
+    })
+  ).toBe(ssoSessionsBefore + 2);
   expect(
     await prisma.legacyAccountLinkRequest.findUniqueOrThrow({
       where: { id: linkRequest.id },
@@ -1541,6 +3782,7 @@ test("Ticket 14 Legacy SSO approval rejects Admin and disabled candidates", asyn
     callbackUrl: legacySsoCallbackUrl,
     clientId,
     clientSecret,
+    codeLifetimeMs: 60_000,
     identity,
   });
   const ssoApp = createLegacySsoTestApp({
@@ -1572,14 +3814,16 @@ test("Ticket 14 Legacy SSO approval rejects Admin and disabled candidates", asyn
     where: { providerId_subject: { providerId, subject: adminSubject } },
   });
   for (const request of [disabledRequest, adminRequest]) {
-    const response = await handle(
-      new Request(
-        `https://folio.example.test/api/admin/account-links/${request.id}/approve`,
-        {
-          headers: { Authorization: `Bearer ${reviewerBearer}` },
-          method: "POST",
-        }
-      )
+    const snapshot = await legacyAccountLinkSnapshot(
+      handle,
+      reviewerBearer,
+      request.id
+    );
+    const response = await submitLegacyAccountLinkReview(
+      handle,
+      reviewerBearer,
+      snapshot,
+      "approve"
     );
     expect(response.status).toBe(409);
   }
@@ -1595,14 +3839,11 @@ test("Ticket 14 Legacy SSO approval rejects Admin and disabled candidates", asyn
       expect.objectContaining({ id: adminRequest.id, status: "pending" }),
     ])
   );
-  const rejection = await handle(
-    new Request(
-      `https://folio.example.test/api/admin/account-links/${disabledRequest.id}/reject`,
-      {
-        headers: { Authorization: `Bearer ${reviewerBearer}` },
-        method: "POST",
-      }
-    )
+  const rejection = await submitLegacyAccountLinkReview(
+    handle,
+    reviewerBearer,
+    await legacyAccountLinkSnapshot(handle, reviewerBearer, disabledRequest.id),
+    "reject"
   );
   expect(rejection.status).toBe(200);
   expect(
@@ -1658,6 +3899,7 @@ test("Ticket 14 stale SSO callback cannot bypass an account link created concurr
     callbackUrl: legacySsoCallbackUrl,
     clientId,
     clientSecret,
+    codeLifetimeMs: 60_000,
     identity,
   });
   legacySsoMock = legacyMock;
@@ -1775,7 +4017,7 @@ test("Ticket 14 stale SSO callback cannot bypass an account link created concurr
   } finally {
     const callbackToSettle = staleCallbackState.callback;
     if (callbackToSettle) {
-      await callbackToSettle.catch(() => undefined);
+      await callbackToSettle.catch(() => {});
     }
     await prisma.$executeRawUnsafe(
       `DROP TRIGGER IF EXISTS "${gateTrigger}" ON "user"`
@@ -1800,7 +4042,8 @@ test("linked role=user completes browser-bound SSO and receives a normal session
   });
   const identity = {
     email,
-    email_verified: true,
+    email_verified: false,
+    name: "PDMS must not rename a linked User",
     sub: `legacy-${crypto.randomUUID()}`,
   };
   const clientId = `folio-${crypto.randomUUID()}`;
@@ -1820,6 +4063,7 @@ test("linked role=user completes browser-bound SSO and receives a normal session
     callbackUrl: legacySsoCallbackUrl,
     clientId,
     clientSecret,
+    codeLifetimeMs: 60_000,
     identity,
   });
   const ssoApp = createLegacySsoTestApp({
@@ -1867,7 +4111,7 @@ test("linked role=user completes browser-bound SSO and receives a normal session
     throw new Error("The test old backend did not return a callback");
   }
   const callbackUrl = new URL(callbackLocation);
-  expect([...callbackUrl.searchParams.keys()].sort()).toEqual([
+  expect([...callbackUrl.searchParams.keys()].toSorted()).toEqual([
     "code",
     "state",
   ]);
@@ -1959,6 +4203,14 @@ test("linked role=user completes browser-bound SSO and receives a normal session
       name: "Ticket 12 linked User",
       role: "user",
     },
+  });
+  expect(
+    await prisma.user.findUnique({ where: { id: user.id } })
+  ).toMatchObject({
+    email,
+    emailVerified: true,
+    mustChangePassword: true,
+    name: "Ticket 12 linked User",
   });
   const ssoSession = await prisma.session.findFirst({
     orderBy: { createdAt: "desc" },
@@ -2146,9 +4398,10 @@ test("linked role=user completes browser-bound SSO and receives a normal session
     targetType: ssoCapabilityClaims.targetType,
   });
   expect(verifyEditorCapability(missingSsoExpiryCapability)).toBeNull();
-  expect((await capabilityRequest(missingSsoExpiryCapability)).status).toBe(
-    401
+  const missingSsoExpiryResponse = await capabilityRequest(
+    missingSsoExpiryCapability
   );
+  expect(missingSsoExpiryResponse.status).toBe(401);
   const admin = await createCredentialFixture({
     email: `ticket-12-admin-${crypto.randomUUID()}@example.com`,
     name: "Ticket 12 Admin",
@@ -2169,7 +4422,8 @@ test("linked role=user completes browser-bound SSO and receives a normal session
     targetId: ssoCapabilityClaims.targetId,
     targetType: ssoCapabilityClaims.targetType,
   });
-  expect((await capabilityRequest(adminSsoCapability)).status).toBe(401);
+  const adminSsoResponse = await capabilityRequest(adminSsoCapability);
+  expect(adminSsoResponse.status).toBe(401);
   await prisma.user.update({
     data: { role: "user" },
     where: { id: admin.id },
@@ -2205,7 +4459,10 @@ test("linked role=user completes browser-bound SSO and receives a normal session
     actorId: user.id,
     isSso: false,
   });
-  expect((await capabilityRequest(localPasswordCapability)).status).toBe(401);
+  const localPasswordResponse = await capabilityRequest(
+    localPasswordCapability
+  );
+  expect(localPasswordResponse.status).toBe(401);
 
   const callbackReplay = await handle(
     new Request(callbackUrl.href, {
@@ -2296,6 +4553,7 @@ test("Legacy SSO switch requires owner confirmation and preserves current sessio
     callbackUrl: legacySsoCallbackUrl,
     clientId,
     clientSecret,
+    codeLifetimeMs: 60_000,
     identity,
   });
   const ssoApp = createLegacySsoTestApp({
@@ -2394,8 +4652,9 @@ test("Legacy SSO switch requires owner confirmation and preserves current sessio
     if (body) {
       headers.set("Content-Type", "application/json");
     }
-    return handle(
+    return await handle(
       new Request(`https://folio.example.test${path}`, {
+        // oxlint-disable-next-line unicorn/no-invalid-fetch-options -- Preserve the shared GET/POST fixture: GET has an undefined body; POST carries confirmation data.
         body,
         headers,
         method,
@@ -2407,14 +4666,18 @@ test("Legacy SSO switch requires owner confirmation and preserves current sessio
     "/api/legacy-sso/switch"
   );
   expect(wrongOwnerRead.status).toBe(401);
-  expect(
-    (await switchRequest(otherBearer, "/api/legacy-sso/switch/confirm", "POST"))
-      .status
-  ).toBe(401);
-  expect(
-    (await switchRequest(otherBearer, "/api/legacy-sso/switch/cancel", "POST"))
-      .status
-  ).toBe(401);
+  const wrongOwnerConfirm = await switchRequest(
+    otherBearer,
+    "/api/legacy-sso/switch/confirm",
+    "POST"
+  );
+  expect(wrongOwnerConfirm.status).toBe(401);
+  const wrongOwnerCancel = await switchRequest(
+    otherBearer,
+    "/api/legacy-sso/switch/cancel",
+    "POST"
+  );
+  expect(wrongOwnerCancel.status).toBe(401);
 
   const switchDetails = await switchRequest(
     ownerBearer,
@@ -2452,27 +4715,26 @@ test("Legacy SSO switch requires owner confirmation and preserves current sessio
   expect(await prisma.session.count({ where: { userId: target.id } })).toBe(
     targetSessionsBefore
   );
-  expect(
-    await (
-      await handle(
-        new Request("https://folio.example.test/api/session", {
-          headers: { Authorization: `Bearer ${ownerBearer}` },
-        })
-      )
-    ).json()
-  ).toMatchObject({ user: { id: owner.id } });
-  expect(
-    await (
-      await handle(
-        new Request("https://folio.example.test/api/responses/me", {
-          headers: { Authorization: `Bearer ${ownerBearer}` },
-        })
-      )
-    ).json()
-  ).toEqual(beforeResponses);
-  expect(
-    (await switchRequest(ownerBearer, "/api/legacy-sso/switch", "GET")).status
-  ).toBe(401);
+  const ownerSessionAfterCancel = await handle(
+    new Request("https://folio.example.test/api/session", {
+      headers: { Authorization: `Bearer ${ownerBearer}` },
+    })
+  );
+  expect(await ownerSessionAfterCancel.json()).toMatchObject({
+    user: { id: owner.id },
+  });
+  const ownerResponsesAfterCancel = await handle(
+    new Request("https://folio.example.test/api/responses/me", {
+      headers: { Authorization: `Bearer ${ownerBearer}` },
+    })
+  );
+  expect(await ownerResponsesAfterCancel.json()).toEqual(beforeResponses);
+  const cancelledSwitchRead = await switchRequest(
+    ownerBearer,
+    "/api/legacy-sso/switch",
+    "GET"
+  );
+  expect(cancelledSwitchRead.status).toBe(401);
 
   const otherSessionsBeforeOverlap = await prisma.session.count({
     where: { userId: other.id },
@@ -2542,7 +4804,7 @@ test("Legacy SSO switch requires owner confirmation and preserves current sessio
     replacementDetails.confirmationFingerprint
   );
   expect(replacementCancel.status).toBe(200);
-  const staleChallengeId = staleCookie.split("=", 2)[1];
+  const [, staleChallengeId] = staleCookie.split("=", 2);
   await prisma.verification.deleteMany({ where: { id: staleChallengeId } });
   identity.email = target.email;
   identity.sub = targetSubject;
@@ -2677,15 +4939,14 @@ test("Legacy SSO switch requires owner confirmation and preserves current sessio
   );
   expect(await sameUserConfirm.json()).toEqual({ returnTo });
   const sameUserBearer = await claimLegacySsoBearer(handle, sameUserConfirm);
-  expect(
-    await (
-      await handle(
-        new Request("https://folio.example.test/api/session", {
-          headers: { Authorization: `Bearer ${sameUserBearer}` },
-        })
-      )
-    ).json()
-  ).toMatchObject({ user: { id: owner.id } });
+  const sameUserSession = await handle(
+    new Request("https://folio.example.test/api/session", {
+      headers: { Authorization: `Bearer ${sameUserBearer}` },
+    })
+  );
+  expect(await sameUserSession.json()).toMatchObject({
+    user: { id: owner.id },
+  });
 });
 test("Legacy SSO exchange failure and expired switch challenge preserve current bearer", async () => {
   const now = new Date();
@@ -2720,6 +4981,7 @@ test("Legacy SSO exchange failure and expired switch challenge preserve current 
     clientId,
     clientSecret,
     clock: () => new Date(now),
+    codeLifetimeMs: 60_000,
     identity,
   });
   const failedExchangeApp = createLegacySsoTestApp({
@@ -2752,15 +5014,14 @@ test("Legacy SSO exchange failure and expired switch challenge preserve current 
   expect(await prisma.session.count({ where: { userId: target.id } })).toBe(
     targetSessionsBefore
   );
-  expect(
-    await (
-      await failedExchangeHandle(
-        new Request("https://folio.example.test/api/session", {
-          headers: { Authorization: `Bearer ${ownerBearer}` },
-        })
-      )
-    ).json()
-  ).toMatchObject({ user: { id: owner.id } });
+  const ownerSessionAfterFailure = await failedExchangeHandle(
+    new Request("https://folio.example.test/api/session", {
+      headers: { Authorization: `Bearer ${ownerBearer}` },
+    })
+  );
+  expect(await ownerSessionAfterFailure.json()).toMatchObject({
+    user: { id: owner.id },
+  });
 
   const appNow = () => new Date(now);
   const ssoApp = createLegacySsoTestApp(
@@ -2787,7 +5048,7 @@ test("Legacy SSO exchange failure and expired switch challenge preserve current 
     expiredFlow.callback,
     "__Host-folio-sso-switch"
   );
-  const challengeId = switchCookie.split("=", 2)[1];
+  const [, challengeId] = switchCookie.split("=", 2);
   if (!challengeId) {
     throw new Error("The switch challenge cookie was empty");
   }
@@ -2819,15 +5080,14 @@ test("Legacy SSO exchange failure and expired switch challenge preserve current 
   expect(await prisma.session.count({ where: { userId: target.id } })).toBe(
     targetSessionsBefore
   );
-  expect(
-    await (
-      await handle(
-        new Request("https://folio.example.test/api/session", {
-          headers: { Authorization: `Bearer ${ownerBearer}` },
-        })
-      )
-    ).json()
-  ).toMatchObject({ user: { id: owner.id } });
+  const ownerSessionAfterExpiry = await handle(
+    new Request("https://folio.example.test/api/session", {
+      headers: { Authorization: `Bearer ${ownerBearer}` },
+    })
+  );
+  expect(await ownerSessionAfterExpiry.json()).toMatchObject({
+    user: { id: owner.id },
+  });
 });
 test("rejects unsafe returns and mismatched callback state or cookie", async () => {
   const email = `ticket-12-binding-${crypto.randomUUID()}@example.com`;
@@ -2857,6 +5117,7 @@ test("rejects unsafe returns and mismatched callback state or cookie", async () 
     callbackUrl: legacySsoCallbackUrl,
     clientId,
     clientSecret,
+    codeLifetimeMs: 60_000,
     identity,
   });
   const ssoApp = createLegacySsoTestApp({
@@ -2945,26 +5206,22 @@ test("rejects unsafe returns and mismatched callback state or cookie", async () 
   expect(validCallback.headers.get("location")).toBe(
     new URL(returnTo, legacySsoWebOrigin).href
   );
-  expect(
-    await (
-      await handle(
-        new Request("https://folio.example.test/api/legacy-sso/status")
-      )
-    ).json()
-  ).toEqual({ enabled: true });
+  const enabledStatusResponse = await handle(
+    new Request("https://folio.example.test/api/legacy-sso/status")
+  );
+  expect(await enabledStatusResponse.json()).toEqual({ enabled: true });
 
-  expect(
-    (await handle(new Request("https://folio.example.test/prefill/handoff")))
-      .status
-  ).toBe(405);
-  expect(
-    await (
-      await app.handle(new Request("http://test.local/api/legacy-sso/status"))
-    ).json()
-  ).toEqual({ enabled: false });
+  const handoffGetResponse = await handle(
+    new Request("https://folio.example.test/prefill/handoff")
+  );
+  expect(handoffGetResponse.status).toBe(405);
+  const disabledStatusResponse = await app.handle(
+    new Request("http://test.local/api/legacy-sso/status")
+  );
+  expect(await disabledStatusResponse.json()).toEqual({ enabled: false });
 });
 
-test("rejects unverified, disabled, and Admin identities but queues email collisions", async () => {
+test("rejects disabled and Admin identities but queues email collisions", async () => {
   const email = `ticket-12-eligibility-${crypto.randomUUID()}@example.com`;
   const password = "Ticket12-eligibility-test-password";
   const user = await createCredentialFixture({
@@ -2993,6 +5250,7 @@ test("rejects unverified, disabled, and Admin identities but queues email collis
     callbackUrl: legacySsoCallbackUrl,
     clientId,
     clientSecret,
+    codeLifetimeMs: 60_000,
     identity,
   });
   const ssoApp = createLegacySsoTestApp({
@@ -3028,8 +5286,6 @@ test("rejects unverified, disabled, and Admin identities but queues email collis
     expect(callbackResponse.headers.get("location")).toBe(expectedLocation);
   };
   const userCountBefore = await prisma.user.count();
-  await expectIdentityLocation(legacySsoFailedLocation);
-  identity.email_verified = true;
   identity.sub = `unlinked-${crypto.randomUUID()}`;
   await expectIdentityLocation(legacySsoPendingLocation);
   identity.sub = linkedSubject;
@@ -3081,6 +5337,7 @@ test("expires browser-bound SSO transactions and session handoffs", async () => 
     clientId,
     clientSecret,
     clock: () => new Date(backendNow),
+    codeLifetimeMs: 60_000,
     identity,
   });
   const ssoApp = createLegacySsoTestApp(
@@ -3161,7 +5418,8 @@ test("old-backend codes bind client, callback, verifier, expiry, and single use"
     clientId,
     clientSecret,
     clock: () => new Date(now),
-    codeLifetimeMs: 1000,
+    codeLifetimeMs: 60_000,
+    exchangeResponse: () => Response.json(identity),
     identity,
   });
   legacySsoMock = legacySsoServer;
@@ -3177,17 +5435,19 @@ test("old-backend codes bind client, callback, verifier, expiry, and single use"
 
   const wrongClientAuthorize = new URL(authorize);
   wrongClientAuthorize.searchParams.set("client_id", "other-client");
-  expect(
-    (await fetch(wrongClientAuthorize, { redirect: "manual" })).status
-  ).toBe(400);
+  const wrongClientAuthorizeResponse = await fetch(wrongClientAuthorize, {
+    redirect: "manual",
+  });
+  expect(wrongClientAuthorizeResponse.status).toBe(400);
   const wrongCallbackAuthorize = new URL(authorize);
   wrongCallbackAuthorize.searchParams.set(
     "redirect_uri",
     "https://attacker.example.test/callback"
   );
-  expect(
-    (await fetch(wrongCallbackAuthorize, { redirect: "manual" })).status
-  ).toBe(400);
+  const wrongCallbackAuthorizeResponse = await fetch(wrongCallbackAuthorize, {
+    redirect: "manual",
+  });
+  expect(wrongCallbackAuthorizeResponse.status).toBe(400);
   const authorizeResponse = await fetch(authorize, { redirect: "manual" });
   expect(authorizeResponse.status).toBe(303);
   const callbackLocation = authorizeResponse.headers.get("location");
@@ -3208,7 +5468,7 @@ test("old-backend codes bind client, callback, verifier, expiry, and single use"
     codeVerifier?: string;
     redirectUri?: string;
   } = {}) =>
-    fetch(legacySsoServer.exchangeUrl, {
+    await fetch(legacySsoServer.exchangeUrl, {
       body: new URLSearchParams({
         client_id: exchangeClientId,
         code,
@@ -3224,17 +5484,22 @@ test("old-backend codes bind client, callback, verifier, expiry, and single use"
       },
       method: "POST",
     });
-  expect((await exchange({ clientId: "other-client" })).status).toBe(400);
+  const wrongClientExchange = await exchange({ clientId: "other-client" });
+  expect(wrongClientExchange.status).toBe(400);
+  const wrongRedirectExchange = await exchange({
+    redirectUri: "https://attacker.example.test/callback",
+  });
+  expect(wrongRedirectExchange.status).toBe(400);
+  const wrongVerifierExchange = await exchange({
+    codeVerifier: "w".repeat(43),
+  });
+  expect(wrongVerifierExchange.status).toBe(400);
+  const concurrentExchanges = await Promise.all([exchange(), exchange()]);
   expect(
-    (
-      await exchange({
-        redirectUri: "https://attacker.example.test/callback",
-      })
-    ).status
-  ).toBe(400);
-  expect((await exchange({ codeVerifier: "w".repeat(43) })).status).toBe(400);
-  expect((await exchange()).status).toBe(200);
-  expect((await exchange()).status).toBe(400);
+    concurrentExchanges.map((response) => response.status).toSorted()
+  ).toEqual([200, 400]);
+  const replayedExchange = await exchange();
+  expect(replayedExchange.status).toBe(400);
 
   const expiredAuthorization = await fetch(authorize, { redirect: "manual" });
   const expiredLocation = expiredAuthorization.headers.get("location");
@@ -3245,7 +5510,7 @@ test("old-backend codes bind client, callback, verifier, expiry, and single use"
   if (!expiredCode) {
     throw new Error("The test old backend callback omitted its expiring code");
   }
-  now = new Date(now.getTime() + 1001);
+  now = new Date(now.getTime() + 60_000);
   const expiredResponse = await fetch(legacySsoServer.exchangeUrl, {
     body: new URLSearchParams({
       client_id: clientId,
@@ -3507,13 +5772,10 @@ test("Ticket 07 native scalar forms preserve values, validation, and Fill Method
   if (!publishBody.operationCapability || !publishBody.operationId) {
     throw new Error("The Ticket 06 publish operation was not created");
   }
-  expect(
-    (
-      await waitForOperation(publishBody.operationId, {
-        "X-Editor-Capability": publishBody.operationCapability,
-      })
-    ).status
-  ).toBe("completed");
+  const publishOperation = await waitForOperation(publishBody.operationId, {
+    "X-Editor-Capability": publishBody.operationCapability,
+  });
+  expect(publishOperation.status).toBe("completed");
   const publishedTemplate = await prisma.publishedTemplate.findUniqueOrThrow({
     include: {
       manifest: {
@@ -3658,14 +5920,14 @@ test("Ticket 07 native scalar forms preserve values, validation, and Fill Method
   expect(await publicFormResponse.json()).toMatchObject({
     form: { fillMethod: "native" },
   });
-  const startResponse = await app.handle(
+  const nativeStartResponse = await app.handle(
     new Request(`http://test.local/api/forms/${publicId}/start`, {
       headers: { Authorization: `Bearer ${userBearer}` },
       method: "POST",
     })
   );
-  expect(startResponse.status).toBe(200);
-  const startBody = (await startResponse.json()) as {
+  expect(nativeStartResponse.status).toBe(200);
+  const startBody = (await nativeStartResponse.json()) as {
     editorConfigUrl?: string;
     fillMethod?: string;
     response?: { id?: string };
@@ -3993,9 +6255,7 @@ test("Ticket 07 native scalar forms preserve values, validation, and Fill Method
       forceSave: () => Promise.resolve(false),
     },
     prefillReturnUrl: "https://source.example.test/forms/return",
-    putObject: async () => {
-      throw new Error("Ticket 06 storage failure");
-    },
+    putObject: () => Promise.reject(new Error("Ticket 06 storage failure")),
   });
   const stableBeforeFailure = await prisma.response.findUniqueOrThrow({
     select: {
@@ -4006,7 +6266,11 @@ test("Ticket 07 native scalar forms preserve values, validation, and Fill Method
     },
     where: { id: responseId },
   });
-  const stableDocument = await readObject(stableBeforeFailure.draftObjectKey!);
+  const stableDraftObjectKey = stableBeforeFailure.draftObjectKey;
+  if (!stableDraftObjectKey) {
+    throw new Error("The stable Ticket 06 draft has no object key");
+  }
+  const stableDocument = await readObject(stableDraftObjectKey);
   const failedSaveResponse = await nativeDraftRequest(
     nativeConfig,
     draftData,
@@ -4036,9 +6300,7 @@ test("Ticket 07 native scalar forms preserve values, validation, and Fill Method
       where: { id: responseId },
     })
   ).toEqual(stableBeforeFailure);
-  expect(await readObject(stableBeforeFailure.draftObjectKey!)).toEqual(
-    stableDocument
-  );
+  expect(await readObject(stableDraftObjectKey)).toEqual(stableDocument);
   const saveResponse = await nativeDraftRequest(nativeConfig, draftData);
   expect(saveResponse.status).toBe(202);
   const saveBody = (await saveResponse.json()) as {
@@ -4075,16 +6337,18 @@ test("Ticket 07 native scalar forms preserve values, validation, and Fill Method
     state_checkbox: true,
     value_checkbox: false,
   });
-  const savedArchive = unzipSync(
-    await readObject(savedResponse.draftObjectKey!)
-  );
+  const savedDraftObjectKey = savedResponse.draftObjectKey;
+  if (!savedDraftObjectKey) {
+    throw new Error("The saved Ticket 06 draft has no object key");
+  }
+  const savedArchive = unzipSync(await readObject(savedDraftObjectKey));
   const savedDocumentXml = new TextDecoder().decode(
     savedArchive["word/document.xml"]
   );
   expect(savedDocumentXml).toContain("Static layout");
   expect(savedDocumentXml).not.toContain("showingPlcHdr");
   const nullableCategoryContent = savedDocumentXml.match(
-    /<w:tag w:val="nullable_category"\/>[\s\S]*?<w:sdtContent>([\s\S]*?)<\/w:sdtContent>/u
+    /<w:tag w:val="nullable_category"\/>[\s\S]*?<w:sdtContent>(?<content>[\s\S]*?)<\/w:sdtContent>/u
   )?.[1];
   expect(nullableCategoryContent).toBe("<w:r><w:t></w:t></w:r>");
   expect(savedDocumentXml).toContain(
@@ -4251,15 +6515,6 @@ test("Ticket 07 native scalar forms preserve values, validation, and Fill Method
     onlyOfficeConfig.config?.editorConfig?.plugins?.options?.[pluginGuid]
       ?.tagAliases
   ).toEqual({ metadata: "full_name" });
-  const onlyOfficeSaveCapabilityFor = (
-    config: typeof onlyOfficeConfig
-  ): string => {
-    const capability = config.bridge?.capabilities?.["save-draft"];
-    if (!capability) {
-      throw new Error("The ONLYOFFICE save capability is missing");
-    }
-    return capability;
-  };
   const onlyOfficeSubmitCapability =
     onlyOfficeConfig.bridge?.capabilities?.submit;
   if (!onlyOfficeSubmitCapability) {
@@ -4295,13 +6550,13 @@ test("Ticket 07 native scalar forms preserve values, validation, and Fill Method
       })
     );
   const refreshOnlyOfficeEditorConfig = async () => {
-    const startResponse = await app.handle(
+    const refreshedStartResponse = await app.handle(
       new Request(`http://test.local/api/forms/${publicId}/start`, {
         headers: { Authorization: `Bearer ${userBearer}` },
         method: "POST",
       })
     );
-    const start = (await startResponse.json()) as {
+    const start = (await refreshedStartResponse.json()) as {
       editorConfigUrl?: string;
     };
     if (!start.editorConfigUrl) {
@@ -4415,7 +6670,7 @@ test("Ticket 07 native scalar forms preserve values, validation, and Fill Method
         '<w:rPr xmlns:fontAlias="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:b/><w:rFonts fontAlias:ascii="Old Ticket Font" fontAlias:hAnsi="Old Ticket Font" fontAlias:asciiTheme="majorAscii" fontAlias:hAnsiTheme="majorHAnsi"/></w:rPr>'
       )
       .replace(
-        /(<w:r><w:rPr xmlns:fontAlias="http:\/\/schemas\.openxmlformats\.org\/wordprocessingml\/2006\/main"><w:b\/><w:rFonts fontAlias:ascii="Old Ticket Font" fontAlias:hAnsi="Old Ticket Font" fontAlias:asciiTheme="majorAscii" fontAlias:hAnsiTheme="majorHAnsi"\/><\/w:rPr><w:t>[^<]*<\/w:t><\/w:r>)/u,
+        /(?<run><w:r><w:rPr xmlns:fontAlias="http:\/\/schemas\.openxmlformats\.org\/wordprocessingml\/2006\/main"><w:b\/><w:rFonts fontAlias:ascii="Old Ticket Font" fontAlias:hAnsi="Old Ticket Font" fontAlias:asciiTheme="majorAscii" fontAlias:hAnsiTheme="majorHAnsi"\/><\/w:rPr><w:t>[^<]*<\/w:t><\/w:r>)/u,
         '$1<w:r><w:rPr xmlns:fontAlias="urn:fixture"><w:rFonts fontAlias:asciiTheme="keep"/></w:rPr><w:t>extension marker</w:t></w:r>'
       )
       .replace(
@@ -4535,7 +6790,7 @@ test("Ticket 07 native scalar forms preserve values, validation, and Fill Method
   expect(onlyOfficeDraftXml).toContain("Empty option label");
   expect(onlyOfficeDraftXml).toContain("Nullable empty option label");
   const callbackNullableCategoryContent = onlyOfficeDraftXml.match(
-    /<w:tag w:val="nullable_category"\/>[\s\S]*?<w:sdtContent>([\s\S]*?)<\/w:sdtContent>/u
+    /<w:tag w:val="nullable_category"\/>[\s\S]*?<w:sdtContent>(?<content>[\s\S]*?)<\/w:sdtContent>/u
   )?.[1];
   expect(callbackNullableCategoryContent).toBe("<w:r><w:t></w:t></w:r>");
   expect(onlyOfficeDraftXml).toContain('w:fullDate="2024-02-29T00:00:00Z"');
@@ -4687,14 +6942,11 @@ test("Ticket 07 native scalar forms preserve values, validation, and Fill Method
       "X-Editor-Capability": checkedCheckboxOperation.operationCapability,
     })
   ).toMatchObject({ status: "completed" });
-  expect(
-    (
-      await prisma.response.findUniqueOrThrow({
-        select: { draftData: true },
-        where: { id: responseId },
-      })
-    ).draftData
-  ).toMatchObject({ enabled: true });
+  const checkedCheckboxDraft = await prisma.response.findUniqueOrThrow({
+    select: { draftData: true },
+    where: { id: responseId },
+  });
+  expect(checkedCheckboxDraft.draftData).toMatchObject({ enabled: true });
   await refreshOnlyOfficeEditorConfig();
   const explicitEmptyOptionSource = await prisma.response.findUniqueOrThrow({
     select: { draftObjectKey: true },
@@ -4711,7 +6963,7 @@ test("Ticket 07 native scalar forms preserve values, validation, and Fill Method
   );
   explicitEmptyOptionArchive["word/document.xml"] = strToU8(
     explicitEmptyOptionSourceXml.replace(
-      /(<w:tag w:val="nullable_category"\/>[\s\S]*?<w:sdtContent>)[\s\S]*?(<\/w:sdtContent>)/u,
+      /(?<opening><w:tag w:val="nullable_category"\/>[\s\S]*?<w:sdtContent>)[\s\S]*?(?<closing><\/w:sdtContent>)/u,
       "$1<w:r><w:t>Nullable empty option label</w:t></w:r>$2"
     )
   );
@@ -4748,13 +7000,17 @@ test("Ticket 07 native scalar forms preserve values, validation, and Fill Method
   expect(explicitEmptyOptionDraft.draftData).toMatchObject({
     nullable_category: "",
   });
+  const explicitEmptyOptionObjectKey = explicitEmptyOptionDraft.draftObjectKey;
+  if (!explicitEmptyOptionObjectKey) {
+    throw new Error("The explicit empty option draft has no object key");
+  }
   const explicitEmptyOptionXml = new TextDecoder().decode(
-    unzipSync(await readObject(explicitEmptyOptionDraft.draftObjectKey!))[
+    unzipSync(await readObject(explicitEmptyOptionObjectKey))[
       "word/document.xml"
     ]
   );
   const explicitEmptyOptionContent = explicitEmptyOptionXml.match(
-    /<w:tag w:val="nullable_category"\/>[\s\S]*?<w:sdtContent>([\s\S]*?)<\/w:sdtContent>/u
+    /<w:tag w:val="nullable_category"\/>[\s\S]*?<w:sdtContent>(?<content>[\s\S]*?)<\/w:sdtContent>/u
   )?.[1];
   expect(explicitEmptyOptionContent).toContain(
     "<w:t>Nullable empty option label</w:t>"
@@ -5074,10 +7330,12 @@ test("Ticket 07 native scalar forms preserve values, validation, and Fill Method
     select: { draftObjectKey: true },
     where: { id: checkboxStart.response.id },
   });
+  const checkboxSavedObjectKey = checkboxSaved.draftObjectKey;
+  if (!checkboxSavedObjectKey) {
+    throw new Error("The default-namespace checkbox draft has no object key");
+  }
   const checkboxSavedXml = new TextDecoder().decode(
-    unzipSync(await readObject(checkboxSaved.draftObjectKey!))[
-      "word/document.xml"
-    ]
+    unzipSync(await readObject(checkboxSavedObjectKey))["word/document.xml"]
   );
   expect(checkboxSavedXml).toContain(
     '<rFonts word:extension="keep" xmlns:word1="http://schemas.openxmlformats.org/wordprocessingml/2006/main" word1:ascii="Ticket Symbols" word1:hAnsi="Ticket Symbols"/>'
@@ -5226,8 +7484,12 @@ test("Ticket 07 native scalar forms preserve values, validation, and Fill Method
     select: { draftObjectKey: true },
     where: { id: strictCheckboxStart.response.id },
   });
+  const strictCheckboxSavedObjectKey = strictCheckboxSaved.draftObjectKey;
+  if (!strictCheckboxSavedObjectKey) {
+    throw new Error("The Strict WordML checkbox draft has no object key");
+  }
   const strictCheckboxSavedXml = new TextDecoder().decode(
-    unzipSync(await readObject(strictCheckboxSaved.draftObjectKey!))[
+    unzipSync(await readObject(strictCheckboxSavedObjectKey))[
       "word/document.xml"
     ]
   );
@@ -5240,7 +7502,7 @@ test("Ticket 07 native scalar forms preserve values, validation, and Fill Method
     name: string,
     title: string
   ): Promise<string> => {
-    const createResponse = await app.handle(
+    const fallbackCreateResponse = await app.handle(
       formCreationRequest({
         authorization: adminBearer,
         source: "upload",
@@ -5248,8 +7510,8 @@ test("Ticket 07 native scalar forms preserve values, validation, and Fill Method
         title,
       })
     );
-    expect(createResponse.status).toBe(200);
-    const created = (await createResponse.json()) as {
+    expect(fallbackCreateResponse.status).toBe(200);
+    const created = (await fallbackCreateResponse.json()) as {
       form?: { publicId?: string };
     };
     const fallbackPublicId = created.form?.publicId;
@@ -5263,21 +7525,21 @@ test("Ticket 07 native scalar forms preserve values, validation, and Fill Method
       )
     );
     const editor = (await editorResponse.json()) as EditorConfigBody;
-    const publishCapability = editor.bridge.capabilities.publish;
-    if (!publishCapability) {
+    const fallbackPublishCapability = editor.bridge.capabilities.publish;
+    if (!fallbackPublishCapability) {
       throw new Error(`${title} publish capability is missing`);
     }
-    const publishResponse = await app.handle(
+    const fallbackPublishResponse = await app.handle(
       new Request(
         `http://test.local/api/admin/forms/${fallbackPublicId}/publish`,
         {
           body: JSON.stringify({ documentKey: editor.config.document.key }),
-          headers: capabilityHeaders(publishCapability),
+          headers: capabilityHeaders(fallbackPublishCapability),
           method: "POST",
         }
       )
     );
-    const publish = (await publishResponse.json()) as {
+    const publish = (await fallbackPublishResponse.json()) as {
       operationCapability?: string;
       operationId?: string;
     };
@@ -5297,24 +7559,25 @@ test("Ticket 07 native scalar forms preserve values, validation, and Fill Method
     expect(await detailResponse.json()).toMatchObject({
       form: { fillMethod: "onlyoffice", nativeFillAvailable: false },
     });
-    const nativeMethodResponse = await app.handle(
+    const fallbackNativeMethodResponse = await app.handle(
       new Request(`http://test.local/api/admin/forms/${fallbackPublicId}`, {
         body: JSON.stringify({ fillMethod: "native" }),
         headers: { ...jsonHeaders, Authorization: `Bearer ${adminBearer}` },
         method: "PATCH",
       })
     );
-    expect(nativeMethodResponse.status).toBe(409);
+    expect(fallbackNativeMethodResponse.status).toBe(409);
     const fallbackForm = await prisma.form.findUniqueOrThrow({
       select: { id: true },
       where: { publicId: fallbackPublicId },
     });
-    const publishedTemplate = await prisma.publishedTemplate.findUniqueOrThrow({
-      select: { objectKey: true },
-      where: { formId: fallbackForm.id },
-    });
+    const fallbackPublishedTemplate =
+      await prisma.publishedTemplate.findUniqueOrThrow({
+        select: { objectKey: true },
+        where: { formId: fallbackForm.id },
+      });
     const document = new TextDecoder().decode(
-      unzipSync(await readObject(publishedTemplate.objectKey))[
+      unzipSync(await readObject(fallbackPublishedTemplate.objectKey))[
         "word/document.xml"
       ]
     );
@@ -5740,7 +8003,9 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   if (existingBootstrap) {
     expect(bootstrapBefore).toEqual(existingBootstrap);
     expect(bootstrapAccountBefore).toEqual(existingBootstrapAccount);
-  } else if (!existingAdmin) {
+  } else if (existingAdmin) {
+    expect(bootstrapBefore).toBeNull();
+  } else {
     if (!bootstrapBefore) {
       throw new Error("Bootstrap Admin was not created");
     }
@@ -5758,8 +8023,6 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
       providerId: "credential",
       userId: bootstrapBefore.id,
     });
-  } else {
-    expect(bootstrapBefore).toBeNull();
   }
   const adminCountBeforeSecondEnsure = await prisma.user.count({
     where: { role: "admin" },
@@ -11773,7 +14036,7 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   expect(latestViewerConfig.config.editorConfig).not.toHaveProperty(
     "callbackUrl"
   );
-  const viewerTokenPayload = latestViewerConfig.config.token.split(".")[1];
+  const [, viewerTokenPayload] = latestViewerConfig.config.token.split(".");
   if (!viewerTokenPayload) {
     throw new Error("The signed viewer configuration was not returned");
   }
@@ -13929,16 +16192,16 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     select: { id: true },
     where: { enabled: true, role: "admin" },
   });
-  for (const existingAdmin of enabledAdminsBeforeRace) {
+  for (const enabledAdminBeforeRace of enabledAdminsBeforeRace) {
     if (
-      existingAdmin.id === authorityAdminA.id ||
-      existingAdmin.id === authorityAdminB.id
+      enabledAdminBeforeRace.id === authorityAdminA.id ||
+      enabledAdminBeforeRace.id === authorityAdminB.id
     ) {
       continue;
     }
     const demoteResponse = await accountRequest(
       "PATCH",
-      `/api/admin/users/${existingAdmin.id}`,
+      `/api/admin/users/${enabledAdminBeforeRace.id}`,
       authorityAdminA.token,
       { role: "user" }
     );
@@ -15414,14 +17677,10 @@ test("Ticket 17 sign-out always revokes and clears tombstones after failures", a
     authoring,
     "endedOwnerSessions"
   ) as Set<string>;
-  let releaseRevocation!: () => void;
-  const revocationGate = new Promise<void>((resolve) => {
-    releaseRevocation = resolve;
-  });
-  let notifyRevocationStarted!: () => void;
-  const revocationStarted = new Promise<void>((resolve) => {
-    notifyRevocationStarted = resolve;
-  });
+  const { promise: revocationGate, resolve: releaseRevocation } =
+    Promise.withResolvers<undefined>();
+  const { promise: revocationStarted, resolve: notifyRevocationStarted } =
+    Promise.withResolvers<undefined>();
 
   const ending = authoring.endForSession("normal-sign-out", async () => {
     notifyRevocationStarted();
@@ -15433,14 +17692,14 @@ test("Ticket 17 sign-out always revokes and clears tombstones after failures", a
   await ending;
   expect(endedOwnerSessions.size).toBe(0);
   const firstRevocationError = new Error("first concurrent revoke failed");
-  let releaseFirstConcurrentRevocation!: () => void;
-  const firstConcurrentRevocationGate = new Promise<void>((resolve) => {
-    releaseFirstConcurrentRevocation = resolve;
-  });
-  let notifyFirstConcurrentRevocation!: () => void;
-  const firstConcurrentRevocationStarted = new Promise<void>((resolve) => {
-    notifyFirstConcurrentRevocation = resolve;
-  });
+  const {
+    promise: firstConcurrentRevocationGate,
+    resolve: releaseFirstConcurrentRevocation,
+  } = Promise.withResolvers<undefined>();
+  const {
+    promise: firstConcurrentRevocationStarted,
+    resolve: notifyFirstConcurrentRevocation,
+  } = Promise.withResolvers<undefined>();
   const firstConcurrentEnd = authoring.endForSession(
     "concurrent-sign-out",
     async () => {
@@ -15450,14 +17709,14 @@ test("Ticket 17 sign-out always revokes and clears tombstones after failures", a
     }
   );
   await firstConcurrentRevocationStarted;
-  let releaseSecondConcurrentRevocation!: () => void;
-  const secondConcurrentRevocationGate = new Promise<void>((resolve) => {
-    releaseSecondConcurrentRevocation = resolve;
-  });
-  let notifySecondConcurrentRevocation!: () => void;
-  const secondConcurrentRevocationStarted = new Promise<void>((resolve) => {
-    notifySecondConcurrentRevocation = resolve;
-  });
+  const {
+    promise: secondConcurrentRevocationGate,
+    resolve: releaseSecondConcurrentRevocation,
+  } = Promise.withResolvers<undefined>();
+  const {
+    promise: secondConcurrentRevocationStarted,
+    resolve: notifySecondConcurrentRevocation,
+  } = Promise.withResolvers<undefined>();
   const secondConcurrentEnd = authoring.endForSession(
     "concurrent-sign-out",
     async () => {
@@ -15544,8 +17803,9 @@ test("Ticket 17 sign-out always revokes and clears tombstones after failures", a
   let cleanupErrorPropagated = false;
   try {
     try {
-      await authoring.endForSession("cleanup-failure", async () => {
+      await authoring.endForSession("cleanup-failure", () => {
         revocationAttempted = true;
+        return Promise.resolve();
       });
     } catch (error) {
       cleanupErrorPropagated = error === cleanupError;
@@ -15568,9 +17828,9 @@ test("Ticket 17 sign-out always revokes and clears tombstones after failures", a
     const revocationError = new Error("session revocation failed");
     let revocationErrorPropagated = false;
     try {
-      await authoring.endForSession(ownerSessionId, async () => {
-        throw revocationError;
-      });
+      await authoring.endForSession(ownerSessionId, () =>
+        Promise.reject(revocationError)
+      );
     } catch (error) {
       revocationErrorPropagated = error === revocationError;
     }
@@ -15753,16 +18013,17 @@ test("Ticket 17 authoring shutdown cleans every active session after errors", as
     });
 
     const pendingReservation = authoring.reserveRequest("close-owner-pending");
-    const pendingGeneration = [
+    const [pendingGeneration] = [
       ...(pendingGenerations.get("close-owner-pending") ?? []),
-    ][0];
+    ];
     if (!pendingGeneration) {
       throw new Error("The pending shutdown generation was not reserved");
     }
     pendingGeneration.started = true;
     pendingGeneration.disposeError = { cause: pendingDisposeError };
     pendingGeneration.piSession = {
-      abort: async () => authoring.releaseRequest(pendingReservation),
+      abort: async () =>
+        await Promise.resolve(authoring.releaseRequest(pendingReservation)),
     };
     let closeError: unknown;
     try {
@@ -15828,37 +18089,28 @@ test("Ticket 17/18 AI Authoring creates, revises, restores, and uploads a valida
     paragraphs: ["Route through Facilities.", "Send to manager for approval."],
   };
   const revisionPrompt = "Add a Department field and a Facilities routing note";
-  const failedRevisionPrompt = "Add an approval note below the existing paragraphs";
+  const failedRevisionPrompt =
+    "Add an approval note below the existing paragraphs";
   let revisionCalls = 0;
   let upstreamCalls = 0;
   let forcedToolCalls: boolean[] = [];
   let omitAssistantSummary = false;
   let blockNextProviderRequest = false;
-  let notifyProviderBlocked!: () => void;
-  const providerBlocked = new Promise<void>((resolve) => {
-    notifyProviderBlocked = resolve;
-  });
-  let releaseProviderResponse!: () => void;
-  const providerResponseGate = new Promise<void>((resolve) => {
-    releaseProviderResponse = resolve;
-  });
-  let notifyProviderAborted!: () => void;
-  const providerAborted = new Promise<void>((resolve) => {
-    notifyProviderAborted = resolve;
-  });
+  const { promise: providerBlocked, resolve: notifyProviderBlocked } =
+    Promise.withResolvers<undefined>();
+  const { promise: providerResponseGate, resolve: releaseProviderResponse } =
+    Promise.withResolvers<undefined>();
+  const { promise: providerAborted, resolve: notifyProviderAborted } =
+    Promise.withResolvers<undefined>();
   let blockNextPromptPreflight = false;
-  let notifyPromptPreflightPaused!: () => void;
-  const promptPreflightPaused = new Promise<void>((resolve) => {
-    notifyPromptPreflightPaused = resolve;
-  });
-  let releasePromptPreflight!: () => void;
-  const promptPreflightGate = new Promise<void>((resolve) => {
-    releasePromptPreflight = resolve;
-  });
-  let notifyPromptAbortRequested!: () => void;
-  const promptAbortRequested = new Promise<void>((resolve) => {
-    notifyPromptAbortRequested = resolve;
-  });
+  const {
+    promise: promptPreflightPaused,
+    resolve: notifyPromptPreflightPaused,
+  } = Promise.withResolvers<undefined>();
+  const { promise: promptPreflightGate, resolve: releasePromptPreflight } =
+    Promise.withResolvers<undefined>();
+  const { promise: promptAbortRequested, resolve: notifyPromptAbortRequested } =
+    Promise.withResolvers<undefined>();
   let restoreAgentSessionHooks: (() => void) | undefined;
   const upstream = Bun.serve({
     fetch: async (request) => {
@@ -15902,9 +18154,11 @@ test("Ticket 17/18 AI Authoring creates, revises, restores, and uploads a valida
       ).toBe(true);
       if (blockNextProviderRequest) {
         blockNextProviderRequest = false;
-        request.signal.addEventListener("abort", notifyProviderAborted, {
-          once: true,
-        });
+        request.signal.addEventListener(
+          "abort",
+          () => notifyProviderAborted(),
+          { once: true }
+        );
         notifyProviderBlocked();
         await providerResponseGate;
       }
@@ -15915,41 +18169,46 @@ test("Ticket 17/18 AI Authoring creates, revises, restores, and uploads a valida
       const toolArguments = messages.includes(failedRevisionPrompt)
         ? omittedTemplate
         : template;
-      const completionChunks = toolCall
-        ? [
-            {
-              delta: {
-                role: "assistant",
-                tool_calls: [
-                  {
-                    function: {
-                      arguments: JSON.stringify(toolArguments),
-                      name: "create_template_docx",
-                    },
-                    id: `call-${upstreamCalls}-${revisionCalls}`,
-                    index: 0,
-                    type: "function",
+      let completionChunks;
+      if (toolCall) {
+        completionChunks = [
+          {
+            delta: {
+              role: "assistant",
+              tool_calls: [
+                {
+                  function: {
+                    arguments: JSON.stringify(toolArguments),
+                    name: "create_template_docx",
                   },
-                ],
-              },
-              finish_reason: null,
-            },
-            { delta: {}, finish_reason: "tool_calls" },
-          ]
-        : omitAssistantSummary
-          ? [{ delta: { role: "assistant" }, finish_reason: "stop" }]
-          : [
-              {
-                delta: {
-                  content: isRevision
-                    ? "Updated Equipment Request with Department and Facilities routing."
-                    : "Created Equipment Request with one tagged field.",
-                  role: "assistant",
+                  id: `call-${upstreamCalls}-${revisionCalls}`,
+                  index: 0,
+                  type: "function",
                 },
-                finish_reason: null,
-              },
-              { delta: {}, finish_reason: "stop" },
-            ];
+              ],
+            },
+            finish_reason: null,
+          },
+          { delta: {}, finish_reason: "tool_calls" },
+        ];
+      } else if (omitAssistantSummary) {
+        completionChunks = [
+          { delta: { role: "assistant" }, finish_reason: "stop" },
+        ];
+      } else {
+        completionChunks = [
+          {
+            delta: {
+              content: isRevision
+                ? "Updated Equipment Request with Department and Facilities routing."
+                : "Created Equipment Request with one tagged field.",
+              role: "assistant",
+            },
+            finish_reason: null,
+          },
+          { delta: {}, finish_reason: "stop" },
+        ];
+      }
       const createdAt = Math.floor(Date.now() / 1000);
       const stream = completionChunks
         .map((chunk) =>
@@ -15989,10 +18248,6 @@ test("Ticket 17/18 AI Authoring creates, revises, restores, and uploads a valida
     prefillReturnUrl: "https://source.example.test/forms/return",
   });
   const disabledApp = createApp({ legacySso: null, omniRoute: null });
-  const temporaryDirectories = async () =>
-    (await readdir(tmpdir())).filter((entry) =>
-      entry.startsWith("folio-authoring-")
-    );
   const createPreview = async (authorization: string) => {
     const directoriesBefore = new Set(await temporaryDirectories());
     const response = await aiApp.handle(
@@ -16021,11 +18276,12 @@ test("Ticket 17/18 AI Authoring creates, revises, restores, and uploads a valida
         title: string;
       };
     };
-    const directoriesAdded = (await temporaryDirectories()).filter(
+    const directoriesAfterCreate = await temporaryDirectories();
+    const directoriesAdded = directoriesAfterCreate.filter(
       (directory) => !directoriesBefore.has(directory)
     );
     expect(directoriesAdded).toHaveLength(1);
-    const directory = directoriesAdded[0];
+    const [directory] = directoriesAdded;
     if (!directory) {
       throw new Error("AI Authoring did not create its temporary directory");
     }
@@ -16086,14 +18342,10 @@ test("Ticket 17/18 AI Authoring creates, revises, restores, and uploads a valida
       delayedBodyAdmin.email,
       delayedBodyPassword
     );
-    let notifyBodyRead!: () => void;
-    const bodyRead = new Promise<void>((resolve) => {
-      notifyBodyRead = resolve;
-    });
-    let releaseBody!: () => void;
-    const bodyGate = new Promise<void>((resolve) => {
-      releaseBody = resolve;
-    });
+    const { promise: bodyRead, resolve: notifyBodyRead } =
+      Promise.withResolvers<undefined>();
+    const { promise: bodyGate, resolve: releaseBody } =
+      Promise.withResolvers<undefined>();
     let bodyReadNotified = false;
     let delayedCreate: Promise<globalThis.Response> | undefined;
     try {
@@ -16276,7 +18528,8 @@ test("Ticket 17/18 AI Authoring creates, revises, restores, and uploads a valida
         prompt: "Create an equipment request form",
       },
     ]);
-    const currentUrl = "http://test.local/api/admin/ai-authoring/sessions/current";
+    const currentUrl =
+      "http://test.local/api/admin/ai-authoring/sessions/current";
     const revisionUrl = `http://test.local/api/admin/ai-authoring/sessions/${first.session.sessionId}/revisions`;
     const currentBeforeRevision = await aiApp.handle(
       new Request(currentUrl, {
@@ -16655,11 +18908,12 @@ test("Ticket 17/18 AI Authoring creates, revises, restores, and uploads a valida
       })
     );
     await promptPreflightPaused;
-    const preflightDirectories = (await temporaryDirectories()).filter(
+    const directoriesAfterPreflight = await temporaryDirectories();
+    const preflightDirectories = directoriesAfterPreflight.filter(
       (directory) => !directoriesBeforePreflight.has(directory)
     );
     expect(preflightDirectories).toHaveLength(1);
-    const preflightDirectory = preflightDirectories[0];
+    const [preflightDirectory] = preflightDirectories;
     if (!preflightDirectory) {
       throw new Error(
         "Preflight AI Authoring did not create its temporary directory"
@@ -16716,11 +18970,12 @@ test("Ticket 17/18 AI Authoring creates, revises, restores, and uploads a valida
       })
     );
     await providerBlocked;
-    const pendingDirectories = (await temporaryDirectories()).filter(
+    const directoriesAfterPending = await temporaryDirectories();
+    const pendingDirectories = directoriesAfterPending.filter(
       (directory) => !directoriesBeforePending.has(directory)
     );
     expect(pendingDirectories).toHaveLength(1);
-    const pendingDirectory = pendingDirectories[0];
+    const [pendingDirectory] = pendingDirectories;
     if (!pendingDirectory) {
       throw new Error(
         "Pending AI Authoring did not create its temporary directory"
@@ -16884,6 +19139,7 @@ test("Ticket 17/18 AI Authoring creates, revises, restores, and uploads a valida
       AgentSession.prototype.getLastAssistantText;
     const originalFailedGenerationDispose = AgentSession.prototype.dispose;
     const originalUint8ArrayFill = Uint8Array.prototype.fill;
+    const uint8ArrayFillSpy = vi.spyOn(Uint8Array.prototype, "fill");
     let generatedDocumentZeroed = false;
     AgentSession.prototype.getLastAssistantText = () => {
       throw new Error("generation failed after DOCX creation");
@@ -16891,7 +19147,7 @@ test("Ticket 17/18 AI Authoring creates, revises, restores, and uploads a valida
     AgentSession.prototype.dispose = () => {
       throw new Error("Pi disposal failed");
     };
-    Uint8Array.prototype.fill = function fill(
+    uint8ArrayFillSpy.mockImplementation(function fill(
       this: Uint8Array,
       value: number,
       start?: number,
@@ -16904,7 +19160,7 @@ test("Ticket 17/18 AI Authoring creates, revises, restores, and uploads a valida
         generatedDocumentZeroed = this.every((byte) => byte === 0);
       }
       return result;
-    };
+    });
     try {
       forcedToolCalls = [true, false];
       const failedGeneration = await aiApp.handle(
@@ -16926,8 +19182,9 @@ test("Ticket 17/18 AI Authoring creates, revises, restores, and uploads a valida
       };
       expect(failedGenerationBody.error).toBe("ai_authoring_failed");
       expect(generatedDocumentZeroed).toBe(true);
+      const directoriesAfterFailedGeneration = await temporaryDirectories();
       expect(
-        (await temporaryDirectories()).filter(
+        directoriesAfterFailedGeneration.filter(
           (directory) => !directoriesBeforeFailedGeneration.has(directory)
         )
       ).toHaveLength(0);
@@ -16935,7 +19192,7 @@ test("Ticket 17/18 AI Authoring creates, revises, restores, and uploads a valida
       AgentSession.prototype.getLastAssistantText =
         originalGetLastAssistantText;
       AgentSession.prototype.dispose = originalFailedGenerationDispose;
-      Uint8Array.prototype.fill = originalUint8ArrayFill;
+      uint8ArrayFillSpy.mockRestore();
     }
 
     forcedToolCalls = [true, false];
@@ -17033,7 +19290,8 @@ test("Ticket 19 PDF authoring re-inspects original bytes when revising a retaine
   ]);
   const firstPrompt = "Create an equipment intake form from the attached PDF";
   const revisionPrompt = "Add a serial number field from the same PDF";
-  const instructionsRevisionPrompt = "Shorten the instructions to match the attached PDF";
+  const instructionsRevisionPrompt =
+    "Shorten the instructions to match the attached PDF";
   const observations = [
     "PDF observation: the intake requires an employee name.",
     "PDF observation: the intake also requires an equipment serial number.",
@@ -17045,20 +19303,20 @@ test("Ticket 19 PDF authoring re-inspects original bytes when revising a retaine
   let invalidEditDeclaration = false;
   let blockInspection = false;
   const { promise: inspectionStarted, resolve: notifyInspectionStarted } =
-    Promise.withResolvers<void>();
+    Promise.withResolvers<undefined>();
   const { promise: inspectionGate, resolve: releaseInspection } =
-    Promise.withResolvers<void>();
+    Promise.withResolvers<undefined>();
   const upstream = Bun.serve({
-    hostname: "127.0.0.1",
-    port: 0,
     fetch: async (request) => {
       const body = (await request.json()) as {
         messages?: {
-          content?: string | {
-            file?: { file_data?: string; filename?: string };
-            text?: string;
-            type?: string;
-          }[];
+          content?:
+            | string
+            | {
+                file?: { file_data?: string; filename?: string };
+                text?: string;
+                type?: string;
+              }[];
         }[];
         model?: string;
         stream?: boolean;
@@ -17070,10 +19328,12 @@ test("Ticket 19 PDF authoring re-inspects original bytes when revising a retaine
           ? content.find((part) => part.type === "file")?.file
           : undefined;
         const encoded = file?.file_data?.match(
-          /^data:application\/pdf;base64,([A-Za-z0-9+/=]+)$/u
+          /^data:application\/pdf;base64,(?<encoded>[A-Za-z0-9+/=]+)$/u
         )?.[1];
         receivedPdfs.push(
-          encoded ? Uint8Array.from(Buffer.from(encoded, "base64")) : new Uint8Array()
+          encoded
+            ? Uint8Array.from(Buffer.from(encoded, "base64"))
+            : new Uint8Array()
         );
         if (blockInspection) {
           blockInspection = false;
@@ -17082,10 +19342,16 @@ test("Ticket 19 PDF authoring re-inspects original bytes when revising a retaine
         }
         const observation = observations[receivedPdfs.length - 1];
         return Response.json({
-          choices: [{ finish_reason: "stop", index: 0, message: {
-            content: observation ?? "PDF observation: intake form.",
-            role: "assistant",
-          } }],
+          choices: [
+            {
+              finish_reason: "stop",
+              index: 0,
+              message: {
+                content: observation ?? "PDF observation: intake form.",
+                role: "assistant",
+              },
+            },
+          ],
           created: Math.floor(Date.now() / 1000),
           id: `pdf-${receivedPdfs.length}`,
           model,
@@ -17116,14 +19382,20 @@ test("Ticket 19 PDF authoring re-inspects original bytes when revising a retaine
             tag: "employee_name",
           },
           ...(revising
-            ? [{ label: "Serial Number", placeholder: "Enter serial number", tag: "serial_number" }]
+            ? [
+                {
+                  label: "Serial Number",
+                  placeholder: "Enter serial number",
+                  tag: "serial_number",
+                },
+              ]
             : []),
         ],
         paragraphs: [
-          revisingInstructions
-            ? "Enter name, serial."
-            : "Complete each field.",
-          ...(invalidEditDeclaration ? ["Route the intake to Facilities."] : []),
+          revisingInstructions ? "Enter name, serial." : "Complete each field.",
+          ...(invalidEditDeclaration
+            ? ["Route the intake to Facilities."]
+            : []),
         ],
         title: "Equipment Intake",
       };
@@ -17132,15 +19404,17 @@ test("Ticket 19 PDF authoring re-inspects original bytes when revising a retaine
             {
               delta: {
                 role: "assistant",
-                tool_calls: [{
-                  function: {
-                    arguments: JSON.stringify(generated),
-                    name: "create_template_docx",
+                tool_calls: [
+                  {
+                    function: {
+                      arguments: JSON.stringify(generated),
+                      name: "create_template_docx",
+                    },
+                    id: `tool-${piCalls}`,
+                    index: 0,
+                    type: "function",
                   },
-                  id: `tool-${piCalls}`,
-                  index: 0,
-                  type: "function",
-                }],
+                ],
               },
               finish_reason: null,
             },
@@ -17149,26 +19423,33 @@ test("Ticket 19 PDF authoring re-inspects original bytes when revising a retaine
         : [
             {
               delta: {
-                content: revising ? "Revised the intake form." : "Created the intake form.",
+                content: revising
+                  ? "Revised the intake form."
+                  : "Created the intake form.",
                 role: "assistant",
               },
               finish_reason: null,
             },
             { delta: {}, finish_reason: "stop" },
           ];
-      const stream = chunks.map((chunk) =>
-        `data: ${JSON.stringify({
-          choices: [{ index: 0, ...chunk }],
-          created: Math.floor(Date.now() / 1000),
-          id: `chat-${piCalls}`,
-          model,
-          object: "chat.completion.chunk",
-        })}\n\n`
-      ).join("");
+      const stream = chunks
+        .map(
+          (chunk) =>
+            `data: ${JSON.stringify({
+              choices: [{ index: 0, ...chunk }],
+              created: Math.floor(Date.now() / 1000),
+              id: `chat-${piCalls}`,
+              model,
+              object: "chat.completion.chunk",
+            })}\n\n`
+        )
+        .join("");
       return new Response(`${stream}data: [DONE]\n\n`, {
         headers: { "Content-Type": "text/event-stream" },
       });
     },
+    hostname: "127.0.0.1",
+    port: 0,
   });
   let now = new Date();
   const pdfApp = createApp({
@@ -17194,7 +19475,7 @@ test("Ticket 19 PDF authoring re-inspects original bytes when revising a retaine
   let otherAdminBearer = "";
   let activeSessionId: string | undefined;
   const createRequest = (
-    authorization: string | undefined,
+    authorization?: string,
     pdf = originalPdf,
     mime = "application/pdf",
     consent = "true",
@@ -17206,14 +19487,18 @@ test("Ticket 19 PDF authoring re-inspects original bytes when revising a retaine
     body.set("pdf", new File([pdf], filename, { type: mime }));
     return new Request(sessionUrl, {
       body,
-      headers: authorization ? { Authorization: `Bearer ${authorization}` } : {},
+      headers: authorization
+        ? { Authorization: `Bearer ${authorization}` }
+        : {},
       method: "POST",
     });
   };
   const getCurrent = (authorization: string) =>
-    pdfApp.handle(new Request(currentUrl, {
-      headers: { Authorization: `Bearer ${authorization}` },
-    }));
+    pdfApp.handle(
+      new Request(currentUrl, {
+        headers: { Authorization: `Bearer ${authorization}` },
+      })
+    );
   try {
     const admin = await createCredentialFixture({
       email: `ticket-19-admin-${crypto.randomUUID()}@example.com`,
@@ -17235,25 +19520,54 @@ test("Ticket 19 PDF authoring re-inspects original bytes when revising a retaine
     adminBearer = await bearerFor(admin.email, password);
     otherAdminBearer = await bearerFor(otherAdmin.email, password);
     userBearer = await bearerFor(user.email, password);
-    expect((await pdfApp.handle(createRequest(undefined))).status).toBe(401);
-    expect((await pdfApp.handle(createRequest(userBearer))).status).toBe(403);
-    expect((await disabledApp.handle(createRequest(adminBearer))).status).toBe(503);
-    expect((await pdfApp.handle(createRequest(adminBearer, originalPdf, "application/pdf", "false"))).status).toBe(428);
-    expect((await pdfApp.handle(createRequest(adminBearer, originalPdf, "text/plain", "true", "source.txt"))).status).toBe(415);
-    expect((await pdfApp.handle(createRequest(adminBearer, new TextEncoder().encode("not a PDF")))).status).toBe(415);
+    const anonymousCreateResponse = await pdfApp.handle(createRequest());
+    expect(anonymousCreateResponse.status).toBe(401);
+    const userCreateResponse = await pdfApp.handle(createRequest(userBearer));
+    expect(userCreateResponse.status).toBe(403);
+    const disabledCreateResponse = await disabledApp.handle(
+      createRequest(adminBearer)
+    );
+    expect(disabledCreateResponse.status).toBe(503);
+    const missingConsentResponse = await pdfApp.handle(
+      createRequest(adminBearer, originalPdf, "application/pdf", "false")
+    );
+    expect(missingConsentResponse.status).toBe(428);
+    const wrongContentTypeResponse = await pdfApp.handle(
+      createRequest(
+        adminBearer,
+        originalPdf,
+        "text/plain",
+        "true",
+        "source.txt"
+      )
+    );
+    expect(wrongContentTypeResponse.status).toBe(415);
+    const invalidPdfResponse = await pdfApp.handle(
+      createRequest(adminBearer, new TextEncoder().encode("not a PDF"))
+    );
+    expect(invalidPdfResponse.status).toBe(415);
     const oversizedPdf = new Uint8Array(10 * 1024 * 1024 + 1);
     oversizedPdf.set(originalPdf);
-    expect((await pdfApp.handle(createRequest(adminBearer, oversizedPdf))).status).toBe(413);
+    const oversizedPdfResponse = await pdfApp.handle(
+      createRequest(adminBearer, oversizedPdf)
+    );
+    expect(oversizedPdfResponse.status).toBe(413);
     const oversizedBody = new FormData();
     oversizedBody.set("prompt", firstPrompt);
     oversizedBody.set("consent", "true");
-    oversizedBody.set("pdf", new File([originalPdf], "source.pdf", { type: "application/pdf" }));
+    oversizedBody.set(
+      "pdf",
+      new File([originalPdf], "source.pdf", { type: "application/pdf" })
+    );
     oversizedBody.set("padding", "x".repeat(11 * 1024 * 1024));
-    expect((await pdfApp.handle(new Request(sessionUrl, {
-      body: oversizedBody,
-      headers: { Authorization: `Bearer ${adminBearer}` },
-      method: "POST",
-    }))).status).toBe(413);
+    const oversizedBodyResponse = await pdfApp.handle(
+      new Request(sessionUrl, {
+        body: oversizedBody,
+        headers: { Authorization: `Bearer ${adminBearer}` },
+        method: "POST",
+      })
+    );
+    expect(oversizedBodyResponse.status).toBe(413);
     expect(receivedPdfs).toHaveLength(0);
 
     const createdResponse = await pdfApp.handle(createRequest(adminBearer));
@@ -17269,18 +19583,26 @@ test("Ticket 19 PDF authoring re-inspects original bytes when revising a retaine
     expect(created.hasSourcePdf).toBe(true);
     expect(receivedPdfs).toEqual([originalPdf]);
     expect(piMessages[0]).toContain(observations[0]);
-    const initialDownload = await pdfApp.handle(new Request(
-      `http://test.local${created.downloadUrl}`,
-      { headers: { Authorization: `Bearer ${adminBearer}` } }
-    ));
+    const initialDownload = await pdfApp.handle(
+      new Request(`http://test.local${created.downloadUrl}`, {
+        headers: { Authorization: `Bearer ${adminBearer}` },
+      })
+    );
     expect(initialDownload.status).toBe(200);
-    const initialXml = unzipSync(new Uint8Array(await initialDownload.arrayBuffer()))["word/document.xml"];
-    expect(new TextDecoder().decode(initialXml)).toContain('<w:tag w:val="employee_name"/>');
+    const initialXml = unzipSync(
+      new Uint8Array(await initialDownload.arrayBuffer())
+    )["word/document.xml"];
+    expect(new TextDecoder().decode(initialXml)).toContain(
+      '<w:tag w:val="employee_name"/>'
+    );
 
     const refreshed = await getCurrent(adminBearer);
     expect(refreshed.status).toBe(200);
     expect(await refreshed.json()).toEqual({ session: created });
-    expect(await (await getCurrent(otherAdminBearer)).json()).toEqual({ session: null });
+    const otherAdminCurrentResponse = await getCurrent(otherAdminBearer);
+    expect(await otherAdminCurrentResponse.json()).toEqual({
+      session: null,
+    });
     const revisionUrl = `${sessionUrl}/${created.sessionId}/revisions`;
     const revisionRequest = (
       authorization: string,
@@ -17292,8 +19614,14 @@ test("Ticket 19 PDF authoring re-inspects original bytes when revising a retaine
         headers: { ...jsonHeaders, Authorization: `Bearer ${authorization}` },
         method: "POST",
       });
-    expect((await pdfApp.handle(revisionRequest(otherAdminBearer))).status).toBe(404);
-    expect((await pdfApp.handle(revisionRequest(adminBearer, false))).status).toBe(428);
+    const otherAdminRevisionResponse = await pdfApp.handle(
+      revisionRequest(otherAdminBearer)
+    );
+    expect(otherAdminRevisionResponse.status).toBe(404);
+    const missingRevisionConsentResponse = await pdfApp.handle(
+      revisionRequest(adminBearer, false)
+    );
+    expect(missingRevisionConsentResponse.status).toBe(428);
     expect(receivedPdfs).toHaveLength(1);
     const revisedResponse = await pdfApp.handle(revisionRequest(adminBearer));
     expect(revisedResponse.status).toBe(200);
@@ -17303,46 +19631,62 @@ test("Ticket 19 PDF authoring re-inspects original bytes when revising a retaine
     expect(revised.hasSourcePdf).toBe(true);
     expect(receivedPdfs).toEqual([originalPdf, originalPdf]);
     expect(piMessages[2]).toContain(observations[1]);
-    const revisedDownload = await pdfApp.handle(new Request(
-      `http://test.local${revised.downloadUrl}`,
-      { headers: { Authorization: `Bearer ${adminBearer}` } }
-    ));
+    const revisedDownload = await pdfApp.handle(
+      new Request(`http://test.local${revised.downloadUrl}`, {
+        headers: { Authorization: `Bearer ${adminBearer}` },
+      })
+    );
     expect(revisedDownload.status).toBe(200);
-    const revisedXml = unzipSync(new Uint8Array(await revisedDownload.arrayBuffer()))["word/document.xml"];
-    expect(new TextDecoder().decode(revisedXml)).toContain('<w:tag w:val="serial_number"/>');
-    expect(await (await getCurrent(adminBearer)).json()).toEqual({ session: revised });
+    const revisedXml = unzipSync(
+      new Uint8Array(await revisedDownload.arrayBuffer())
+    )["word/document.xml"];
+    expect(new TextDecoder().decode(revisedXml)).toContain(
+      '<w:tag w:val="serial_number"/>'
+    );
+    const currentAfterRevision = await getCurrent(adminBearer);
+    expect(await currentAfterRevision.json()).toEqual({
+      session: revised,
+    });
 
     const instructionsResponse = await pdfApp.handle(
       revisionRequest(adminBearer, true, instructionsRevisionPrompt)
     );
     expect(instructionsResponse.status).toBe(200);
-    const { session: instructionsRevised } = (await instructionsResponse.json()) as {
-      session: typeof created;
-    };
+    const { session: instructionsRevised } =
+      (await instructionsResponse.json()) as {
+        session: typeof created;
+      };
     expect(instructionsRevised.hasSourcePdf).toBe(true);
     expect(receivedPdfs).toEqual([originalPdf, originalPdf, originalPdf]);
     expect(piMessages[4]).toContain(observations[2]);
-    const instructionsDownload = await pdfApp.handle(new Request(
-      `http://test.local${instructionsRevised.downloadUrl}`,
-      { headers: { Authorization: `Bearer ${adminBearer}` } }
-    ));
+    const instructionsDownload = await pdfApp.handle(
+      new Request(`http://test.local${instructionsRevised.downloadUrl}`, {
+        headers: { Authorization: `Bearer ${adminBearer}` },
+      })
+    );
     expect(instructionsDownload.status).toBe(200);
     const instructionsDocument = new Uint8Array(
       await instructionsDownload.arrayBuffer()
     );
-    const instructionsXml = unzipSync(instructionsDocument)["word/document.xml"];
+    const instructionsXml =
+      unzipSync(instructionsDocument)["word/document.xml"];
     const instructionsText = new TextDecoder().decode(instructionsXml);
     expect(instructionsText).toContain("Enter name, serial.");
     expect(instructionsText).not.toContain("Complete each field.");
     expect(instructionsText).toContain('<w:tag w:val="employee_name"/>');
     expect(instructionsText).toContain('<w:tag w:val="serial_number"/>');
-    expect(await (await getCurrent(adminBearer)).json()).toEqual({
+    const currentAfterInstructions = await getCurrent(adminBearer);
+    expect(await currentAfterInstructions.json()).toEqual({
       session: instructionsRevised,
     });
 
     invalidEditDeclaration = true;
     const invalidRevisionResponse = await pdfApp.handle(
-      revisionRequest(adminBearer, true, "Add a PDF routing note after the instructions")
+      revisionRequest(
+        adminBearer,
+        true,
+        "Add a PDF routing note after the instructions"
+      )
     );
     invalidEditDeclaration = false;
     expect(invalidRevisionResponse.status).toBe(502);
@@ -17352,27 +19696,37 @@ test("Ticket 19 PDF authoring re-inspects original bytes when revising a retaine
       originalPdf,
       originalPdf,
     ]);
-    expect(await (await getCurrent(adminBearer)).json()).toEqual({
+    const currentAfterInvalidRevision = await getCurrent(adminBearer);
+    expect(await currentAfterInvalidRevision.json()).toEqual({
       session: instructionsRevised,
     });
-    const unchangedDownload = await pdfApp.handle(new Request(
-      `http://test.local${instructionsRevised.downloadUrl}`,
-      { headers: { Authorization: `Bearer ${adminBearer}` } }
-    ));
+    const unchangedDownload = await pdfApp.handle(
+      new Request(`http://test.local${instructionsRevised.downloadUrl}`, {
+        headers: { Authorization: `Bearer ${adminBearer}` },
+      })
+    );
     expect(unchangedDownload.status).toBe(200);
     expect(new Uint8Array(await unchangedDownload.arrayBuffer())).toEqual(
       instructionsDocument
     );
-    expect((await pdfApp.handle(new Request(
-      `${sessionUrl}/${created.sessionId}`,
-      { headers: { Authorization: `Bearer ${adminBearer}` }, method: "DELETE" }
-    ))).status).toBe(200);
+    const deleteSessionResponse = await pdfApp.handle(
+      new Request(`${sessionUrl}/${created.sessionId}`, {
+        headers: { Authorization: `Bearer ${adminBearer}` },
+        method: "DELETE",
+      })
+    );
+    expect(deleteSessionResponse.status).toBe(200);
     activeSessionId = undefined;
-    expect(await (await getCurrent(adminBearer)).json()).toEqual({ session: null });
-    expect((await pdfApp.handle(new Request(
-      `http://test.local${created.downloadUrl}`,
-      { headers: { Authorization: `Bearer ${adminBearer}` } }
-    ))).status).toBe(404);
+    const currentAfterDelete = await getCurrent(adminBearer);
+    expect(await currentAfterDelete.json()).toEqual({
+      session: null,
+    });
+    const deletedDownloadResponse = await pdfApp.handle(
+      new Request(`http://test.local${created.downloadUrl}`, {
+        headers: { Authorization: `Bearer ${adminBearer}` },
+      })
+    );
+    expect(deletedDownloadResponse.status).toBe(404);
     const logoutCreate = await pdfApp.handle(
       createRequest(adminBearer, originalPdf, "", "true", "source.bin")
     );
@@ -17382,17 +19736,25 @@ test("Ticket 19 PDF authoring re-inspects original bytes when revising a retaine
     };
     activeSessionId = logoutSession.sessionId;
     expect(logoutSession.hasSourcePdf).toBe(true);
-    expect((await pdfApp.handle(new Request("http://test.local/api/auth/sign-out", {
-      headers: { Authorization: `Bearer ${adminBearer}` },
-      method: "POST",
-    }))).status).toBe(200);
+    const logoutResponse = await pdfApp.handle(
+      new Request("http://test.local/api/auth/sign-out", {
+        headers: { Authorization: `Bearer ${adminBearer}` },
+        method: "POST",
+      })
+    );
+    expect(logoutResponse.status).toBe(200);
     activeSessionId = undefined;
     adminBearer = await bearerFor(admin.email, password);
-    expect(await (await getCurrent(adminBearer)).json()).toEqual({ session: null });
-    expect((await pdfApp.handle(new Request(
-      `http://test.local${logoutSession.downloadUrl}`,
-      { headers: { Authorization: `Bearer ${adminBearer}` } }
-    ))).status).toBe(404);
+    const currentAfterLogout = await getCurrent(adminBearer);
+    expect(await currentAfterLogout.json()).toEqual({
+      session: null,
+    });
+    const logoutDownloadResponse = await pdfApp.handle(
+      new Request(`http://test.local${logoutSession.downloadUrl}`, {
+        headers: { Authorization: `Bearer ${adminBearer}` },
+      })
+    );
+    expect(logoutDownloadResponse.status).toBe(404);
 
     const expiryCreate = await pdfApp.handle(createRequest(adminBearer));
     expect(expiryCreate.status).toBe(200);
@@ -17401,9 +19763,15 @@ test("Ticket 19 PDF authoring re-inspects original bytes when revising a retaine
     };
     activeSessionId = expirySession.sessionId;
     now = new Date(now.getTime() + 2 * 60 * 60 * 1000);
-    expect(await (await getCurrent(adminBearer)).json()).toEqual({ session: null });
+    const currentAfterExpiry = await getCurrent(adminBearer);
+    expect(await currentAfterExpiry.json()).toEqual({
+      session: null,
+    });
     activeSessionId = undefined;
-    expect((await pdfApp.handle(revisionRequest(adminBearer))).status).toBe(404);
+    const expiredRevisionResponse = await pdfApp.handle(
+      revisionRequest(adminBearer)
+    );
+    expect(expiredRevisionResponse.status).toBe(404);
     expect(receivedPdfs).toEqual([
       originalPdf,
       originalPdf,
@@ -17429,26 +19797,37 @@ test("Ticket 19 PDF authoring re-inspects original bytes when revising a retaine
     ]);
     releaseInspection();
     expect(completedBeforeGatewayRelease).toBe(true);
-    expect((await logoutWhileBlocked).status).toBe(200);
-    expect((await blockedCreate).status).not.toBe(200);
+    const logoutWhileBlockedResponse = await logoutWhileBlocked;
+    expect(logoutWhileBlockedResponse.status).toBe(200);
+    const blockedCreateResponse = await blockedCreate;
+    expect(blockedCreateResponse.status).not.toBe(200);
     adminBearer = await bearerFor(admin.email, password);
-    expect(await (await getCurrent(adminBearer)).json()).toEqual({
+    const currentAfterBlockedLogout = await getCurrent(adminBearer);
+    expect(await currentAfterBlockedLogout.json()).toEqual({
       session: null,
     });
   } finally {
     releaseInspection();
     if (activeSessionId && adminBearer) {
-      await pdfApp.handle(new Request(`${sessionUrl}/${activeSessionId}`, {
-        headers: { Authorization: `Bearer ${adminBearer}` },
-        method: "DELETE",
-      })).catch(() => {});
+      await pdfApp
+        .handle(
+          new Request(`${sessionUrl}/${activeSessionId}`, {
+            headers: { Authorization: `Bearer ${adminBearer}` },
+            method: "DELETE",
+          })
+        )
+        .catch(() => {});
     }
     for (const bearer of [adminBearer, otherAdminBearer, userBearer]) {
       if (bearer) {
-        await pdfApp.handle(new Request("http://test.local/api/auth/sign-out", {
-          headers: { Authorization: `Bearer ${bearer}` },
-          method: "POST",
-        })).catch(() => {});
+        await pdfApp
+          .handle(
+            new Request("http://test.local/api/auth/sign-out", {
+              headers: { Authorization: `Bearer ${bearer}` },
+              method: "POST",
+            })
+          )
+          .catch(() => {});
       }
     }
     upstream.stop(true);
@@ -17457,32 +19836,32 @@ test("Ticket 19 PDF authoring re-inspects original bytes when revising a retaine
 
 const documentWorkerTestUrl = process.env.DOCUMENT_WORKER_URL;
 if (documentWorkerTestUrl) {
-test("Ticket 20 Python document worker generates a Template Draft and contains hostile code", async () => {
-  const workerUrl = documentWorkerTestUrl;
-  const health = await fetch(new URL("/health", workerUrl), {
-    signal: AbortSignal.timeout(2000),
-  }).catch(() => null);
-  if (!health?.ok) {
-    throw new Error(
-      `Document worker unavailable at ${workerUrl}; start the Docker worker before running this test`
-    );
-  }
-  const model = "ticket-20-python-model";
-  const serviceKey = `ticket-20-${crypto.randomUUID()}`;
-  const marker = `Python-generated-${crypto.randomUUID()}`;
-  const template = {
-    title: `Python Equipment Request ${marker}`,
-    description: "Request equipment with a generated document.",
-    paragraphs: ["Complete the equipment request.", "Use R&D <equipment>."],
-    fields: [
-      {
-        label: "Employee Name",
-        placeholder: "Enter employee name",
-        tag: "employee_name",
-      },
-    ],
-  };
-  const benignSource = `
+  test("Ticket 20 Python document worker generates a Template Draft and contains hostile code", async () => {
+    const workerUrl = documentWorkerTestUrl;
+    const health = await fetch(new URL("/health", workerUrl), {
+      signal: AbortSignal.timeout(2000),
+    }).catch(() => null);
+    if (!health?.ok) {
+      throw new Error(
+        `Document worker unavailable at ${workerUrl}; start the Docker worker before running this test`
+      );
+    }
+    const model = "ticket-20-python-model";
+    const serviceKey = `ticket-20-${crypto.randomUUID()}`;
+    const marker = `Python-generated-${crypto.randomUUID()}`;
+    const template = {
+      description: "Request equipment with a generated document.",
+      fields: [
+        {
+          label: "Employee Name",
+          placeholder: "Enter employee name",
+          tag: "employee_name",
+        },
+      ],
+      paragraphs: ["Complete the equipment request.", "Use R&D <equipment>."],
+      title: `Python Equipment Request ${marker}`,
+    };
+    const benignSource = `
 from zipfile import ZipFile, ZIP_DEFLATED
 from xml.sax.saxutils import escape
 
@@ -17513,398 +19892,488 @@ with ZipFile('output.docx', 'w', ZIP_DEFLATED) as archive:
 </Relationships>''')
     archive.writestr('word/document.xml', document)
 `;
-  const revisionPrompt = "A warmer welcome and a requester identity suit this form better.";
-  const paragraphRevision = {
-    ...template,
-    paragraphs: ["Welcome! Tell us which equipment you need.", "Use R&D <equipment>."],
-    source: benignSource.replace(
-      "Complete the equipment request.",
-      "Welcome! Tell us which equipment you need."
-    ),
-  };
-  const fieldRevision = {
-    ...template,
-    fields: [{
-      label: "Requester Name",
-      placeholder: "Enter requester name",
-      tag: "requester_name",
-    }],
-    source: benignSource
-      .replace("Employee Name", "Requester Name")
-      .replace("Enter employee name", "Enter requester name")
-      .replace("employee_name", "requester_name"),
-  };
-  const revisedTemplate = {
-    ...paragraphRevision,
-    fields: fieldRevision.fields,
-    editedParagraphs: ["Complete the equipment request."],
-    removedFieldTags: ["employee_name"],
-    source: fieldRevision.source
-      .replace(
+    const revisionPrompt =
+      "A warmer welcome and a requester identity suit this form better.";
+    const paragraphRevision = {
+      ...template,
+      paragraphs: [
+        "Welcome! Tell us which equipment you need.",
+        "Use R&D <equipment>.",
+      ],
+      source: benignSource.replace(
         "Complete the equipment request.",
         "Welcome! Tell us which equipment you need."
-      )
-      .replace("<w:showingPlcHdr/>", ""),
-  };
-  const rejectedOutputs = {
-    "source-only paragraph removal": {
-      ...template,
-      source: benignSource.replace(
-        "'<w:p><w:r><w:t>Complete the equipment request.</w:t></w:r></w:p>'",
-        "''"
       ),
-    },
-    "source-only paragraph change": {
+    };
+    const fieldRevision = {
       ...template,
-      source: benignSource.replace(
-        "Complete the equipment request.",
-        "Original instructions were silently replaced."
-      ),
-    },
-    "source-only title change": {
-      ...template,
-      source: benignSource.replace("escape(title)", "escape('Incorrect title')"),
-    },
-    "source-only description change": {
-      ...template,
-      source: benignSource.replace("escape(description)", "escape('Incorrect description')"),
-    },
-    "source-only field label change": {
-      ...template,
-      source: benignSource.replace('w:alias w:val="Employee Name"', 'w:alias w:val="Incorrect label"'),
-    },
-    "source-only field placeholder change": {
-      ...template,
-      source: benignSource.replace("Enter employee name", "Incorrect placeholder"),
-    },
-    "paragraph revision without declaration": paragraphRevision,
-    "paragraph revision with stale declaration": {
+      fields: [
+        {
+          label: "Requester Name",
+          placeholder: "Enter requester name",
+          tag: "requester_name",
+        },
+      ],
+      source: benignSource
+        .replace("Employee Name", "Requester Name")
+        .replace("Enter employee name", "Enter requester name")
+        .replace("employee_name", "requester_name"),
+    };
+    const revisedTemplate = {
       ...paragraphRevision,
-      editedParagraphs: ["This paragraph is not in the current document."],
-    },
-    "field revision without declaration": fieldRevision,
-    "field revision with stale declaration": {
-      ...fieldRevision,
-      removedFieldTags: ["unknown_field"],
-    },
-    "bogus document output": {
-      ...template,
-      source: "open('output.docx', 'wb').write(b'not a DOCX')",
-    },
-    "unsupported control output": {
-      ...template,
-      source: benignSource.replace("<w:text/>", "<w:comboBox/>"),
-    },
-    "mismatched control output": {
-      ...template,
-      source: benignSource.replace("employee_name", "undeclared_name"),
-    },
-  };
-  const hostileSources: Record<string, string> = {
-    "read private server file": "open('/app/.env').read()",
-    "write outside workspace": "open('/tmp/folio-worker-escape', 'w').write('breached')",
-    "contact internet": "import socket; socket.create_connection(('1.1.1.1', 443), timeout=1).close()",
-    "execute shell": "import subprocess; subprocess.run(['/bin/sh', '-c', 'echo breached'], check=True)",
-    "exhaust memory": "allocation = bytearray(512 * 1024 * 1024)",
-    "exhaust CPU": "while True: pass",
-  };
-  const upstream = Bun.serve({
-    hostname: "127.0.0.1",
-    port: 0,
-    fetch: async (request) => {
-      const body = (await request.json()) as {
-        messages?: { content?: unknown; role?: string }[];
-        tools?: { function?: { name?: string } }[];
-      };
-      const messages = body.messages ?? [];
-      const latestUserContent = [...messages].reverse().find((message) =>
-        message.role === "user"
-      )?.content;
-      const promptText = JSON.stringify(latestUserContent ?? "");
-      const attemptedAttack = Object.entries(hostileSources).find(([prompt]) =>
-        promptText.includes(prompt)
-      );
-      const requestedOutput = Object.entries({
-        ...rejectedOutputs,
-        [revisionPrompt]: revisedTemplate,
-      }).find(([prompt]) => promptText.includes(prompt))?.[1];
-      const generated = attemptedAttack
-        ? { ...template, source: `${attemptedAttack[1]}\n${benignSource}` }
-        : requestedOutput ?? { ...template, source: benignSource };
-      // Pi also sends tool-free requests when compacting the long attack history.
-      const shouldSummarize = messages.at(-1)?.role === "tool" || !body.tools;
-      const chunks = shouldSummarize
-        ? [
-            {
-              delta: { role: "assistant", content: "Document prepared." },
-              finish_reason: null,
-            },
-            { delta: {}, finish_reason: "stop" },
-          ]
-        : [
-            {
-              delta: {
-                role: "assistant",
-                tool_calls: [{
-                  function: {
-                    arguments: JSON.stringify(generated),
-                    name: "create_template_docx_python",
-                  },
-                  id: `call-${crypto.randomUUID()}`,
-                  index: 0,
-                  type: "function",
-                }],
+      editedParagraphs: ["Complete the equipment request."],
+      fields: fieldRevision.fields,
+      removedFieldTags: ["employee_name"],
+      source: fieldRevision.source
+        .replace(
+          "Complete the equipment request.",
+          "Welcome! Tell us which equipment you need."
+        )
+        .replace("<w:showingPlcHdr/>", ""),
+    };
+    const rejectedOutputs = {
+      "bogus document output": {
+        ...template,
+        source: "open('output.docx', 'wb').write(b'not a DOCX')",
+      },
+      "field revision with stale declaration": {
+        ...fieldRevision,
+        removedFieldTags: ["unknown_field"],
+      },
+      "field revision without declaration": fieldRevision,
+      "mismatched control output": {
+        ...template,
+        source: benignSource.replace("employee_name", "undeclared_name"),
+      },
+      "paragraph revision with stale declaration": {
+        ...paragraphRevision,
+        editedParagraphs: ["This paragraph is not in the current document."],
+      },
+      "paragraph revision without declaration": paragraphRevision,
+      "source-only description change": {
+        ...template,
+        source: benignSource.replace(
+          "escape(description)",
+          "escape('Incorrect description')"
+        ),
+      },
+      "source-only field label change": {
+        ...template,
+        source: benignSource.replace(
+          'w:alias w:val="Employee Name"',
+          'w:alias w:val="Incorrect label"'
+        ),
+      },
+      "source-only field placeholder change": {
+        ...template,
+        source: benignSource.replace(
+          "Enter employee name",
+          "Incorrect placeholder"
+        ),
+      },
+      "source-only paragraph change": {
+        ...template,
+        source: benignSource.replace(
+          "Complete the equipment request.",
+          "Original instructions were silently replaced."
+        ),
+      },
+      "source-only paragraph removal": {
+        ...template,
+        source: benignSource.replace(
+          "'<w:p><w:r><w:t>Complete the equipment request.</w:t></w:r></w:p>'",
+          "''"
+        ),
+      },
+      "source-only title change": {
+        ...template,
+        source: benignSource.replace(
+          "escape(title)",
+          "escape('Incorrect title')"
+        ),
+      },
+      "unsupported control output": {
+        ...template,
+        source: benignSource.replace("<w:text/>", "<w:comboBox/>"),
+      },
+    };
+    const hostileSources: Record<string, string> = {
+      "contact internet":
+        "import socket; socket.create_connection(('1.1.1.1', 443), timeout=1).close()",
+      "execute shell":
+        "import subprocess; subprocess.run(['/bin/sh', '-c', 'echo breached'], check=True)",
+      "exhaust CPU": "while True: pass",
+      "exhaust memory": "allocation = bytearray(512 * 1024 * 1024)",
+      "read private server file": "open('/app/.env').read()",
+      "write outside workspace":
+        "open('/tmp/folio-worker-escape', 'w').write('breached')",
+    };
+    const upstream = Bun.serve({
+      fetch: async (request) => {
+        const body = (await request.json()) as {
+          messages?: { content?: unknown; role?: string }[];
+          tools?: { function?: { name?: string } }[];
+        };
+        const messages = body.messages ?? [];
+        const latestUserContent = messages
+          .toReversed()
+          .find((message) => message.role === "user")?.content;
+        const promptText = JSON.stringify(latestUserContent ?? "");
+        const attemptedAttack = Object.entries(hostileSources).find(
+          ([prompt]) => promptText.includes(prompt)
+        );
+        const requestedOutput = Object.entries({
+          ...rejectedOutputs,
+          [revisionPrompt]: revisedTemplate,
+        }).find(([prompt]) => promptText.includes(prompt))?.[1];
+        const generated = attemptedAttack
+          ? { ...template, source: `${attemptedAttack[1]}\n${benignSource}` }
+          : (requestedOutput ?? { ...template, source: benignSource });
+        // Pi also sends tool-free requests when compacting the long attack history.
+        const shouldSummarize = messages.at(-1)?.role === "tool" || !body.tools;
+        const chunks = shouldSummarize
+          ? [
+              {
+                delta: { content: "Document prepared.", role: "assistant" },
+                finish_reason: null,
               },
-              finish_reason: null,
-            },
-            { delta: {}, finish_reason: "tool_calls" },
-          ];
-      const stream = chunks
-        .map((chunk) => `data: ${JSON.stringify({
-          choices: [{ index: 0, ...chunk }],
-          created: Math.floor(Date.now() / 1000),
-          id: `chatcmpl-${crypto.randomUUID()}`,
-          model,
-          object: "chat.completion.chunk",
-        })}\n\n`)
-        .join("");
-      return new Response(`${stream}data: [DONE]\n\n`, {
-        headers: { "Content-Type": "text/event-stream" },
+              { delta: {}, finish_reason: "stop" },
+            ]
+          : [
+              {
+                delta: {
+                  role: "assistant",
+                  tool_calls: [
+                    {
+                      function: {
+                        arguments: JSON.stringify(generated),
+                        name: "create_template_docx_python",
+                      },
+                      id: `call-${crypto.randomUUID()}`,
+                      index: 0,
+                      type: "function",
+                    },
+                  ],
+                },
+                finish_reason: null,
+              },
+              { delta: {}, finish_reason: "tool_calls" },
+            ];
+        const stream = chunks
+          .map(
+            (chunk) =>
+              `data: ${JSON.stringify({
+                choices: [{ index: 0, ...chunk }],
+                created: Math.floor(Date.now() / 1000),
+                id: `chatcmpl-${crypto.randomUUID()}`,
+                model,
+                object: "chat.completion.chunk",
+              })}\n\n`
+          )
+          .join("");
+        return new Response(`${stream}data: [DONE]\n\n`, {
+          headers: { "Content-Type": "text/event-stream" },
+        });
+      },
+      hostname: "127.0.0.1",
+      port: 0,
+    });
+    const workerApp = createApp({
+      legacySso: null,
+      omniRoute: {
+        apiKey: serviceKey,
+        baseUrl: `http://127.0.0.1:${upstream.port}/v1`,
+        model,
+      },
+      onlyOffice: {
+        convertDocxToPdf: () => Promise.resolve(new Uint8Array()),
+        forceSave: () => Promise.resolve(false),
+      },
+      prefillReturnUrl: "https://source.example.test/forms/return",
+    });
+    const sessionUrl = "http://test.local/api/admin/ai-authoring/sessions";
+    const currentUrl = `${sessionUrl}/current`;
+    const password = "Ticket20-worker-password";
+    let adminBearer = "";
+    let otherAdminBearer = "";
+    let userBearer = "";
+    let sessionId = "";
+    let otherSessionId = "";
+    let baselinePublicId = "";
+    let generatedPublicId = "";
+    try {
+      const admin = await createCredentialFixture({
+        email: `ticket-20-admin-${crypto.randomUUID()}@example.com`,
+        name: "Ticket 20 Admin",
+        password,
+        role: "admin",
       });
-    },
-  });
-  const workerApp = createApp({
-    legacySso: null,
-    omniRoute: {
-      apiKey: serviceKey,
-      baseUrl: `http://127.0.0.1:${upstream.port}/v1`,
-      model,
-    },
-    onlyOffice: {
-      convertDocxToPdf: () => Promise.resolve(new Uint8Array()),
-      forceSave: () => Promise.resolve(false),
-    },
-    prefillReturnUrl: "https://source.example.test/forms/return",
-  });
-  const sessionUrl = "http://test.local/api/admin/ai-authoring/sessions";
-  const currentUrl = `${sessionUrl}/current`;
-  const password = "Ticket20-worker-password";
-  let adminBearer = "";
-  let otherAdminBearer = "";
-  let userBearer = "";
-  let sessionId = "";
-  let otherSessionId = "";
-  let baselinePublicId = "";
-  let generatedPublicId = "";
-  try {
-    const admin = await createCredentialFixture({
-      email: `ticket-20-admin-${crypto.randomUUID()}@example.com`,
-      name: "Ticket 20 Admin",
-      password,
-      role: "admin",
-    });
-    const otherAdmin = await createCredentialFixture({
-      email: `ticket-20-other-${crypto.randomUUID()}@example.com`,
-      name: "Ticket 20 Other Admin",
-      password,
-      role: "admin",
-    });
-    const user = await createCredentialFixture({
-      email: `ticket-20-user-${crypto.randomUUID()}@example.com`,
-      name: "Ticket 20 User",
-      password,
-    });
-    adminBearer = await bearerFor(admin.email, password);
-    otherAdminBearer = await bearerFor(otherAdmin.email, password);
-    userBearer = await bearerFor(user.email, password);
-    const templateDocument = async (
-      bearer: string,
-      publicId: string
-    ): Promise<Uint8Array> => {
-      const editorResponse = await workerApp.handle(new Request(
-        `http://test.local/api/admin/forms/${publicId}/editor-config`,
-        { headers: { Authorization: `Bearer ${bearer}` } }
-      ));
-      expect(editorResponse.status).toBe(200);
-      const editor = (await editorResponse.json()) as EditorConfigBody;
-      const url = editor.config.document.url;
-      const response = await workerApp.handle(new Request(url, {
-        headers: { Authorization: createOnlyOfficeAuthorization({ url }) },
-      }));
-      expect(response.status).toBe(200);
-      return new Uint8Array(await response.arrayBuffer());
-    };
-    const existingDocument = docxFixture(`untouched-${crypto.randomUUID()}`);
-    const baselineResponse = await workerApp.handle(formCreationRequest({
-      authorization: otherAdminBearer,
-      source: "upload",
-      template: { bytes: existingDocument, name: "existing.docx" },
-      title: "Existing Form",
-    }));
-    expect(baselineResponse.status).toBe(200);
-    const baseline = (await baselineResponse.json()) as { form: { publicId: string } };
-    baselinePublicId = baseline.form.publicId;
-
-    const create = (bearer: string) => workerApp.handle(new Request(sessionUrl, {
-      body: JSON.stringify({ consent: true, prompt: "Create Python equipment request" }),
-      headers: { ...jsonHeaders, Authorization: `Bearer ${bearer}` },
-      method: "POST",
-    }));
-    const createdResponse = await create(adminBearer);
-    expect(createdResponse.status).toBe(200);
-    const { session } = (await createdResponse.json()) as {
-      session: {
-        description: string;
-        downloadUrl: string;
-        fields: typeof template.fields;
-        sessionId: string;
-        title: string;
+      const otherAdmin = await createCredentialFixture({
+        email: `ticket-20-other-${crypto.randomUUID()}@example.com`,
+        name: "Ticket 20 Other Admin",
+        password,
+        role: "admin",
+      });
+      const user = await createCredentialFixture({
+        email: `ticket-20-user-${crypto.randomUUID()}@example.com`,
+        name: "Ticket 20 User",
+        password,
+      });
+      adminBearer = await bearerFor(admin.email, password);
+      otherAdminBearer = await bearerFor(otherAdmin.email, password);
+      userBearer = await bearerFor(user.email, password);
+      const templateDocument = async (
+        bearer: string,
+        publicId: string
+      ): Promise<Uint8Array> => {
+        const editorResponse = await workerApp.handle(
+          new Request(
+            `http://test.local/api/admin/forms/${publicId}/editor-config`,
+            { headers: { Authorization: `Bearer ${bearer}` } }
+          )
+        );
+        expect(editorResponse.status).toBe(200);
+        const editor = (await editorResponse.json()) as EditorConfigBody;
+        const { url } = editor.config.document;
+        const response = await workerApp.handle(
+          new Request(url, {
+            headers: { Authorization: createOnlyOfficeAuthorization({ url }) },
+          })
+        );
+        expect(response.status).toBe(200);
+        return new Uint8Array(await response.arrayBuffer());
       };
-    };
-    sessionId = session.sessionId;
-    expect(session.title).toBe(template.title);
-    expect(session.description).toBe(template.description);
-    expect(session.fields).toEqual(template.fields);
-    const download = (bearer: string, url: string) =>
-      workerApp.handle(new Request(`http://test.local${url}`, {
-        headers: { Authorization: `Bearer ${bearer}` },
-      }));
-    const documentResponse = await download(adminBearer, session.downloadUrl);
-    expect(documentResponse.status).toBe(200);
-    const generatedDocument = new Uint8Array(await documentResponse.arrayBuffer());
-    const documentPart = unzipSync(generatedDocument)["word/document.xml"];
-    if (!documentPart) {
-      throw new Error("Python output has no document part");
-    }
-    const xml = new TextDecoder().decode(documentPart);
-    expect(xml).toContain(marker);
-    expect(xml).toContain("Complete the equipment request.");
-    expect(xml).toContain('<w:tag w:val="employee_name"/>');
-
-    const otherResponse = await create(otherAdminBearer);
-    expect(otherResponse.status).toBe(200);
-    const { session: otherSession } = (await otherResponse.json()) as {
-      session: { downloadUrl: string; sessionId: string };
-    };
-    otherSessionId = otherSession.sessionId;
-    const otherDownload = await download(otherAdminBearer, otherSession.downloadUrl);
-    expect(otherDownload.status).toBe(200);
-    const otherDocument = new Uint8Array(await otherDownload.arrayBuffer());
-
-    for (const prompt of [
-      ...Object.keys(rejectedOutputs),
-      ...Object.keys(hostileSources),
-    ]) {
-      const rejected = await workerApp.handle(new Request(`${sessionUrl}/${sessionId}/revisions`, {
-        body: JSON.stringify({ consent: true, prompt }),
-        headers: { ...jsonHeaders, Authorization: `Bearer ${adminBearer}` },
-        method: "POST",
-      }));
-      expect(rejected.status).toBe(502);
-      expect(await (await workerApp.handle(new Request(currentUrl, {
-        headers: { Authorization: `Bearer ${adminBearer}` },
-      }))).json()).toEqual({ session });
-      const retained = await download(adminBearer, session.downloadUrl);
-      expect(retained.status).toBe(200);
-      expect(new Uint8Array(await retained.arrayBuffer())).toEqual(generatedDocument);
-      const otherRetained = await download(otherAdminBearer, otherSession.downloadUrl);
-      expect(otherRetained.status).toBe(200);
-      expect(new Uint8Array(await otherRetained.arrayBuffer())).toEqual(otherDocument);
-      expect((await workerApp.handle(new Request("http://test.local/api/session", {
-        headers: { Authorization: `Bearer ${userBearer}` },
-      }))).status).toBe(200);
-      const baselineStillExists = await workerApp.handle(new Request(
-        `http://test.local/api/admin/forms/${baselinePublicId}`,
-        { headers: { Authorization: `Bearer ${otherAdminBearer}` } }
-      ));
-      expect(baselineStillExists.status).toBe(200);
-      expect((await baselineStillExists.json()) as { form: { title: string } }).toMatchObject({
-        form: { title: "Existing Form" },
-      });
-      expect(await templateDocument(otherAdminBearer, baselinePublicId)).toEqual(
-        existingDocument
+      const existingDocument = docxFixture(`untouched-${crypto.randomUUID()}`);
+      const baselineResponse = await workerApp.handle(
+        formCreationRequest({
+          authorization: otherAdminBearer,
+          source: "upload",
+          template: { bytes: existingDocument, name: "existing.docx" },
+          title: "Existing Form",
+        })
       );
-    }
+      expect(baselineResponse.status).toBe(200);
+      const baseline = (await baselineResponse.json()) as {
+        form: { publicId: string };
+      };
+      baselinePublicId = baseline.form.publicId;
 
-    const revisedResponse = await workerApp.handle(new Request(
-      `${sessionUrl}/${sessionId}/revisions`,
-      {
-        body: JSON.stringify({ consent: true, prompt: revisionPrompt }),
-        headers: { ...jsonHeaders, Authorization: `Bearer ${adminBearer}` },
-        method: "POST",
+      const create = (bearer: string) =>
+        workerApp.handle(
+          new Request(sessionUrl, {
+            body: JSON.stringify({
+              consent: true,
+              prompt: "Create Python equipment request",
+            }),
+            headers: { ...jsonHeaders, Authorization: `Bearer ${bearer}` },
+            method: "POST",
+          })
+        );
+      const createdResponse = await create(adminBearer);
+      expect(createdResponse.status).toBe(200);
+      const { session } = (await createdResponse.json()) as {
+        session: {
+          description: string;
+          downloadUrl: string;
+          fields: typeof template.fields;
+          sessionId: string;
+          title: string;
+        };
+      };
+      ({ sessionId } = session);
+      expect(session.title).toBe(template.title);
+      expect(session.description).toBe(template.description);
+      expect(session.fields).toEqual(template.fields);
+      const download = (bearer: string, url: string) =>
+        workerApp.handle(
+          new Request(`http://test.local${url}`, {
+            headers: { Authorization: `Bearer ${bearer}` },
+          })
+        );
+      const documentResponse = await download(adminBearer, session.downloadUrl);
+      expect(documentResponse.status).toBe(200);
+      const generatedDocument = new Uint8Array(
+        await documentResponse.arrayBuffer()
+      );
+      const documentPart = unzipSync(generatedDocument)["word/document.xml"];
+      if (!documentPart) {
+        throw new Error("Python output has no document part");
       }
-    ));
-    expect(revisedResponse.status).toBe(200);
-    const { session: revisedSession } = (await revisedResponse.json()) as {
-      session: typeof session;
-    };
-    expect(revisedSession.fields).toEqual(fieldRevision.fields);
-    expect(await (await workerApp.handle(new Request(currentUrl, {
-      headers: { Authorization: `Bearer ${adminBearer}` },
-    }))).json()).toEqual({ session: revisedSession });
-    const revisedDownload = await download(adminBearer, revisedSession.downloadUrl);
-    expect(revisedDownload.status).toBe(200);
-    const revisedDocument = new Uint8Array(await revisedDownload.arrayBuffer());
-    const revisedXml = new TextDecoder().decode(
-      unzipSync(revisedDocument)["word/document.xml"]
-    );
-    expect(revisedXml).toContain(marker);
-    expect(revisedXml).toContain("Welcome! Tell us which equipment you need.");
-    expect(revisedXml).not.toContain("Complete the equipment request.");
-    expect(revisedXml).toContain('<w:tag w:val="requester_name"/>');
-    expect(revisedXml).not.toContain('<w:tag w:val="employee_name"/>');
+      const xml = new TextDecoder().decode(documentPart);
+      expect(xml).toContain(marker);
+      expect(xml).toContain("Complete the equipment request.");
+      expect(xml).toContain('<w:tag w:val="employee_name"/>');
 
-    const uploadResponse = await workerApp.handle(formCreationRequest({
-      authorization: adminBearer,
-      description: revisedSession.description,
-      source: "upload",
-      template: { bytes: revisedDocument, name: "python-equipment.docx" },
-      title: revisedSession.title,
-    }));
-    expect(uploadResponse.status).toBe(200);
-    const { form } = (await uploadResponse.json()) as {
-      form: { hasTemplateDraft: boolean; publicId: string };
-    };
-    generatedPublicId = form.publicId;
-    expect(form.hasTemplateDraft).toBe(true);
-    expect(await templateDocument(adminBearer, generatedPublicId)).toEqual(
-      revisedDocument
-    );
-    expect(await templateDocument(otherAdminBearer, baselinePublicId)).toEqual(
-      existingDocument
-    );
-  } finally {
-    for (const [bearer, id] of [
-      [adminBearer, sessionId],
-      [otherAdminBearer, otherSessionId],
-    ]) {
-      if (bearer && id) {
-        await workerApp.handle(new Request(`${sessionUrl}/${id}`, {
-          headers: { Authorization: `Bearer ${bearer}` },
-          method: "DELETE",
-        })).catch(() => {});
+      const otherResponse = await create(otherAdminBearer);
+      expect(otherResponse.status).toBe(200);
+      const { session: otherSession } = (await otherResponse.json()) as {
+        session: { downloadUrl: string; sessionId: string };
+      };
+      otherSessionId = otherSession.sessionId;
+      const otherDownload = await download(
+        otherAdminBearer,
+        otherSession.downloadUrl
+      );
+      expect(otherDownload.status).toBe(200);
+      const otherDocument = new Uint8Array(await otherDownload.arrayBuffer());
+
+      for (const prompt of [
+        ...Object.keys(rejectedOutputs),
+        ...Object.keys(hostileSources),
+      ]) {
+        const rejected = await workerApp.handle(
+          new Request(`${sessionUrl}/${sessionId}/revisions`, {
+            body: JSON.stringify({ consent: true, prompt }),
+            headers: { ...jsonHeaders, Authorization: `Bearer ${adminBearer}` },
+            method: "POST",
+          })
+        );
+        expect(rejected.status).toBe(502);
+        const currentAfterRejectedRevision = await workerApp.handle(
+          new Request(currentUrl, {
+            headers: { Authorization: `Bearer ${adminBearer}` },
+          })
+        );
+        expect(await currentAfterRejectedRevision.json()).toEqual({ session });
+        const retained = await download(adminBearer, session.downloadUrl);
+        expect(retained.status).toBe(200);
+        expect(new Uint8Array(await retained.arrayBuffer())).toEqual(
+          generatedDocument
+        );
+        const otherRetained = await download(
+          otherAdminBearer,
+          otherSession.downloadUrl
+        );
+        expect(otherRetained.status).toBe(200);
+        expect(new Uint8Array(await otherRetained.arrayBuffer())).toEqual(
+          otherDocument
+        );
+        const userSessionResponse = await workerApp.handle(
+          new Request("http://test.local/api/session", {
+            headers: { Authorization: `Bearer ${userBearer}` },
+          })
+        );
+        expect(userSessionResponse.status).toBe(200);
+        const baselineStillExists = await workerApp.handle(
+          new Request(`http://test.local/api/admin/forms/${baselinePublicId}`, {
+            headers: { Authorization: `Bearer ${otherAdminBearer}` },
+          })
+        );
+        expect(baselineStillExists.status).toBe(200);
+        expect(
+          (await baselineStillExists.json()) as { form: { title: string } }
+        ).toMatchObject({
+          form: { title: "Existing Form" },
+        });
+        expect(
+          await templateDocument(otherAdminBearer, baselinePublicId)
+        ).toEqual(existingDocument);
       }
-    }
-    for (const [bearer, publicId] of [
-      [adminBearer, generatedPublicId],
-      [otherAdminBearer, baselinePublicId],
-    ]) {
-      if (bearer && publicId) {
-        await workerApp.handle(new Request(`http://test.local/api/admin/forms/${publicId}`, {
-          headers: { Authorization: `Bearer ${bearer}` },
-          method: "DELETE",
-        })).catch(() => {});
-      }
-    }
-    for (const bearer of [adminBearer, otherAdminBearer, userBearer]) {
-      if (bearer) {
-        await workerApp.handle(new Request("http://test.local/api/auth/sign-out", {
-          headers: { Authorization: `Bearer ${bearer}` },
+
+      const revisedResponse = await workerApp.handle(
+        new Request(`${sessionUrl}/${sessionId}/revisions`, {
+          body: JSON.stringify({ consent: true, prompt: revisionPrompt }),
+          headers: { ...jsonHeaders, Authorization: `Bearer ${adminBearer}` },
           method: "POST",
-        })).catch(() => {});
+        })
+      );
+      expect(revisedResponse.status).toBe(200);
+      const { session: revisedSession } = (await revisedResponse.json()) as {
+        session: typeof session;
+      };
+      expect(revisedSession.fields).toEqual(fieldRevision.fields);
+      const currentAfterRevision = await workerApp.handle(
+        new Request(currentUrl, {
+          headers: { Authorization: `Bearer ${adminBearer}` },
+        })
+      );
+      expect(await currentAfterRevision.json()).toEqual({
+        session: revisedSession,
+      });
+      const revisedDownload = await download(
+        adminBearer,
+        revisedSession.downloadUrl
+      );
+      expect(revisedDownload.status).toBe(200);
+      const revisedDocument = new Uint8Array(
+        await revisedDownload.arrayBuffer()
+      );
+      const revisedXml = new TextDecoder().decode(
+        unzipSync(revisedDocument)["word/document.xml"]
+      );
+      expect(revisedXml).toContain(marker);
+      expect(revisedXml).toContain(
+        "Welcome! Tell us which equipment you need."
+      );
+      expect(revisedXml).not.toContain("Complete the equipment request.");
+      expect(revisedXml).toContain('<w:tag w:val="requester_name"/>');
+      expect(revisedXml).not.toContain('<w:tag w:val="employee_name"/>');
+
+      const uploadResponse = await workerApp.handle(
+        formCreationRequest({
+          authorization: adminBearer,
+          description: revisedSession.description,
+          source: "upload",
+          template: { bytes: revisedDocument, name: "python-equipment.docx" },
+          title: revisedSession.title,
+        })
+      );
+      expect(uploadResponse.status).toBe(200);
+      const { form } = (await uploadResponse.json()) as {
+        form: { hasTemplateDraft: boolean; publicId: string };
+      };
+      generatedPublicId = form.publicId;
+      expect(form.hasTemplateDraft).toBe(true);
+      expect(await templateDocument(adminBearer, generatedPublicId)).toEqual(
+        revisedDocument
+      );
+      expect(
+        await templateDocument(otherAdminBearer, baselinePublicId)
+      ).toEqual(existingDocument);
+    } finally {
+      for (const [bearer, id] of [
+        [adminBearer, sessionId],
+        [otherAdminBearer, otherSessionId],
+      ]) {
+        if (bearer && id) {
+          await workerApp
+            .handle(
+              new Request(`${sessionUrl}/${id}`, {
+                headers: { Authorization: `Bearer ${bearer}` },
+                method: "DELETE",
+              })
+            )
+            .catch(() => {});
+        }
       }
+      for (const [bearer, publicId] of [
+        [adminBearer, generatedPublicId],
+        [otherAdminBearer, baselinePublicId],
+      ]) {
+        if (bearer && publicId) {
+          await workerApp
+            .handle(
+              new Request(`http://test.local/api/admin/forms/${publicId}`, {
+                headers: { Authorization: `Bearer ${bearer}` },
+                method: "DELETE",
+              })
+            )
+            .catch(() => {});
+        }
+      }
+      for (const bearer of [adminBearer, otherAdminBearer, userBearer]) {
+        if (bearer) {
+          await workerApp
+            .handle(
+              new Request("http://test.local/api/auth/sign-out", {
+                headers: { Authorization: `Bearer ${bearer}` },
+                method: "POST",
+              })
+            )
+            .catch(() => {});
+        }
+      }
+      upstream.stop(true);
     }
-    upstream.stop(true);
-  }
-});
+  });
 }

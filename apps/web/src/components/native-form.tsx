@@ -271,22 +271,11 @@ const NativeFieldControl = ({
   }
 };
 
-interface NativeFieldProps extends Omit<
-  NativeFieldControlProps,
-  "describedBy"
-> {
-  label: string;
-  placeholder: string | null;
-  pictureMaxBytes: number | null;
-  pictureMaxHeight: number | null;
-  pictureMaxWidth: number | null;
-  required: boolean;
-}
+type NativeFieldProps = Omit<NativeFieldControlProps, "describedBy">;
 
 const NativeField = ({
   field,
   fieldId,
-  label,
   locked,
   onChange,
   onPictureChange,
@@ -294,13 +283,16 @@ const NativeField = ({
   pictureFiles,
   pictureInputKey,
   pictures,
-  placeholder,
-  pictureMaxBytes,
-  pictureMaxHeight,
-  pictureMaxWidth,
-  required,
   value,
 }: NativeFieldProps) => {
+  const {
+    label,
+    placeholder,
+    pictureMaxBytes,
+    pictureMaxHeight,
+    pictureMaxWidth,
+    required,
+  } = field;
   const helpId = `${fieldId}-help`;
   const pictureHelpId = `${fieldId}-picture-help`;
   const helpText = [
@@ -315,6 +307,32 @@ const NativeField = ({
   } else if (helpText) {
     inputDescription = helpId;
   }
+  const control = (
+    <NativeFieldControl
+      describedBy={inputDescription}
+      field={field}
+      fieldId={fieldId}
+      locked={locked}
+      onChange={onChange}
+      onPictureChange={onPictureChange}
+      operationBusy={operationBusy}
+      pictureFiles={pictureFiles}
+      pictureInputKey={pictureInputKey}
+      pictures={pictures}
+      value={value}
+    />
+  );
+  const labelContent = (
+    <>
+      {label}
+      {required ? (
+        <span aria-hidden="true" className="text-[var(--danger)]">
+          {" "}
+          *
+        </span>
+      ) : null}
+    </>
+  );
   return (
     <div className="space-y-2">
       {field.type === "checkbox" ? (
@@ -322,26 +340,8 @@ const NativeField = ({
           className="flex items-center gap-2 text-sm font-semibold text-[var(--ink)]"
           htmlFor={fieldId}
         >
-          <NativeFieldControl
-            describedBy={inputDescription}
-            field={field}
-            fieldId={fieldId}
-            locked={locked}
-            onChange={onChange}
-            onPictureChange={onPictureChange}
-            operationBusy={operationBusy}
-            pictureFiles={pictureFiles}
-            pictureInputKey={pictureInputKey}
-            pictures={pictures}
-            value={value}
-          />
-          {label}
-          {required ? (
-            <span aria-hidden="true" className="text-[var(--danger)]">
-              {" "}
-              *
-            </span>
-          ) : null}
+          {control}
+          {labelContent}
         </label>
       ) : (
         <>
@@ -349,27 +349,9 @@ const NativeField = ({
             className="block text-sm font-semibold text-[var(--ink)]"
             htmlFor={fieldId}
           >
-            {label}
-            {required ? (
-              <span aria-hidden="true" className="text-[var(--danger)]">
-                {" "}
-                *
-              </span>
-            ) : null}
+            {labelContent}
           </label>
-          <NativeFieldControl
-            describedBy={inputDescription}
-            field={field}
-            fieldId={fieldId}
-            locked={locked}
-            onChange={onChange}
-            onPictureChange={onPictureChange}
-            operationBusy={operationBusy}
-            pictureFiles={pictureFiles}
-            pictureInputKey={pictureInputKey}
-            pictures={pictures}
-            value={value}
-          />
+          {control}
         </>
       )}
       {field.type === "picture" ? (
@@ -426,19 +408,13 @@ export const NativeForm = ({
             field={field}
             fieldId={`native-field-${field.position}`}
             key={field.tag}
-            label={field.label}
             locked={lockedFields[field.tag] === true}
             onChange={onChange}
             onPictureChange={onPictureChange}
             operationBusy={operationBusy}
             pictureFiles={pictureFiles}
             pictureInputKey={pictureInputKey}
-            pictureMaxBytes={field.pictureMaxBytes}
-            pictureMaxHeight={field.pictureMaxHeight}
-            pictureMaxWidth={field.pictureMaxWidth}
             pictures={pictures}
-            placeholder={field.placeholder}
-            required={field.required}
             value={values[field.tag]}
           />
         ))}

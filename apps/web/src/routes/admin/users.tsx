@@ -19,7 +19,7 @@ import {
   UsersRound,
   X,
 } from "lucide-react";
-import type { FormEvent } from "react";
+import type { FormEvent, RefObject } from "react";
 import { useEffect, useRef, useState } from "react";
 
 import { PageHeader } from "@/components/app-shell";
@@ -199,6 +199,271 @@ const actionFailureMessage = (kind: ActionKind) => {
   }
   return "ไม่สามารถตั้งรหัสผ่านใหม่ได้ กรุณาลองใหม่อีกครั้ง";
 };
+
+const TemporaryPasswordNotice = ({
+  copyTemporaryPassword,
+  temporaryPassword,
+  temporaryPasswordCopyFeedback,
+  temporaryPasswordRef,
+}: {
+  copyTemporaryPassword: () => Promise<void>;
+  temporaryPassword: string | null;
+  temporaryPasswordCopyFeedback: {
+    tone: "danger" | "success";
+    message: string;
+  } | null;
+  temporaryPasswordRef: RefObject<HTMLDivElement | null>;
+}) => {
+  if (!temporaryPassword) {
+    return null;
+  }
+  return (
+    <>
+      <div
+        ref={temporaryPasswordRef}
+        tabIndex={-1}
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+        className="mt-4 rounded-[10px] border border-[var(--success)]/25 bg-[var(--success-soft)] px-4 py-3 text-sm text-[var(--success)] focus:outline-none"
+      >
+        <strong className="block">รหัสผ่านชั่วคราว (แสดงครั้งเดียว)</strong>
+        <code className="mt-2 block break-all rounded-md bg-[var(--paper)] px-3 py-2 text-base font-semibold text-[var(--ink)]">
+          {temporaryPassword}
+        </code>
+        <span className="mt-2 block text-xs">
+          จดหรือส่งรหัสนี้ให้เจ้าของบัญชีอย่างปลอดภัย
+          ระบบจะไม่แสดงรหัสนี้อีกหลังจากการดำเนินการครั้งถัดไป
+        </span>
+        <Button
+          className="mt-3"
+          onClick={copyTemporaryPassword}
+          size="sm"
+          type="button"
+          variant="secondary"
+        >
+          <Copy aria-hidden="true" size={15} />
+          คัดลอกรหัสผ่านชั่วคราว
+        </Button>
+      </div>
+      <p
+        aria-atomic="true"
+        aria-live="polite"
+        className={
+          temporaryPasswordCopyFeedback
+            ? `mt-2 text-sm font-medium ${
+                temporaryPasswordCopyFeedback.tone === "danger"
+                  ? "text-[var(--danger)]"
+                  : "text-[var(--success)]"
+              }`
+            : "sr-only"
+        }
+        role="status"
+      >
+        {temporaryPasswordCopyFeedback?.message ?? ""}
+      </p>
+    </>
+  );
+};
+
+const LegacyAccountLinks = ({
+  requests,
+  nextCursor,
+  loading,
+  error,
+  feedback,
+  pendingAction,
+  headingRef,
+  reload,
+  review,
+  loadMore,
+}: {
+  requests: AdminLegacyAccountLinkRequest[];
+  nextCursor: string | null;
+  loading: boolean;
+  error: string | null;
+  feedback: string | null;
+  pendingAction: string | null;
+  headingRef: RefObject<HTMLHeadingElement | null>;
+  reload: () => void;
+  review: (
+    request: AdminLegacyAccountLinkRequest,
+    decision: "approve" | "reject"
+  ) => Promise<void>;
+  loadMore: () => Promise<void>;
+}) => (
+  <Card className="mt-6 overflow-hidden" aria-busy={loading}>
+    <div className="border-b border-[var(--line)] px-5 py-4 sm:px-6">
+      <div className="flex items-start gap-3">
+        <span className="grid size-10 shrink-0 place-items-center rounded-[10px] bg-[var(--accent-soft)]">
+          <ShieldCheck size={19} />
+        </span>
+        <div>
+          <h2
+            ref={headingRef}
+            tabIndex={-1}
+            className="text-xl font-bold tracking-[-0.03em]"
+          >
+            คำขอเชื่อมบัญชี Legacy
+          </h2>
+          <p className="mt-1 text-sm text-[var(--ink-soft)]">
+            ตรวจข้อมูลตัวตนจาก PDMS และบัญชี Folio Forms ก่อนอนุมัติ PDMS
+            ไม่ได้ยืนยันความเป็นเจ้าของกล่องอีเมล ผู้ใช้ต้องเริ่มเข้าสู่ระบบผ่านระบบเดิมใหม่หลังอนุมัติ
+          </p>
+        </div>
+      </div>
+    </div>
+    {feedback ? (
+      <div className="px-5 pt-4 sm:px-6">
+        <Notice tone="success">{feedback}</Notice>
+      </div>
+    ) : null}
+    {error ? (
+      <div className="px-5 pt-4 sm:px-6">
+        <Notice tone="danger">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <span>{error}</span>
+            <Button
+              type="button"
+              variant="secondary"
+              size="sm"
+              onClick={reload}
+              disabled={loading}
+            >
+              ลองใหม่
+            </Button>
+          </div>
+        </Notice>
+      </div>
+    ) : null}
+    {loading && requests.length === 0 ? (
+      <div className="grid min-h-32 place-items-center gap-3 p-6 text-sm text-[var(--ink-soft)]">
+        <Spinner />
+        <span>กำลังโหลดคำขอ…</span>
+      </div>
+    ) : null}
+    {!loading && requests.length === 0 && error === null ? (
+      <p className="p-6 text-center text-sm text-[var(--ink-soft)]">
+        ไม่มีคำขอที่รออนุมัติ
+      </p>
+    ) : null}
+    {requests.length > 0 ? (
+      <ul className="divide-y divide-[var(--line)]">
+        {requests.map((request) => {
+          let ineligibleReason: string | null = null;
+          if (!request.user.enabled) {
+            ineligibleReason = "บัญชี Folio Forms ปิดใช้งานอยู่";
+          } else if (request.user.role !== "user") {
+            ineligibleReason = "ไม่สามารถเชื่อมบัญชีกับบัญชีผู้ดูแลระบบ";
+          } else if (request.user.email !== request.email) {
+            ineligibleReason = "อีเมลบัญชี Folio Forms เปลี่ยนไปแล้ว";
+          }
+          const actionIsPending =
+            pendingAction?.startsWith(`${request.id}:`) === true;
+          const actionDisabled = loading || pendingAction !== null;
+          return (
+            <li key={request.id} className="space-y-4 p-5 sm:px-6">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <h3 className="font-semibold text-[var(--ink)]">
+                    {request.user.name}
+                  </h3>
+                  <p className="break-all text-sm text-[var(--ink-soft)]">
+                    {request.user.email}
+                  </p>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <Badge tone={roleBadgeTones[request.user.role]}>
+                    {roleBadgeLabels[request.user.role]}
+                  </Badge>
+                  <Badge tone={request.user.enabled ? "neutral" : "warning"}>
+                    {request.user.enabled ? "เปิดใช้งาน" : "ปิดใช้งาน"}
+                  </Badge>
+                </div>
+              </div>
+              <dl className="grid gap-3 text-sm sm:grid-cols-2">
+                <div>
+                  <dt className="text-xs text-[var(--ink-soft)]">
+                    อีเมลบัญชีจาก PDMS
+                  </dt>
+                  <dd className="break-all font-medium">{request.email}</dd>
+                </div>
+                <div>
+                  <dt className="text-xs text-[var(--ink-soft)]">วันที่ส่งคำขอ</dt>
+                  <dd>{formatDate(request.createdAt)}</dd>
+                </div>
+                <div>
+                  <dt className="text-xs text-[var(--ink-soft)]">Provider</dt>
+                  <dd className="break-all">{request.providerId}</dd>
+                </div>
+                <div>
+                  <dt className="text-xs text-[var(--ink-soft)]">Subject</dt>
+                  <dd className="break-all">{request.subject}</dd>
+                </div>
+              </dl>
+              {ineligibleReason ? (
+                <p className="text-sm text-[var(--danger)]">
+                  {ineligibleReason}
+                </p>
+              ) : null}
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  type="button"
+                  size="sm"
+                  onClick={async () => {
+                    await review(request, "approve");
+                  }}
+                  disabled={Boolean(ineligibleReason) || actionDisabled}
+                  aria-label={`อนุมัติการเชื่อมบัญชี ${request.email} กับ ${request.user.email}`}
+                >
+                  {actionIsPending &&
+                  pendingAction === `${request.id}:approve` ? (
+                    <Spinner />
+                  ) : (
+                    <ShieldCheck size={15} />
+                  )}
+                  อนุมัติ
+                </Button>
+                <Button
+                  type="button"
+                  variant="danger"
+                  size="sm"
+                  onClick={async () => {
+                    await review(request, "reject");
+                  }}
+                  disabled={actionDisabled}
+                  aria-label={`ปฏิเสธคำขอเชื่อมบัญชี ${request.email}`}
+                >
+                  {actionIsPending &&
+                  pendingAction === `${request.id}:reject` ? (
+                    <Spinner />
+                  ) : (
+                    <X size={15} />
+                  )}
+                  ปฏิเสธ
+                </Button>
+              </div>
+            </li>
+          );
+        })}
+      </ul>
+    ) : null}
+    {nextCursor ? (
+      <div className="flex justify-center border-t border-[var(--line)] p-4">
+        <Button
+          type="button"
+          variant="secondary"
+          size="sm"
+          onClick={loadMore}
+          disabled={loading || pendingAction !== null}
+        >
+          {loading ? <Spinner /> : <ChevronRight size={15} />}
+          โหลดคำขอเพิ่มเติม
+        </Button>
+      </div>
+    ) : null}
+  </Card>
+);
 
 const AdminUsersRoute = () => {
   const navigate = useNavigate();
@@ -392,10 +657,9 @@ const AdminUsersRoute = () => {
       setLegacyAccountLinkLoading(true);
       setLegacyAccountLinkError(null);
       try {
-        const payload =
-          await apiGet<AdminLegacyAccountLinkListResponse>(
-            "/api/admin/account-links"
-          );
+        const payload = await apiGet<AdminLegacyAccountLinkListResponse>(
+          "/api/admin/account-links"
+        );
         if (cancelled) {
           return;
         }
@@ -733,10 +997,7 @@ const AdminUsersRoute = () => {
       setLegacyAccountLinkNextCursor(payload.nextCursor);
     } catch (caughtError) {
       setLegacyAccountLinkError(
-        errorMessageFor(
-          caughtError,
-          "ไม่สามารถโหลดคำขอเพิ่มเติมได้ กรุณาลองใหม่อีกครั้ง"
-        )
+        errorMessageFor(caughtError, "ไม่สามารถโหลดคำขอเพิ่มเติมได้ กรุณาลองใหม่อีกครั้ง")
       );
     } finally {
       setLegacyAccountLinkLoading(false);
@@ -753,7 +1014,8 @@ const AdminUsersRoute = () => {
     setLegacyAccountLinkFeedback(null);
     try {
       await apiPost<AdminLegacyAccountLinkMutationResponse>(
-        `/api/admin/account-links/${encodeURIComponent(request.id)}/${decision}`
+        `/api/admin/account-links/${encodeURIComponent(request.id)}/${decision}`,
+        { reviewedGeneration: request.reviewedGeneration }
       );
       setLegacyAccountLinkRequests((current) =>
         current.filter((currentRequest) => currentRequest.id !== request.id)
@@ -767,6 +1029,10 @@ const AdminUsersRoute = () => {
         legacyAccountLinksHeadingRef.current?.focus();
       });
     } catch (caughtError) {
+      if (caughtError instanceof ApiError && caughtError.status === 409) {
+        setLegacyAccountLinkLoading(true);
+        setReloadVersion((value) => value + 1);
+      }
       setLegacyAccountLinkError(
         errorMessageFor(
           caughtError,
@@ -789,53 +1055,12 @@ const AdminUsersRoute = () => {
         <Notice tone={feedback.tone}>{feedback.message}</Notice>
       ) : null}
 
-      {temporaryPassword ? (
-        <>
-          <div
-            ref={temporaryPasswordRef}
-            tabIndex={-1}
-            role="status"
-            aria-live="polite"
-            aria-atomic="true"
-            className="mt-4 rounded-[10px] border border-[var(--success)]/25 bg-[var(--success-soft)] px-4 py-3 text-sm text-[var(--success)] focus:outline-none"
-          >
-            <strong className="block">รหัสผ่านชั่วคราว (แสดงครั้งเดียว)</strong>
-            <code className="mt-2 block break-all rounded-md bg-[var(--paper)] px-3 py-2 text-base font-semibold text-[var(--ink)]">
-              {temporaryPassword}
-            </code>
-            <span className="mt-2 block text-xs">
-              จดหรือส่งรหัสนี้ให้เจ้าของบัญชีอย่างปลอดภัย
-              ระบบจะไม่แสดงรหัสนี้อีกหลังจากการดำเนินการครั้งถัดไป
-            </span>
-            <Button
-              className="mt-3"
-              onClick={copyTemporaryPassword}
-              size="sm"
-              type="button"
-              variant="secondary"
-            >
-              <Copy aria-hidden="true" size={15} />
-              คัดลอกรหัสผ่านชั่วคราว
-            </Button>
-          </div>
-          <p
-            aria-atomic="true"
-            aria-live="polite"
-            className={
-              temporaryPasswordCopyFeedback
-                ? `mt-2 text-sm font-medium ${
-                    temporaryPasswordCopyFeedback.tone === "danger"
-                      ? "text-[var(--danger)]"
-                      : "text-[var(--success)]"
-                  }`
-                : "sr-only"
-            }
-            role="status"
-          >
-            {temporaryPasswordCopyFeedback?.message ?? ""}
-          </p>
-        </>
-      ) : null}
+      <TemporaryPasswordNotice
+        copyTemporaryPassword={copyTemporaryPassword}
+        temporaryPassword={temporaryPassword}
+        temporaryPasswordCopyFeedback={temporaryPasswordCopyFeedback}
+        temporaryPasswordRef={temporaryPasswordRef}
+      />
 
       <div className="mt-6 grid gap-6 lg:grid-cols-[minmax(0,0.8fr)_minmax(0,1.2fr)]">
         <Card className="p-5 sm:p-6">
@@ -1013,192 +1238,18 @@ const AdminUsersRoute = () => {
         </Card>
       </div>
 
-      <Card
-        className="mt-6 overflow-hidden"
-        aria-busy={legacyAccountLinkLoading}
-      >
-        <div className="border-b border-[var(--line)] px-5 py-4 sm:px-6">
-          <div className="flex items-start gap-3">
-            <span className="grid size-10 shrink-0 place-items-center rounded-[10px] bg-[var(--accent-soft)]">
-              <ShieldCheck size={19} />
-            </span>
-            <div>
-              <h2
-                ref={legacyAccountLinksHeadingRef}
-                tabIndex={-1}
-                className="text-xl font-bold tracking-[-0.03em]"
-              >
-                คำขอเชื่อมบัญชี Legacy
-              </h2>
-              <p className="mt-1 text-sm text-[var(--ink-soft)]">
-                ตรวจอีเมลที่ยืนยันกับบัญชี Folio Forms ก่อนอนุมัติ
-                ผู้ใช้ต้องเริ่มเข้าสู่ระบบผ่านระบบเดิมใหม่หลังอนุมัติ
-              </p>
-            </div>
-          </div>
-        </div>
-        {legacyAccountLinkFeedback ? (
-          <div className="px-5 pt-4 sm:px-6">
-            <Notice tone="success">{legacyAccountLinkFeedback}</Notice>
-          </div>
-        ) : null}
-        {legacyAccountLinkError ? (
-          <div className="px-5 pt-4 sm:px-6">
-            <Notice tone="danger">
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <span>{legacyAccountLinkError}</span>
-                <Button
-                  type="button"
-                  variant="secondary"
-                  size="sm"
-                  onClick={() => setReloadVersion((value) => value + 1)}
-                  disabled={legacyAccountLinkLoading}
-                >
-                  ลองใหม่
-                </Button>
-              </div>
-            </Notice>
-          </div>
-        ) : null}
-        {legacyAccountLinkLoading &&
-        legacyAccountLinkRequests.length === 0 ? (
-          <div className="grid min-h-32 place-items-center gap-3 p-6 text-sm text-[var(--ink-soft)]">
-            <Spinner />
-            <span>กำลังโหลดคำขอ…</span>
-          </div>
-        ) : null}
-        {!legacyAccountLinkLoading &&
-        legacyAccountLinkRequests.length === 0 &&
-        legacyAccountLinkError === null ? (
-          <p className="p-6 text-center text-sm text-[var(--ink-soft)]">
-            ไม่มีคำขอที่รออนุมัติ
-          </p>
-        ) : null}
-        {legacyAccountLinkRequests.length > 0 ? (
-          <ul className="divide-y divide-[var(--line)]">
-            {legacyAccountLinkRequests.map((request) => {
-              let ineligibleReason: string | null = null;
-              if (!request.user.enabled) {
-                ineligibleReason = "บัญชี Folio Forms ปิดใช้งานอยู่";
-              } else if (request.user.role !== "user") {
-                ineligibleReason = "ไม่สามารถเชื่อมบัญชีกับบัญชีผู้ดูแลระบบ";
-              } else if (request.user.email !== request.email) {
-                ineligibleReason = "อีเมลบัญชี Folio Forms เปลี่ยนไปแล้ว";
-              }
-              const actionIsPending =
-                legacyAccountLinkAction?.startsWith(`${request.id}:`) === true;
-              const actionDisabled =
-                legacyAccountLinkLoading || legacyAccountLinkAction !== null;
-              return (
-                <li key={request.id} className="space-y-4 p-5 sm:px-6">
-                  <div className="flex flex-wrap items-start justify-between gap-3">
-                    <div className="min-w-0">
-                      <h3 className="font-semibold text-[var(--ink)]">
-                        {request.user.name}
-                      </h3>
-                      <p className="break-all text-sm text-[var(--ink-soft)]">
-                        {request.user.email}
-                      </p>
-                    </div>
-                    <div className="flex flex-wrap gap-2">
-                      <Badge tone={roleBadgeTones[request.user.role]}>
-                        {roleBadgeLabels[request.user.role]}
-                      </Badge>
-                      <Badge
-                        tone={request.user.enabled ? "neutral" : "warning"}
-                      >
-                        {request.user.enabled ? "เปิดใช้งาน" : "ปิดใช้งาน"}
-                      </Badge>
-                    </div>
-                  </div>
-                  <dl className="grid gap-3 text-sm sm:grid-cols-2">
-                    <div>
-                      <dt className="text-xs text-[var(--ink-soft)]">
-                        อีเมลที่ยืนยันจาก Legacy
-                      </dt>
-                      <dd className="break-all font-medium">{request.email}</dd>
-                    </div>
-                    <div>
-                      <dt className="text-xs text-[var(--ink-soft)]">
-                        วันที่ส่งคำขอ
-                      </dt>
-                      <dd>{formatDate(request.createdAt)}</dd>
-                    </div>
-                    <div>
-                      <dt className="text-xs text-[var(--ink-soft)]">
-                        Provider
-                      </dt>
-                      <dd className="break-all">{request.providerId}</dd>
-                    </div>
-                    <div>
-                      <dt className="text-xs text-[var(--ink-soft)]">
-                        Subject
-                      </dt>
-                      <dd className="break-all">{request.subject}</dd>
-                    </div>
-                  </dl>
-                  {ineligibleReason ? (
-                    <p className="text-sm text-[var(--danger)]">
-                      {ineligibleReason}
-                    </p>
-                  ) : null}
-                  <div className="flex flex-wrap gap-2">
-                    <Button
-                      type="button"
-                      size="sm"
-                      onClick={() =>
-                        void reviewLegacyAccountLink(request, "approve")
-                      }
-                      disabled={Boolean(ineligibleReason) || actionDisabled}
-                      aria-label={`อนุมัติการเชื่อมบัญชี ${request.email} กับ ${request.user.email}`}
-                    >
-                      {actionIsPending &&
-                      legacyAccountLinkAction === `${request.id}:approve` ? (
-                        <Spinner />
-                      ) : (
-                        <ShieldCheck size={15} />
-                      )}
-                      อนุมัติ
-                    </Button>
-                    <Button
-                      type="button"
-                      variant="danger"
-                      size="sm"
-                      onClick={() =>
-                        void reviewLegacyAccountLink(request, "reject")
-                      }
-                      disabled={actionDisabled}
-                      aria-label={`ปฏิเสธคำขอเชื่อมบัญชี ${request.email}`}
-                    >
-                      {actionIsPending &&
-                      legacyAccountLinkAction === `${request.id}:reject` ? (
-                        <Spinner />
-                      ) : (
-                        <X size={15} />
-                      )}
-                      ปฏิเสธ
-                    </Button>
-                  </div>
-                </li>
-              );
-            })}
-          </ul>
-        ) : null}
-        {legacyAccountLinkNextCursor ? (
-          <div className="flex justify-center border-t border-[var(--line)] p-4">
-            <Button
-              type="button"
-              variant="secondary"
-              size="sm"
-              onClick={() => void loadMoreLegacyAccountLinks()}
-              disabled={legacyAccountLinkLoading || legacyAccountLinkAction !== null}
-            >
-              {legacyAccountLinkLoading ? <Spinner /> : <ChevronRight size={15} />}
-              โหลดคำขอเพิ่มเติม
-            </Button>
-          </div>
-        ) : null}
-      </Card>
+      <LegacyAccountLinks
+        requests={legacyAccountLinkRequests}
+        nextCursor={legacyAccountLinkNextCursor}
+        loading={legacyAccountLinkLoading}
+        error={legacyAccountLinkError}
+        feedback={legacyAccountLinkFeedback}
+        pendingAction={legacyAccountLinkAction}
+        headingRef={legacyAccountLinksHeadingRef}
+        reload={() => setReloadVersion((value) => value + 1)}
+        review={reviewLegacyAccountLink}
+        loadMore={loadMoreLegacyAccountLinks}
+      />
 
       <Card className="mt-6 overflow-hidden" aria-busy={listLoading}>
         <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[var(--line)] px-5 py-4 sm:px-6">

@@ -102,4 +102,20 @@ user ไม่รู้เรื่อง อยากให้แสดงเ�
 หน้า admin result เองก็ไม่อยากให้ใช้ json เหมือนกัน
 <http://localhost:8080/admin/results/c33a0068-17b7-41c4-b851-14346e8b548e>
 
-ตรงนี้ลองเสนอ idea มาหน่อย ด้วยการวาด ascii ui ง่ายๆมานะ
+อยากได้แบบหลาย tab
+
+1. view เหมือนตอนที่กรอก docx in onlyoffice แต่ว่า view-only นะ
+2. table view คือเอา fiels ต่างๆมาเรียงเป็นตาราง
+
+# AI Agent
+
+ฉันอยากให้ใส่ AI Agent embedded เข้ามาในระบบ มีช่อง chat มี upload pdf file                                                                                                           │
+AI Agent ฉันคิดว่าน่าจะลองใช้ Pi ดูก่อน แล้วต่อกับ OpenAI subscription หรือ token ต่างๆ ตามที่ Pi ทําได้เลย อยากใส่ python เพื่อให้ AI Agent เอาไปใช้งานได้ด้วย แต่ยังไม่รู้ว่าจะทําอย่างไร
+ถ้าไม่มี login ก็ไม่เปิดให้ใช้ AI                                                                                                                                                     ส่ิงที่ AI Agent จะช่วยก็คือสร้าง form จาก pdf ที่ upload หรือ description ใน chat แล้วสร้างเป็น form ออกมา ฉันคิดว่า Pi น่าจะต้องใช้ python นะแต่ไม่แน่ใจ                                            ใน chat ผู้ใช้งานสามารถ chat กับ Pi เพื่อขอให้สร้าง form และแก้ไขได้เรื่อยๆ ถ้ามี preview pane ได้ด้วยก็จะดีมาก สุดท้ายน่าจะได้ docx มาใช่มะ แล้วให้ user download docx เพื่อเอาไป upload เพื่อสร้าง form
+docx ที่ได้จะต้องใส่ static text กับ content-control เพื่อทําเป็น form อะนะ                                                                                                              │
+
+# Another way to filling form
+
+ตอนนี้มีแค่กรอก form ผ่าน onlyoffice ใช่มะ
+ฉันอยากได้หน้าที่กรอก form ต่างๆ เป็น form ปกติ เหมือน google form อะ
+แต่เอา fields ต่างๆมาจาก form template ที่สร้างไว้

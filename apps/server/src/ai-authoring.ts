@@ -641,9 +641,7 @@ export class AiAuthoringSessions {
   }
 
   releaseRequest(reservation: AuthoringRequestReservation): void {
-    const pending = [
-      ...(this.pendingGenerations.get(reservation.ownerSessionId) ?? []),
-    ].find((generation) => generation.reservation === reservation);
+    const pending = this.findPending(reservation.ownerSessionId, reservation);
     if (pending) {
       this.finishPending(reservation.ownerSessionId, pending);
     }
@@ -1080,13 +1078,27 @@ export class AiAuthoringSessions {
     return findings.trim();
   }
 
+  private findPending(
+    ownerSessionId: string,
+    reservation: AuthoringRequestReservation
+  ): PendingGeneration | undefined {
+    const ownerPending = this.pendingGenerations.get(ownerSessionId);
+    if (!ownerPending) {
+      return undefined;
+    }
+    for (const generation of ownerPending) {
+      if (generation.reservation === reservation) {
+        return generation;
+      }
+    }
+    return undefined;
+  }
+
   private pendingFor(
     ownerSessionId: string,
     reservation: AuthoringRequestReservation
   ): PendingGeneration {
-    const pending = [
-      ...(this.pendingGenerations.get(ownerSessionId) ?? []),
-    ].find((generation) => generation.reservation === reservation);
+    const pending = this.findPending(ownerSessionId, reservation);
     if (
       !pending ||
       reservation.ownerSessionId !== ownerSessionId ||
@@ -1102,15 +1114,18 @@ export class AiAuthoringSessions {
     return pending;
   }
 
+  private hasExpired(session: AuthoringSession): boolean {
+    return (
+      this.now().getTime() - session.lastActivity.getTime() >= sessionLifetimeMs
+    );
+  }
+
   private async ensureNoActiveSession(ownerSessionId: string): Promise<void> {
     for await (const [sessionId, session] of this.sessions) {
       if (session.ownerSessionId !== ownerSessionId) {
         continue;
       }
-      if (
-        this.now().getTime() - session.lastActivity.getTime() >=
-        sessionLifetimeMs
-      ) {
+      if (this.hasExpired(session)) {
         await this.dispose(sessionId, session);
         continue;
       }
@@ -1131,8 +1146,7 @@ export class AiAuthoringSessions {
     if (
       pending.cancelled ||
       this.sessions.get(sessionId) !== session ||
-      this.now().getTime() - session.lastActivity.getTime() >=
-        sessionLifetimeMs ||
+      this.hasExpired(session) ||
       !isCurrent
     ) {
       throw new AiAuthoringError(
@@ -1173,10 +1187,7 @@ export class AiAuthoringSessions {
         "AI authoring session was not found"
       );
     }
-    if (
-      this.now().getTime() - session.lastActivity.getTime() >=
-      sessionLifetimeMs
-    ) {
+    if (this.hasExpired(session)) {
       await this.dispose(sessionId, session);
       throw new AiAuthoringError(
         404,

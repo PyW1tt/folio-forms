@@ -3,15 +3,12 @@ import { createFileRoute, Link, useParams } from "@tanstack/react-router";
 import { ArrowLeft, CheckCircle2, Download, FileText } from "lucide-react";
 import { useEffect, useState } from "react";
 
-import { SubmissionFields } from "@/components/submission-result-viewer";
-import { Badge, Card, Notice, Spinner } from "@/components/ui";
 import {
-  ApiError,
-  apiGet,
-  downloadArtifact,
-  formatDate,
-  formatDateTime,
-} from "@/lib/api";
+  SubmissionFields,
+  SubmissionRevisionHistory,
+} from "@/components/submission-result-viewer";
+import { Card, Notice, Spinner } from "@/components/ui";
+import { ApiError, apiGet, downloadArtifact, formatDate } from "@/lib/api";
 import type {
   ReceiptField,
   ResponseRevisionsResponse,
@@ -157,10 +154,7 @@ const ReceiptRoute = () => {
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-3 border-b border-[var(--line)] p-5">
-            <label
-              className="text-sm font-semibold"
-              htmlFor="receipt-revision"
-            >
+            <label className="text-sm font-semibold" htmlFor="receipt-revision">
               ฉบับที่ดู
             </label>
             <select
@@ -204,37 +198,10 @@ const ReceiptRoute = () => {
           </div>
           <div className="border-b border-[var(--line)] p-5 sm:p-7">
             <h2 className="font-semibold">ประวัติ Correction</h2>
-            <ol className="mt-3 space-y-3">
-              {revisions.map((revision) => (
-                <li
-                  className="rounded-[10px] border border-[var(--line)] p-3 text-sm"
-                  key={revision.revision}
-                >
-                  <div className="flex flex-wrap items-center gap-2">
-                    <Badge
-                      tone={revision.revision === 0 ? "neutral" : "warning"}
-                    >
-                      {revision.revision === 0
-                        ? "Submission เดิม"
-                        : `Correction ${revision.revision}`}
-                    </Badge>
-                    <span className="text-[var(--ink-soft)]">
-                      {formatDateTime(revision.createdAt)}
-                    </span>
-                  </div>
-                  {revision.reason ? (
-                    <p className="mt-2 text-[var(--ink-soft)]">
-                      เหตุผล: {revision.reason}
-                    </p>
-                  ) : null}
-                  {revision.actorName || revision.actorEmail ? (
-                    <p className="mt-1 text-[var(--ink-soft)]">
-                      ผู้แก้ไข: {revision.actorName ?? revision.actorEmail}
-                    </p>
-                  ) : null}
-                </li>
-              ))}
-            </ol>
+            <SubmissionRevisionHistory
+              className="mt-3 space-y-3"
+              revisions={revisions}
+            />
           </div>
           <div className="p-5 sm:p-7">
             <SubmissionFields

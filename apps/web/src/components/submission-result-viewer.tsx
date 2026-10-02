@@ -2,8 +2,9 @@ import type { KeyboardEvent } from "react";
 import { useState } from "react";
 
 import { OnlyOfficeEditor } from "@/components/onlyoffice-editor";
-import { Notice } from "@/components/ui";
-import type { ReceiptField } from "@/lib/api";
+import { Badge, Notice } from "@/components/ui";
+import { formatDateTime } from "@/lib/api";
+import type { ReceiptField, ResponseRevision } from "@/lib/api";
 
 const fieldValue = (
   field: ReceiptField,
@@ -62,6 +63,44 @@ export const SubmissionFields = ({
     </dl>
   </>
 );
+
+export const SubmissionRevisionHistory = ({
+  className,
+  revisions,
+}: {
+  className: string;
+  revisions: ResponseRevision[];
+}) => (
+  <ol className={className}>
+    {revisions.map((revision) => (
+      <li
+        className="rounded-[10px] border border-[var(--line)] p-3 text-sm"
+        key={revision.revision}
+      >
+        <div className="flex flex-wrap items-center gap-2">
+          <Badge tone={revision.revision === 0 ? "neutral" : "warning"}>
+            {revision.revision === 0
+              ? "Submission เดิม"
+              : `Correction ${revision.revision}`}
+          </Badge>
+          <span className="text-[var(--ink-soft)]">
+            {formatDateTime(revision.createdAt)}
+          </span>
+        </div>
+        {revision.reason ? (
+          <p className="mt-2 text-[var(--ink-soft)]">
+            เหตุผล: {revision.reason}
+          </p>
+        ) : null}
+        {revision.actorName || revision.actorEmail ? (
+          <p className="mt-1 text-[var(--ink-soft)]">
+            ผู้แก้ไข: {revision.actorName ?? revision.actorEmail}
+          </p>
+        ) : null}
+      </li>
+    ))}
+  </ol>
+);
 export const SubmissionResultViewer = ({
   configUrl,
   data,
@@ -77,9 +116,7 @@ export const SubmissionResultViewer = ({
   fieldsError?: string | null;
   pictures: Record<string, boolean> | null;
 }) => {
-  const [activeTab, setActiveTab] = useState<"document" | "fields">(
-    "document"
-  );
+  const [activeTab, setActiveTab] = useState<"document" | "fields">("document");
   const activateAdjacentTab = (event: KeyboardEvent<HTMLButtonElement>) => {
     if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") {
       return;
@@ -87,8 +124,19 @@ export const SubmissionResultViewer = ({
     event.preventDefault();
     const nextTab = activeTab === "document" ? "fields" : "document";
     setActiveTab(nextTab);
-    document.getElementById(`submission-${nextTab}-tab`)?.focus();
+    document
+      .querySelector<HTMLButtonElement>(`#submission-${nextTab}-tab`)
+      ?.focus();
   };
+
+  let fieldsContent: React.ReactNode = null;
+  if (activeTab === "fields") {
+    fieldsContent = fieldsError ? (
+      <Notice tone="danger">{fieldsError}</Notice>
+    ) : (
+      <SubmissionFields data={data} fields={fields} pictures={pictures} />
+    );
+  }
 
   return (
     <div>
@@ -160,13 +208,7 @@ export const SubmissionResultViewer = ({
         role="tabpanel"
         tabIndex={0}
       >
-        {activeTab === "fields" ? (
-          fieldsError ? (
-            <Notice tone="danger">{fieldsError}</Notice>
-          ) : (
-            <SubmissionFields data={data} fields={fields} pictures={pictures} />
-          )
-        ) : null}
+        {fieldsContent}
       </div>
     </div>
   );

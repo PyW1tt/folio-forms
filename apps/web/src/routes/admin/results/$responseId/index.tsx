@@ -4,7 +4,10 @@ import { FileText, LockKeyhole, Trash2 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
 import { PageHeader } from "@/components/app-shell";
-import { SubmissionResultViewer } from "@/components/submission-result-viewer";
+import {
+  SubmissionResultViewer,
+  SubmissionRevisionHistory,
+} from "@/components/submission-result-viewer";
 import { Badge, Button, Card, Notice, Spinner } from "@/components/ui";
 import {
   ApiError,
@@ -12,7 +15,6 @@ import {
   apiGet,
   downloadArtifact,
   formatDate,
-  formatDateTime,
 } from "@/lib/api";
 import type {
   AdminResultDetail,
@@ -46,35 +48,7 @@ const CorrectionHistory = ({
     );
   }
   return (
-    <ol className="mt-4 space-y-3">
-      {history.map((revision) => (
-        <li
-          className="rounded-[10px] border border-[var(--line)] p-3 text-sm"
-          key={revision.revision}
-        >
-          <div className="flex flex-wrap items-center gap-2">
-            <Badge tone={revision.revision === 0 ? "neutral" : "warning"}>
-              {revision.revision === 0
-                ? "Submission เดิม"
-                : `Correction ${revision.revision}`}
-            </Badge>
-            <span className="text-[var(--ink-soft)]">
-              {formatDateTime(revision.createdAt)}
-            </span>
-          </div>
-          {revision.reason ? (
-            <p className="mt-2 text-[var(--ink-soft)]">
-              เหตุผล: {revision.reason}
-            </p>
-          ) : null}
-          {revision.actorName || revision.actorEmail ? (
-            <p className="mt-1 text-[var(--ink-soft)]">
-              ผู้แก้ไข: {revision.actorName ?? revision.actorEmail}
-            </p>
-          ) : null}
-        </li>
-      ))}
-    </ol>
+    <SubmissionRevisionHistory className="mt-4 space-y-3" revisions={history} />
   );
 };
 

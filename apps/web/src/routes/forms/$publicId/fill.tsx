@@ -129,7 +129,7 @@ const nativeValuesFromConfig = (
   return values;
 };
 
-const nativeSaveSuccessMessage = (
+const draftSaveSuccessMessage = (
   exportFormat: ExportFormat | null | undefined
 ): string => {
   if (exportFormat === "docx") {
@@ -157,6 +157,15 @@ const nativeSaveErrorMessage = (
   }
   return "บันทึกแล้ว แต่โหลดคำตอบล่าสุดไม่สำเร็จ กรุณาโหลดแบบฟอร์มใหม่";
 };
+
+const downloadDraftArtifact = (
+  responseId: string,
+  format: ExportFormat
+): Promise<void> =>
+  downloadArtifact(
+    `/api/responses/${responseId}/draft/${format}`,
+    `response-${responseId}.${format}`
+  );
 // oxlint-disable-next-line complexity -- Coordinates the public form editor, draft lifecycle, and exit confirmation.
 const FillRoute = () => {
   const { publicId } = useParams({ from: "/forms/$publicId/fill" });
@@ -381,6 +390,10 @@ const FillRoute = () => {
     startAttempt,
     user,
   ]);
+  const resolveReauthentication = (allowed: boolean): void => {
+    reauthResolverRef.current?.(allowed);
+    reauthResolverRef.current = null;
+  };
   // oxlint-disable-next-line complexity -- Applies bridge updates, operation state, and save/export transitions.
   const handleBridgeMessage = async (message: EditorBridgeMessage) => {
     if (message.type === "dirty-state") {
@@ -415,8 +428,7 @@ const FillRoute = () => {
       setSuccess(null);
       if (message.action === "save-draft" && exitIntent === "reauth") {
         setExitIntent(null);
-        reauthResolverRef.current?.(false);
-        reauthResolverRef.current = null;
+        resolveReauthentication(false);
       }
       return;
     }
@@ -459,8 +471,7 @@ const FillRoute = () => {
       setSaveBeforeExit(false);
       if (intent === "reauth") {
         setExitIntent(null);
-        reauthResolverRef.current?.(true);
-        reauthResolverRef.current = null;
+        resolveReauthentication(true);
       } else if (intent === "dashboard") {
         allowNavigationRef.current = true;
         setExitIntent(null);
@@ -561,8 +572,7 @@ const FillRoute = () => {
     setSaveBeforeExit(false);
     setExitIntent(null);
     if (intent === "reauth") {
-      reauthResolverRef.current?.(true);
-      reauthResolverRef.current = null;
+      resolveReauthentication(true);
       return;
     }
     allowNavigationRef.current = true;
@@ -592,12 +602,9 @@ const FillRoute = () => {
       return;
     }
     await refreshNativeResponse(configUrl);
-    setSuccess(nativeSaveSuccessMessage(options.exportFormat));
+    setSuccess(draftSaveSuccessMessage(options.exportFormat));
     if (options.exportFormat) {
-      await downloadArtifact(
-        `/api/responses/${savedResponseId}/draft/${options.exportFormat}`,
-        `response-${savedResponseId}.${options.exportFormat}`
-      );
+      await downloadDraftArtifact(savedResponseId, options.exportFormat);
       setExportAfterSave(null);
     }
     if (options.exitAfterSave) {
@@ -662,8 +669,7 @@ const FillRoute = () => {
       setSuccess(null);
       if (options.exitAfterSave && exitIntent === "reauth") {
         setExitIntent(null);
-        reauthResolverRef.current?.(false);
-        reauthResolverRef.current = null;
+        resolveReauthentication(false);
       }
     } finally {
       nativeSaveGuardRef.current = false;
@@ -782,20 +788,12 @@ const FillRoute = () => {
       try {
         await saveThenDownload(
           () => saveCompletion.promise,
-          () =>
-            downloadArtifact(
-              `/api/responses/${activeResponseId}/draft/${format}`,
-              `response-${activeResponseId}.${format}`
-            )
+          () => downloadDraftArtifact(activeResponseId, format)
         );
         setExportAfterSave(null);
         setError(null);
         setOperationError(null);
-        setSuccess(
-          format === "docx"
-            ? "บันทึกและดาวน์โหลด DOCX แล้ว"
-            : "บันทึกและดาวน์โหลด PDF แล้ว"
-        );
+        setSuccess(draftSaveSuccessMessage(format));
       } catch (caughtError: unknown) {
         setExportAfterSave(null);
         setOperationError(
@@ -814,8 +812,7 @@ const FillRoute = () => {
   const cancelExit = () => {
     navigationBlockerRef.current?.reset();
     navigationBlockerRef.current = null;
-    reauthResolverRef.current?.(false);
-    reauthResolverRef.current = null;
+    resolveReauthentication(false);
     setSaveBeforeExit(false);
     setExitIntent(null);
   };
@@ -831,8 +828,7 @@ const FillRoute = () => {
       setClearDirtyRequest((value) => value + 1);
       const intent = exitIntent;
       if (intent === "reauth") {
-        reauthResolverRef.current?.(true);
-        reauthResolverRef.current = null;
+        resolveReauthentication(true);
       } else if (intent === "dashboard") {
         allowNavigationRef.current = true;
         await navigate({ to: "/dashboard" });

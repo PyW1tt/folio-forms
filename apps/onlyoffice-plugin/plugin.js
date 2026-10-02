@@ -72,6 +72,8 @@ const DIRTY_STATE_TYPE = "dirty-state";
 const RUN_ACTION_TYPE = "run-action";
 const CLEAR_DIRTY_TYPE = "clear-dirty";
 const OPERATION_MESSAGE_TYPE = "operation";
+const EDITOR_SAVE_REQUEST_TYPE = "editor-save-request";
+const EDITOR_SAVE_RESPONSE_TYPE = "editor-save-response";
 
 const CAPABILITY_REQUEST_TIMEOUT_MS = 5000;
 const OPERATION_POLL_INTERVAL_MS = 1000;
@@ -106,6 +108,9 @@ let panelSelectionRequestSequence = 0;
 let pendingFieldSelection;
 let bridgeAcknowledged = false;
 let bridgeMessageListenerAttached = false;
+let editorSaveSupported = false;
+let editorSaveRequestSequence = 0;
+let pendingEditorSave;
 let bridgeReadySent = false;
 let capabilityRequestSequence = 0;
 const pendingCapabilityRequests = new Map();
@@ -114,6 +119,14 @@ let initializationStarted = false;
 let prefillApplied = false;
 let prefillPromise;
 let pluginInitialized = false;
+
+function requireOption(value, name) {
+  if (!value) {
+    throw new Error(`Missing editor option: ${name}`);
+  }
+
+  return value;
+}
 
 /**
  * Runs inside ONLYOFFICE document context.
@@ -124,8 +137,7 @@ let pluginInitialized = false;
  * outer plugin scope: ONLYOFFICE serializes this function before execution.
  */
 function extractFormDataCommand() {
-  const scope =
-    typeof Asc !== "undefined" && Asc.scope ? Asc.scope : {};
+  const scope = typeof Asc !== "undefined" && Asc.scope ? Asc.scope : {};
   const tagAliases = scope.formBridgeTagAliases || {};
   const doc = Api.GetDocument();
   const controls = doc.GetAllContentControls();
@@ -219,16 +231,12 @@ function extractFormDataCommand() {
       continue;
     }
 
-
     /**
      * Checkbox
      *
      * Return a real boolean instead of "☒" / "☐".
      */
-    if (
-      typeof control.IsCheckBox === "function" &&
-      control.IsCheckBox()
-    ) {
+    if (typeof control.IsCheckBox === "function" && control.IsCheckBox()) {
       data[tag] = Boolean(control.IsCheckBoxChecked());
       continue;
     }
@@ -239,10 +247,7 @@ function extractFormDataCommand() {
      * Normalize to YYYY-MM-DD without changing the calendar date for local
      * Date objects returned by the Office API.
      */
-    if (
-      typeof control.IsDatePicker === "function" &&
-      control.IsDatePicker()
-    ) {
+    if (typeof control.IsDatePicker === "function" && control.IsDatePicker()) {
       const dateValue = formatDateInsideCommand(control.GetDate());
       data[tag] = dateValue;
       if (
@@ -753,7 +758,11 @@ function restrictEditorToForms() {
   return executeMethodResult("SetEditingRestrictions", ["forms"]);
 }
 function freezeEditor() {
-  return executeMethodResult("SetEditingRestrictions", ["view"]);
+  return executeMethodResult("SetEditingRestrictions", ["readOnly"]);
+}
+
+function saveDocumentCommand() {
+  return typeof Api.Save === "function" && Api.Save();
 }
 
 function parseCommandResult(result) {
@@ -975,6 +984,12 @@ function applyPrefill(prefill) {
       }
     });
 }
+function wait(milliseconds) {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, milliseconds);
+  });
+}
+
 async function applyPrefillWhenReady(prefill) {
   for (let attempt = 0; attempt < PREFILL_MAX_ATTEMPTS; attempt += 1) {
     const result = await applyPrefill(prefill);
@@ -1364,6 +1379,64 @@ function safeFieldSelection(selection) {
   };
 }
 
+function parentWindow() {
+  const target = window.top;
+  if (!target || typeof target.postMessage !== "function") {
+    throw new Error("The editor parent window is unavailable");
+  }
+  return target;
+}
+
+function postBridgeMessage(message) {
+  const bridgeId = requireOption(runtimeOptions.bridgeId, "bridgeId");
+  const parentOrigin = requireOption(
+    runtimeOptions.parentOrigin,
+    "parentOrigin"
+  );
+  parentWindow().postMessage(
+    {
+      ...message,
+      bridgeId,
+    },
+    parentOrigin
+  );
+}
+async function flushEditorChanges() {
+  if (!bridgeAcknowledged) {
+    throw new Error("The editor host bridge is not acknowledged");
+  }
+  if (!editorSaveSupported) {
+    throw new Error("Native editor save synchronization is unavailable");
+  }
+  // Api.Save requests asc_Save after the command callback; it is not completion.
+  if ((await callCommandResult(saveDocumentCommand)) !== true) {
+    throw new Error("The native editor could not request a document save");
+  }
+  editorSaveRequestSequence += 1;
+  const requestId = `editor-save-${editorSaveRequestSequence}`;
+  // This host round trip runs after the native command and its queued state events.
+  await new Promise((resolve, reject) => {
+    pendingEditorSave = { reject, requestId, resolve };
+    try {
+      postBridgeMessage({
+        requestId,
+        source: BRIDGE_MESSAGE_SOURCE,
+        type: EDITOR_SAVE_REQUEST_TYPE,
+      });
+    } catch (error) {
+      pendingEditorSave = undefined;
+      reject(error);
+    }
+  });
+}
+function postFieldSelection(message) {
+  try {
+    postBridgeMessage(message);
+  } catch {
+    setPanelStatus("ไม่สามารถแจ้งการเลือกฟิลด์ได้", "error");
+  }
+}
+
 function publishFieldSelection(selection) {
   const safe = safeFieldSelection(selection);
   const current = {
@@ -1386,11 +1459,7 @@ function publishFieldSelection(selection) {
     return message;
   }
 
-  try {
-    postBridgeMessage(message);
-  } catch {
-    setPanelStatus("ไม่สามารถแจ้งการเลือกฟิลด์ได้", "error");
-  }
+  postFieldSelection(message);
   return message;
 }
 function sameSelectionControl(left, right) {
@@ -1402,6 +1471,12 @@ function isPictureSelection(selection = fieldPanelState.selection) {
 
 function picturePrefillStatus() {
   return "ฟิลด์รูปภาพไม่รองรับการเติมข้อมูลล่วงหน้า";
+}
+
+function reportPicturePrefillError() {
+  const error = picturePrefillStatus();
+  setPanelStatus(error, "info");
+  return error;
 }
 
 function clearPicturePrefillState() {
@@ -1420,6 +1495,58 @@ function applyDefaultPolicyState() {
   fieldPanelState.required = false;
   fieldPanelState.rules = [];
   fieldPanelState.selectedPointer = null;
+}
+
+function hasNextSchemaPage() {
+  return (
+    Boolean(fieldPanelState.schemaCursor) &&
+    fieldPanelState.schemaPageCount < MAX_SCHEMA_PAGES
+  );
+}
+
+function updateFieldPanel() {
+  const { selection } = fieldPanelState;
+  const hasSelection = Boolean(selection?.controlKey);
+  const hasTag = Boolean(selection?.tag);
+  const pictureSelection = isPictureSelection();
+  const { query } = panelElements;
+  const policy = panelElements.policySelect;
+  const { required } = panelElements;
+
+  clearPicturePrefillState();
+  setPanelText(
+    panelElements.selectionTag,
+    hasSelection ? selection.tag || "ยังไม่มีแท็ก" : "ยังไม่ได้เลือก"
+  );
+  setPanelText(
+    panelElements.selectionType,
+    hasSelection ? typeLabel(selection.controlType) : "ยังไม่ได้เลือก"
+  );
+  if (panelElements.pictureHelp) {
+    panelElements.pictureHelp.hidden = !pictureSelection;
+  }
+  if (required) {
+    required.checked = fieldPanelState.required;
+  }
+  if (policy) {
+    policy.value = fieldPanelState.prefillPolicy;
+  }
+
+  setPanelDisabled(required, !hasSelection);
+  setPanelDisabled(policy, !hasSelection || pictureSelection);
+  setPanelDisabled(panelElements.save, !hasSelection || !hasTag);
+  setPanelDisabled(query, !hasSelection || pictureSelection);
+  setPanelDisabled(panelElements.search, !hasSelection || pictureSelection);
+  setPanelDisabled(
+    panelElements.nextPage,
+    !hasSelection || pictureSelection || !hasNextSchemaPage()
+  );
+  setPanelDisabled(
+    panelElements.applyPointer,
+    !hasSelection || pictureSelection || !fieldPanelState.selectedPointer
+  );
+  // oxlint-disable-next-line no-use-before-define -- Hoisted render and pointer handlers form a cycle: pointer actions update the panel, which rebuilds their controls.
+  renderSchemaItems();
 }
 
 function setSelectionState(snapshot) {
@@ -1475,141 +1602,6 @@ function selectionChanged(previous, next) {
     previous.tag !== next.tag ||
     previous.controlType !== next.controlType
   );
-}
-
-async function refreshSelection(hint) {
-  if (runtimeOptions.action !== ACTIONS.TEMPLATE_EDIT) {
-    return { ignored: true, selected: false };
-  }
-
-  const requestId = ++panelSelectionRequestSequence;
-  const previous = fieldPanelState.selection;
-  const snapshot = await readCurrentSelection(hint);
-  if (requestId !== panelSelectionRequestSequence) {
-    return { ignored: true, selected: false };
-  }
-
-  const changed = selectionChanged(previous, snapshot);
-  setSelectionState(snapshot);
-  if (changed || !previous) {
-    publishFieldSelection(fieldPanelState.selection);
-  }
-
-  if (!snapshot) {
-    setPanelStatus("ยังไม่ได้เลือกฟิลด์", "info");
-    return { ok: true, selected: false };
-  }
-
-  if (changed || !previous) {
-    await loadFieldRules();
-  }
-  return {
-    controlType: snapshot.controlType,
-    ok: true,
-    selected: true,
-    tag: snapshot.tag,
-  };
-}
-
-function renderSchemaItems() {
-  const { list } = panelElements;
-  clearPanelChildren(list);
-  if (
-    !list ||
-    typeof document === "undefined" ||
-    typeof document.createElement !== "function"
-  ) {
-    return;
-  }
-  const pictureSelection = isPictureSelection();
-
-  for (const item of fieldPanelState.schemaItems) {
-    const row = document.createElement("li");
-    const pointerButton = document.createElement("button");
-    const type = document.createElement("span");
-    const actions = document.createElement("span");
-    const copyButton = document.createElement("button");
-    const applyButton = document.createElement("button");
-
-    row.className = "schema-item";
-    pointerButton.className = "schema-pointer";
-    pointerButton.type = "button";
-    pointerButton.textContent = item.pointer;
-    pointerButton.title = "เลือกตัวชี้";
-    pointerButton.disabled = pictureSelection;
-    pointerButton.addEventListener?.("click", () => {
-      selectSchemaPointer(item.pointer);
-    });
-    type.className = "schema-type";
-    type.textContent = schemaTypeLabel(item.type);
-    actions.className = "inline-actions";
-    copyButton.className = "secondary-action";
-    copyButton.type = "button";
-    copyButton.textContent = "คัดลอก";
-    copyButton.disabled = pictureSelection;
-    copyButton.addEventListener?.("click", () => {
-      void copySchemaPointer(item.pointer);
-    });
-    applyButton.type = "button";
-    applyButton.textContent = "ใช้เป็นแท็ก";
-    applyButton.disabled = pictureSelection;
-    applyButton.addEventListener?.("click", () => {
-      void applySchemaPointer(item.pointer);
-    });
-    appendPanelChild(row, pointerButton);
-    appendPanelChild(row, type);
-    appendPanelChild(actions, copyButton);
-    appendPanelChild(actions, applyButton);
-    appendPanelChild(row, actions);
-    appendPanelChild(list, row);
-  }
-}
-
-function updateFieldPanel() {
-  const { selection } = fieldPanelState;
-  const hasSelection = Boolean(selection?.controlKey);
-  const hasTag = Boolean(selection?.tag);
-  const pictureSelection = isPictureSelection();
-  const { query } = panelElements;
-  const policy = panelElements.policySelect;
-  const { required } = panelElements;
-
-  clearPicturePrefillState();
-  setPanelText(
-    panelElements.selectionTag,
-    hasSelection ? selection.tag || "ยังไม่มีแท็ก" : "ยังไม่ได้เลือก"
-  );
-  setPanelText(
-    panelElements.selectionType,
-    hasSelection ? typeLabel(selection.controlType) : "ยังไม่ได้เลือก"
-  );
-  if (panelElements.pictureHelp) {
-    panelElements.pictureHelp.hidden = !pictureSelection;
-  }
-  if (required) {
-    required.checked = fieldPanelState.required;
-  }
-  if (policy) {
-    policy.value = fieldPanelState.prefillPolicy;
-  }
-
-  setPanelDisabled(required, !hasSelection);
-  setPanelDisabled(policy, !hasSelection || pictureSelection);
-  setPanelDisabled(panelElements.save, !hasSelection || !hasTag);
-  setPanelDisabled(query, !hasSelection || pictureSelection);
-  setPanelDisabled(panelElements.search, !hasSelection || pictureSelection);
-  setPanelDisabled(
-    panelElements.nextPage,
-    !hasSelection ||
-      pictureSelection ||
-      !fieldPanelState.schemaCursor ||
-      fieldPanelState.schemaPageCount >= MAX_SCHEMA_PAGES
-  );
-  setPanelDisabled(
-    panelElements.applyPointer,
-    !hasSelection || pictureSelection || !fieldPanelState.selectedPointer
-  );
-  renderSchemaItems();
 }
 
 function normalizeFieldRule(value) {
@@ -1674,11 +1666,145 @@ function panelErrorStatus(kind) {
   }
 }
 
-function fieldRulesPath(suffix) {
+function apiUrl(path) {
+  const base = runtimeOptions.apiBase;
+
+  if (!base) {
+    return path;
+  }
+
+  return `${base}${path}`;
+}
+
+async function requestJson(path, init, capability) {
+  const headers = new Headers();
+  headers.set(
+    "X-Editor-Capability",
+    requireOption(capability, "editor capability")
+  );
+
+  if (init?.body !== undefined) {
+    headers.set("Content-Type", "application/json");
+  }
+
+  const response = await fetch(apiUrl(path), {
+    ...init,
+    credentials: "omit",
+    headers,
+  });
+  const text = await response.text();
+  let payload = {};
+
+  if (text) {
+    try {
+      payload = JSON.parse(text);
+    } catch {
+      payload = {
+        message: text,
+      };
+    }
+  }
+
+  if (!response.ok) {
+    const detail =
+      (isRecord(payload) && (payload.error || payload.message)) ||
+      `HTTP ${response.status}`;
+
+    throw new Error(String(detail));
+  }
+
+  if (isRecord(payload) && payload.ok === false) {
+    throw new Error(
+      String(payload.error || payload.message || "Request failed")
+    );
+  }
+
+  return payload;
+}
+
+function adminFormPath(suffix) {
   const publicId = encodeURIComponent(
     requireOption(runtimeOptions.publicId, "publicId")
   );
   return `${API_ROUTES.ADMIN_FORMS}/${publicId}/${suffix}`;
+}
+
+function isActionAllowedInMode(action) {
+  switch (runtimeOptions.action) {
+    case ACTIONS.TEMPLATE_EDIT: {
+      return (
+        action === ACTIONS.CONFIGURE_FIELDS ||
+        action === ACTIONS.PUBLISH ||
+        action === ACTIONS.SAVE_TEMPLATE
+      );
+    }
+    case ACTIONS.FILL:
+    case ACTIONS.DRAFT: {
+      return action === ACTIONS.SAVE_DRAFT || action === ACTIONS.SUBMIT;
+    }
+    case ACTIONS.CORRECTION: {
+      return action === ACTIONS.SAVE_CORRECTION;
+    }
+    case ACTIONS.SUBMIT: {
+      return action === ACTIONS.SUBMIT;
+    }
+    default: {
+      return false;
+    }
+  }
+}
+
+function requestActionCapability(action) {
+  if (!CAPABILITY_ACTIONS.includes(action) || !isActionAllowedInMode(action)) {
+    return Promise.reject(
+      new Error(`Unsupported form action: ${action || "none"}`)
+    );
+  }
+
+  if (!bridgeAcknowledged) {
+    return Promise.reject(
+      new Error("The editor host bridge is not acknowledged")
+    );
+  }
+
+  capabilityRequestSequence += 1;
+  const requestId = `capability-${capabilityRequestSequence}`;
+
+  return new Promise((resolve, reject) => {
+    const pending = {
+      action,
+      reject,
+      resolve,
+      timeoutId: undefined,
+    };
+    pendingCapabilityRequests.set(requestId, pending);
+
+    const timeout = () => {
+      if (pendingCapabilityRequests.get(requestId) !== pending) {
+        return;
+      }
+
+      pendingCapabilityRequests.delete(requestId);
+      reject(new Error(`Timed out waiting for ${action} capability`));
+    };
+
+    try {
+      pending.timeoutId = window.setTimeout(
+        timeout,
+        CAPABILITY_REQUEST_TIMEOUT_MS
+      );
+      postBridgeMessage({
+        action,
+        requestId,
+        source: BRIDGE_MESSAGE_SOURCE,
+        type: CAPABILITY_REQUEST_TYPE,
+      });
+    } catch (error) {
+      pendingCapabilityRequests.delete(requestId);
+      window.clearTimeout(pending.timeoutId);
+      reject(error);
+    }
+  });
 }
 
 async function requestFieldApi(path, init) {
@@ -1703,7 +1829,7 @@ async function loadFieldRules() {
 
   const { selectionId } = selection;
   try {
-    const payload = await requestFieldApi(fieldRulesPath("field-rules"), {
+    const payload = await requestFieldApi(adminFormPath("field-rules"), {
       method: "GET",
     });
     if (fieldPanelState.selection?.selectionId !== selectionId) {
@@ -1788,7 +1914,7 @@ function schemaPath(query, cursor) {
   if (cursor) {
     params.push(`cursor=${encodeURIComponent(cursor)}`);
   }
-  const path = fieldRulesPath("schema");
+  const path = adminFormPath("schema");
   return params.length ? `${path}?${params.join("&")}` : path;
 }
 
@@ -1799,15 +1925,9 @@ async function loadSchemaPage(reset = true) {
     return { error: "ยังไม่ได้เลือกฟิลด์", items: [], ok: false };
   }
   if (isPictureSelection()) {
-    const error = picturePrefillStatus();
-    setPanelStatus(error, "info");
-    return { error, items: [], ok: false };
+    return { error: reportPicturePrefillError(), items: [], ok: false };
   }
-  if (
-    !reset &&
-    (!fieldPanelState.schemaCursor ||
-      fieldPanelState.schemaPageCount >= MAX_SCHEMA_PAGES)
-  ) {
+  if (!reset && !hasNextSchemaPage()) {
     return {
       error: "ไม่มีหน้าถัดไป",
       items: fieldPanelState.schemaItems,
@@ -1875,9 +1995,7 @@ function selectSchemaPointer(pointer) {
     return { ok: false };
   }
   if (isPictureSelection()) {
-    const error = picturePrefillStatus();
-    setPanelStatus(error, "info");
-    return { error, ok: false };
+    return { error: reportPicturePrefillError(), ok: false };
   }
 
   fieldPanelState.selectedPointer = pointer;
@@ -1892,9 +2010,7 @@ async function copySchemaPointer(pointer) {
     return { error: "ยังไม่ได้เลือกฟิลด์", ok: false };
   }
   if (isPictureSelection()) {
-    const error = picturePrefillStatus();
-    setPanelStatus(error, "info");
-    return { error, ok: false };
+    return { error: reportPicturePrefillError(), ok: false };
   }
 
   try {
@@ -1943,9 +2059,7 @@ async function applySchemaPointer(pointer) {
     return { error: "ยังไม่ได้เลือกฟิลด์", ok: false };
   }
   if (isPictureSelection()) {
-    const error = picturePrefillStatus();
-    setPanelStatus(error, "info");
-    return { error, ok: false };
+    return { error: reportPicturePrefillError(), ok: false };
   }
   if (typeof pointer !== "string" || !pointer) {
     return { error: panelErrorStatus("tag"), ok: false };
@@ -2029,7 +2143,7 @@ async function saveFieldRule(overrides) {
   fieldPanelState.saving = true;
   updateFieldPanel();
   try {
-    const payload = await requestFieldApi(fieldRulesPath("field-rules"), {
+    const payload = await requestFieldApi(adminFormPath("field-rules"), {
       body: JSON.stringify(body),
       method: "PATCH",
     });
@@ -2072,6 +2186,94 @@ async function saveFieldRule(overrides) {
     fieldPanelState.saving = false;
     updateFieldPanel();
   }
+}
+
+function renderSchemaItems() {
+  const { list } = panelElements;
+  clearPanelChildren(list);
+  if (
+    !list ||
+    typeof document === "undefined" ||
+    typeof document.createElement !== "function"
+  ) {
+    return;
+  }
+  const pictureSelection = isPictureSelection();
+
+  for (const item of fieldPanelState.schemaItems) {
+    const row = document.createElement("li");
+    const pointerButton = document.createElement("button");
+    const type = document.createElement("span");
+    const actions = document.createElement("span");
+    const copyButton = document.createElement("button");
+    const applyButton = document.createElement("button");
+
+    row.className = "schema-item";
+    pointerButton.className = "schema-pointer";
+    pointerButton.type = "button";
+    pointerButton.textContent = item.pointer;
+    pointerButton.title = "เลือกตัวชี้";
+    pointerButton.disabled = pictureSelection;
+    pointerButton.addEventListener?.("click", () => {
+      selectSchemaPointer(item.pointer);
+    });
+    type.className = "schema-type";
+    type.textContent = schemaTypeLabel(item.type);
+    actions.className = "inline-actions";
+    copyButton.className = "secondary-action";
+    copyButton.type = "button";
+    copyButton.textContent = "คัดลอก";
+    copyButton.disabled = pictureSelection;
+    copyButton.addEventListener?.("click", () => {
+      void copySchemaPointer(item.pointer);
+    });
+    applyButton.type = "button";
+    applyButton.textContent = "ใช้เป็นแท็ก";
+    applyButton.disabled = pictureSelection;
+    applyButton.addEventListener?.("click", () => {
+      void applySchemaPointer(item.pointer);
+    });
+    appendPanelChild(row, pointerButton);
+    appendPanelChild(row, type);
+    appendPanelChild(actions, copyButton);
+    appendPanelChild(actions, applyButton);
+    appendPanelChild(row, actions);
+    appendPanelChild(list, row);
+  }
+}
+
+async function refreshSelection(hint) {
+  if (runtimeOptions.action !== ACTIONS.TEMPLATE_EDIT) {
+    return { ignored: true, selected: false };
+  }
+
+  const requestId = ++panelSelectionRequestSequence;
+  const previous = fieldPanelState.selection;
+  const snapshot = await readCurrentSelection(hint);
+  if (requestId !== panelSelectionRequestSequence) {
+    return { ignored: true, selected: false };
+  }
+
+  const needsRulesRefresh = selectionChanged(previous, snapshot) || !previous;
+  setSelectionState(snapshot);
+  if (needsRulesRefresh) {
+    publishFieldSelection(fieldPanelState.selection);
+  }
+
+  if (!snapshot) {
+    setPanelStatus("ยังไม่ได้เลือกฟิลด์", "info");
+    return { ok: true, selected: false };
+  }
+
+  if (needsRulesRefresh) {
+    await loadFieldRules();
+  }
+  return {
+    controlType: snapshot.controlType,
+    ok: true,
+    selected: true,
+    tag: snapshot.tag,
+  };
 }
 
 function getPanelState() {
@@ -2253,28 +2455,6 @@ function errorMessage(error) {
 
   return String(error || "Unknown error");
 }
-function parentWindow() {
-  const target = window.top;
-  if (!target || typeof target.postMessage !== "function") {
-    throw new Error("The editor parent window is unavailable");
-  }
-  return target;
-}
-
-function postBridgeMessage(message) {
-  const bridgeId = requireOption(runtimeOptions.bridgeId, "bridgeId");
-  const parentOrigin = requireOption(
-    runtimeOptions.parentOrigin,
-    "parentOrigin"
-  );
-  parentWindow().postMessage(
-    {
-      ...message,
-      bridgeId,
-    },
-    parentOrigin
-  );
-}
 function setDirtyState(dirty) {
   if (documentDirty === dirty) {
     return;
@@ -2345,102 +2525,6 @@ function handleCapabilityResponse(message) {
   );
 }
 
-function handleParentMessage(event) {
-  const message = event?.data;
-  let topWindow;
-
-  try {
-    topWindow = window.top;
-  } catch {
-    return;
-  }
-
-  if (
-    !topWindow ||
-    event?.source !== topWindow ||
-    event.origin !== runtimeOptions.parentOrigin ||
-    !isRecord(message) ||
-    message.source !== PARENT_MESSAGE_SOURCE ||
-    message.bridgeId !== runtimeOptions.bridgeId ||
-    (message.type !== BRIDGE_ACK_TYPE &&
-      message.type !== CAPABILITY_RESPONSE_TYPE &&
-      message.type !== RUN_ACTION_TYPE &&
-      message.type !== CLEAR_DIRTY_TYPE)
-  ) {
-    return;
-  }
-  if (message.type === BRIDGE_ACK_TYPE) {
-    bridgeAcknowledged = true;
-    if (pendingFieldSelection) {
-      const pending = pendingFieldSelection;
-      pendingFieldSelection = undefined;
-      try {
-        postBridgeMessage(pending);
-      } catch {
-        setPanelStatus("ไม่สามารถแจ้งการเลือกฟิลด์ได้", "error");
-      }
-    }
-    if (
-      runtimeOptions.action === ACTIONS.TEMPLATE_EDIT &&
-      fieldPanelState.selection?.controlKey &&
-      !fieldPanelState.selection.rulesLoaded
-    ) {
-      void loadFieldRules();
-    }
-    return;
-  }
-
-  if (!bridgeAcknowledged) {
-    return;
-  }
-
-  if (message.type === CLEAR_DIRTY_TYPE) {
-    setDirtyState(false);
-    return;
-  }
-
-  if (message.type === RUN_ACTION_TYPE) {
-    if (
-      message.action !== ACTIONS.SAVE_DRAFT &&
-      message.action !== ACTIONS.SAVE_CORRECTION
-    ) {
-      return;
-    }
-
-    void runAction(
-      message.action,
-      typeof message.reason === "string" ? message.reason : ""
-    );
-    return;
-  }
-
-  handleCapabilityResponse(message);
-}
-
-function startBridge() {
-  if (!bridgeMessageListenerAttached) {
-    window.addEventListener("message", handleParentMessage);
-    bridgeMessageListenerAttached = true;
-  }
-
-  if (bridgeReadySent) {
-    return;
-  }
-
-  try {
-    postBridgeMessage({
-      source: BRIDGE_MESSAGE_SOURCE,
-      type: BRIDGE_READY_TYPE,
-    });
-    bridgeReadySent = true;
-  } catch (error) {
-    setStatus(
-      `Could not connect to editor host: ${errorMessage(error)}`,
-      "error"
-    );
-  }
-}
-
 function notifyParent(action, status, operationId, payload, error) {
   if (!bridgeAcknowledged) {
     return;
@@ -2459,62 +2543,6 @@ function notifyParent(action, status, operationId, payload, error) {
   } catch {
     // The editor can run without a host frame.
   }
-}
-
-function apiUrl(path) {
-  const base = runtimeOptions.apiBase;
-
-  if (!base) {
-    return path;
-  }
-
-  return `${base}${path}`;
-}
-
-async function requestJson(path, init, capability) {
-  const headers = new Headers();
-  headers.set(
-    "X-Editor-Capability",
-    requireOption(capability, "editor capability")
-  );
-
-  if (init?.body !== undefined) {
-    headers.set("Content-Type", "application/json");
-  }
-
-  const response = await fetch(apiUrl(path), {
-    ...init,
-    credentials: "omit",
-    headers,
-  });
-  const text = await response.text();
-  let payload = {};
-
-  if (text) {
-    try {
-      payload = JSON.parse(text);
-    } catch {
-      payload = {
-        message: text,
-      };
-    }
-  }
-
-  if (!response.ok) {
-    const detail =
-      (isRecord(payload) && (payload.error || payload.message)) ||
-      `HTTP ${response.status}`;
-
-    throw new Error(String(detail));
-  }
-
-  if (isRecord(payload) && payload.ok === false) {
-    throw new Error(
-      String(payload.error || payload.message || "Request failed")
-    );
-  }
-
-  return payload;
 }
 
 function normalizeRuntimeOptions() {
@@ -2644,50 +2672,19 @@ function addToolbarMenuItems(actions) {
   }
 }
 
-function attachToolbarHandlers(actions) {
-  for (const action of actions) {
-    const buttonId = buttonIdForAction(action);
-
-    if (!buttonId) {
-      continue;
-    }
-
-    try {
-      window.Asc.plugin.attachToolbarMenuClickEvent(buttonId, () => {
-        void runAction(action);
-      });
-    } catch (error) {
-      setStatus(
-        `Could not attach ${actionLabel(action)}: ${errorMessage(error)}`,
-        "error"
-      );
-    }
-  }
-}
-
-function requireOption(value, name) {
-  if (!value) {
-    throw new Error(`Missing editor option: ${name}`);
-  }
-
-  return value;
-}
-
 function actionRequest(action, data, reason) {
   const documentKey = requireOption(runtimeOptions.documentKey, "documentKey");
 
   if (action === ACTIONS.SAVE_TEMPLATE || action === ACTIONS.PUBLISH) {
-    const publicId = encodeURIComponent(
-      requireOption(runtimeOptions.publicId, "publicId")
+    const path = adminFormPath(
+      action === ACTIONS.SAVE_TEMPLATE ? "save" : "publish"
     );
 
     return {
       body: {
         documentKey,
       },
-      path: `${API_ROUTES.ADMIN_FORMS}/${publicId}/${
-        action === ACTIONS.SAVE_TEMPLATE ? "save" : "publish"
-      }`,
+      path,
     };
   }
 
@@ -2728,87 +2725,6 @@ function actionRequest(action, data, reason) {
   }
 
   throw new Error(`Unsupported form action: ${action || "none"}`);
-}
-
-function isActionAllowedInMode(action) {
-  switch (runtimeOptions.action) {
-    case ACTIONS.TEMPLATE_EDIT: {
-      return (
-        action === ACTIONS.CONFIGURE_FIELDS ||
-        action === ACTIONS.PUBLISH ||
-        action === ACTIONS.SAVE_TEMPLATE
-      );
-    }
-    case ACTIONS.FILL:
-    case ACTIONS.DRAFT: {
-      return action === ACTIONS.SAVE_DRAFT || action === ACTIONS.SUBMIT;
-    }
-    case ACTIONS.CORRECTION: {
-      return action === ACTIONS.SAVE_CORRECTION;
-    }
-    case ACTIONS.SUBMIT: {
-      return action === ACTIONS.SUBMIT;
-    }
-    default: {
-      return false;
-    }
-  }
-}
-
-function requestActionCapability(action) {
-  if (
-    !CAPABILITY_ACTIONS.includes(action) ||
-    !isActionAllowedInMode(action)
-  ) {
-    return Promise.reject(
-      new Error(`Unsupported form action: ${action || "none"}`)
-    );
-  }
-
-  if (!bridgeAcknowledged) {
-    return Promise.reject(
-      new Error("The editor host bridge is not acknowledged")
-    );
-  }
-
-  capabilityRequestSequence += 1;
-  const requestId = `capability-${capabilityRequestSequence}`;
-
-  return new Promise((resolve, reject) => {
-    const pending = {
-      action,
-      reject,
-      resolve,
-      timeoutId: undefined,
-    };
-    pendingCapabilityRequests.set(requestId, pending);
-
-    const timeout = () => {
-      if (pendingCapabilityRequests.get(requestId) !== pending) {
-        return;
-      }
-
-      pendingCapabilityRequests.delete(requestId);
-      reject(new Error(`Timed out waiting for ${action} capability`));
-    };
-
-    try {
-      pending.timeoutId = window.setTimeout(
-        timeout,
-        CAPABILITY_REQUEST_TIMEOUT_MS
-      );
-      postBridgeMessage({
-        action,
-        requestId,
-        source: BRIDGE_MESSAGE_SOURCE,
-        type: CAPABILITY_REQUEST_TYPE,
-      });
-    } catch (error) {
-      pendingCapabilityRequests.delete(requestId);
-      window.clearTimeout(pending.timeoutId);
-      reject(error);
-    }
-  });
 }
 
 async function postAction(action, data, reason, capability) {
@@ -2869,12 +2785,6 @@ function operationFailureMessage(payload, operationId) {
   return detail ? String(detail) : `การดำเนินการ ${operationId} ไม่สำเร็จ`;
 }
 
-function wait(milliseconds) {
-  return new Promise((resolve) => {
-    window.setTimeout(resolve, milliseconds);
-  });
-}
-
 async function pollOperation(operationId, label, operationCapability) {
   const operationLabel = label === undefined ? "operation" : label;
   const id = requireOption(operationId, "operationId");
@@ -2929,6 +2839,14 @@ async function pollOperation(operationId, label, operationCapability) {
   throw new Error(`การดำเนินการ ${id} ใช้เวลานานเกินไป`);
 }
 
+function shouldApplyRuntimePrefill() {
+  return (
+    (runtimeOptions.action === ACTIONS.FILL ||
+      runtimeOptions.action === ACTIONS.CORRECTION) &&
+    hasPrefillValues(runtimeOptions.prefill)
+  );
+}
+
 async function runAction(action, reason = "") {
   if (actionInFlight || initializationPending) {
     setStatus("มีการดำเนินการของฟอร์มกำลังทำงานอยู่", "pending");
@@ -2949,11 +2867,7 @@ async function runAction(action, reason = "") {
     let data;
 
     if (needsData) {
-      if (
-        (runtimeOptions.action === ACTIONS.FILL ||
-          runtimeOptions.action === ACTIONS.CORRECTION) &&
-        hasPrefillValues(runtimeOptions.prefill)
-      ) {
+      if (shouldApplyRuntimePrefill()) {
         await ensurePrefill();
       } else if (
         runtimeOptions.action === ACTIONS.DRAFT ||
@@ -2966,6 +2880,11 @@ async function runAction(action, reason = "") {
       setStatus(`กำลังอ่านข้อมูลของ ${actionLabel(action)}…`, "pending");
       data = await extractFormDataPromise();
     }
+    if (!needsData) {
+      await freezeEditor();
+      editorFrozen = true;
+    }
+    await flushEditorChanges();
 
     setStatus(`${actionLabel(action)} กำลังรอดำเนินการ…`, "pending");
     const capability = await requestActionCapability(action);
@@ -2994,11 +2913,7 @@ async function runAction(action, reason = "") {
       completedPayload || response
     );
 
-    if (
-      action === ACTIONS.SAVE_DRAFT ||
-      action === ACTIONS.SAVE_CORRECTION ||
-      action === ACTIONS.SUBMIT
-    ) {
+    if (needsData) {
       setDirtyState(false);
     }
 
@@ -3020,12 +2935,148 @@ async function runAction(action, reason = "") {
   } finally {
     if (editorFrozen) {
       try {
-        await restrictEditorToForms();
+        await executeMethodResult("SetEditingRestrictions", [
+          runtimeOptions.action === ACTIONS.TEMPLATE_EDIT ? "none" : "forms",
+        ]);
       } catch {
         setStatus("ไม่สามารถคืนค่าการแก้ไขเฉพาะช่องกรอกได้", "error");
       }
     }
     actionInFlight = false;
+  }
+}
+
+function handleParentMessage(event) {
+  const message = event?.data;
+  let topWindow;
+
+  try {
+    topWindow = window.top;
+  } catch {
+    return;
+  }
+
+  if (
+    !topWindow ||
+    event?.source !== topWindow ||
+    event.origin !== runtimeOptions.parentOrigin ||
+    !isRecord(message) ||
+    message.source !== PARENT_MESSAGE_SOURCE ||
+    message.bridgeId !== runtimeOptions.bridgeId ||
+    (message.type !== BRIDGE_ACK_TYPE &&
+      message.type !== CAPABILITY_RESPONSE_TYPE &&
+      message.type !== RUN_ACTION_TYPE &&
+      message.type !== CLEAR_DIRTY_TYPE &&
+      message.type !== EDITOR_SAVE_RESPONSE_TYPE)
+  ) {
+    return;
+  }
+  if (message.type === BRIDGE_ACK_TYPE) {
+    bridgeAcknowledged = true;
+    editorSaveSupported = message.editorSaveSupported === true;
+    if (pendingFieldSelection) {
+      const pending = pendingFieldSelection;
+      pendingFieldSelection = undefined;
+      postFieldSelection(pending);
+    }
+    if (
+      runtimeOptions.action === ACTIONS.TEMPLATE_EDIT &&
+      fieldPanelState.selection?.controlKey &&
+      !fieldPanelState.selection.rulesLoaded
+    ) {
+      void loadFieldRules();
+    }
+    return;
+  }
+
+  if (!bridgeAcknowledged) {
+    return;
+  }
+
+  if (message.type === EDITOR_SAVE_RESPONSE_TYPE) {
+    const pending = pendingEditorSave;
+    if (!pending || message.requestId !== pending.requestId) {
+      return;
+    }
+    if (message.saved === true && !Object.hasOwn(message, "error")) {
+      pendingEditorSave = undefined;
+      pending.resolve();
+    } else if (
+      !Object.hasOwn(message, "saved") &&
+      typeof message.error === "string" &&
+      message.error.trim()
+    ) {
+      pendingEditorSave = undefined;
+      pending.reject(new Error(message.error));
+    }
+    return;
+  }
+
+  if (message.type === CLEAR_DIRTY_TYPE) {
+    setDirtyState(false);
+    return;
+  }
+
+  if (message.type === RUN_ACTION_TYPE) {
+    if (
+      message.action !== ACTIONS.SAVE_DRAFT &&
+      message.action !== ACTIONS.SAVE_CORRECTION
+    ) {
+      return;
+    }
+
+    void runAction(
+      message.action,
+      typeof message.reason === "string" ? message.reason : ""
+    );
+    return;
+  }
+
+  handleCapabilityResponse(message);
+}
+
+function startBridge() {
+  if (!bridgeMessageListenerAttached) {
+    window.addEventListener("message", handleParentMessage);
+    bridgeMessageListenerAttached = true;
+  }
+
+  if (bridgeReadySent) {
+    return;
+  }
+
+  try {
+    postBridgeMessage({
+      source: BRIDGE_MESSAGE_SOURCE,
+      type: BRIDGE_READY_TYPE,
+    });
+    bridgeReadySent = true;
+  } catch (error) {
+    setStatus(
+      `Could not connect to editor host: ${errorMessage(error)}`,
+      "error"
+    );
+  }
+}
+
+function attachToolbarHandlers(actions) {
+  for (const action of actions) {
+    const buttonId = buttonIdForAction(action);
+
+    if (!buttonId) {
+      continue;
+    }
+
+    try {
+      window.Asc.plugin.attachToolbarMenuClickEvent(buttonId, () => {
+        void runAction(action);
+      });
+    } catch (error) {
+      setStatus(
+        `Could not attach ${actionLabel(action)}: ${errorMessage(error)}`,
+        "error"
+      );
+    }
   }
 }
 
@@ -3041,11 +3092,7 @@ function startInitializationTasks() {
   }
   initializationStarted = true;
   const tasks = [];
-  if (
-    (runtimeOptions.action === ACTIONS.FILL ||
-      runtimeOptions.action === ACTIONS.CORRECTION) &&
-    hasPrefillValues(runtimeOptions.prefill)
-  ) {
+  if (shouldApplyRuntimePrefill()) {
     window.setTimeout(() => {
       ensurePrefill()
         .then((result) => {
@@ -3128,40 +3175,6 @@ function startInitializationWhenReady() {
   window.setTimeout(startInitializationTasks, 3000);
 }
 
-function initializePlugin() {
-  if (pluginInitialized) {
-    return;
-  }
-
-  pluginInitialized = true;
-  runtimeOptions = normalizeRuntimeOptions();
-  exposeFormBridge();
-  startBridge();
-
-  if (runtimeOptions.action === ACTIONS.TEMPLATE_EDIT) {
-    setupFieldPanel();
-  } else {
-    hideFieldPanel();
-  }
-
-  const actions = toolbarActionsForMode(runtimeOptions.action);
-  if (actions.length) {
-    addToolbarMenuItems(actions);
-    attachToolbarHandlers(actions);
-  } else if (runtimeOptions.action === ACTIONS.CORRECTION) {
-    setStatus("พร้อมแก้ไขเฉพาะช่องกรอก", "success");
-  } else {
-    setStatus("ไม่พบการทำงานของฟอร์มที่รองรับ", "error");
-  }
-  if (runtimeOptions.action === ACTIONS.CORRECTION) {
-    restrictEditorToForms().catch((error) => {
-      setStatus(`จำกัดการแก้ไขเอกสารไม่สำเร็จ: ${errorMessage(error)}`, "error");
-    });
-  }
-
-  startInitializationWhenReady();
-}
-
 function exposeFormBridge() {
   const formBridge = Object.assign(window.FormBridge || {}, {
     applyPrefill,
@@ -3196,6 +3209,40 @@ function exposeFormBridge() {
   }
   window.FormBridge = formBridge;
 }
+function initializePlugin() {
+  if (pluginInitialized) {
+    return;
+  }
+
+  pluginInitialized = true;
+  runtimeOptions = normalizeRuntimeOptions();
+  exposeFormBridge();
+  startBridge();
+
+  if (runtimeOptions.action === ACTIONS.TEMPLATE_EDIT) {
+    setupFieldPanel();
+  } else {
+    hideFieldPanel();
+  }
+
+  const actions = toolbarActionsForMode(runtimeOptions.action);
+  if (actions.length) {
+    addToolbarMenuItems(actions);
+    attachToolbarHandlers(actions);
+  } else if (runtimeOptions.action === ACTIONS.CORRECTION) {
+    setStatus("พร้อมแก้ไขเฉพาะช่องกรอก", "success");
+  } else {
+    setStatus("ไม่พบการทำงานของฟอร์มที่รองรับ", "error");
+  }
+  if (runtimeOptions.action === ACTIONS.CORRECTION) {
+    restrictEditorToForms().catch((error) => {
+      setStatus(`จำกัดการแก้ไขเอกสารไม่สำเร็จ: ${errorMessage(error)}`, "error");
+    });
+  }
+
+  startInitializationWhenReady();
+}
+
 /**
  * ONLYOFFICE plugin entry point.
  *

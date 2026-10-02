@@ -148,9 +148,34 @@ The liveness endpoint `/health` is shallow. The readiness endpoint `/ready` stay
 
 ### Account administration
 
-Every Admin has the same account authority. Use `/admin/users` to search by normalized email, filter by role or enabled state, provision an account, correct its email, enable or disable access, change its role, or reset its password. Creation and reset show a generated temporary password only in that response; copy it before leaving the result. The final enabled Admin cannot be disabled or demoted. Legacy SSO email collisions create pending account-link requests without creating a Session. Admins can inspect the verified Legacy email, provider, subject, and candidate Folio account at `/admin/users`, then approve or reject the request. Approval applies only to a fresh Legacy SSO attempt; disabled and Admin accounts cannot be linked, and pending Users can still use their existing Folio password.
+Every Admin has the same account authority. Use `/admin/users` to search by normalized email, filter by role or enabled state, provision an account, correct its email, enable or disable access, change its role, or reset its password. Creation and reset show a generated temporary password only in that response; copy it before leaving the result. The final enabled Admin cannot be disabled or demoted.
+
+Legacy SSO email collisions create pending account-link requests without creating a Session. Admins inspect the authenticated PDMS account email, provider, subject, and candidate Folio account at `/admin/users`, then approve or reject the displayed review revision. PDMS does not verify mailbox ownership. Approval alone grants no access; only a fresh Legacy SSO transaction started after approval can complete the binding. Disabled and Admin accounts cannot be linked, and pending Users can still use their existing Folio password.
+
+Changed incomplete PDMS email or candidate evidence clears approval and requires current review. If no eligible matching candidate exists, the request stays visibly pending and cannot be approved or create a new User. A candidate's local email change invalidates pending and approved review even if that email is later restored. Rejected requests remain denied. Both Admin decisions are bound to the listed `reviewedGeneration` snapshot; stale decisions return `409 account_link_changed` and require reloading the request.
+
+A first-time PDMS identity with a free normalized email provisions an enabled ordinary User with `emailVerified: false`, `mustChangePassword: false`, and no local credential. The optional safe, trimmed PDMS name is used only at creation, with the normalized email as fallback. Subsequent SSO never changes the linked User's name, email, verification flag, credentials, or temporary-password requirement. A completed configured provider/subject mapping remains authoritative for its current enabled ordinary owner even when PDMS email changes or matches another Folio account. Historical review evidence cannot replace that owner. Transactions at or before a stored review-generation cutoff remain denied after linking; fresh mapped logins require neither email equality nor renewed approval.
 
 Each privileged account attempt appends an immutable Audit Event with its actor, target, action, outcome, and safe metadata. Passwords, hashes, tokens, and other credential material are excluded.
+
+### PDMS SSO configuration
+
+The existing Legacy SSO bridge consumes one explicitly configured PDMS service. Set all six existing keys on Folio's server:
+
+- `LEGACY_SSO_AUTHORIZE_URL`: the Portal origin followed by `/sso/folio/authorize`.
+- `LEGACY_SSO_EXCHANGE_URL`: the Auth origin followed by `/api/sso/folio/exchange`.
+- `LEGACY_SSO_CALLBACK_URL`: the exact public Folio API URI ending in `/api/legacy-sso/callback`.
+- `LEGACY_SSO_CLIENT_ID`: the dedicated Folio SSO client registered with PDMS Auth.
+- `LEGACY_SSO_CLIENT_SECRET`: that client's dedicated server-held secret, not `X_PDMS_AUTH_SECRET`.
+- `LEGACY_SSO_PROVIDER_ID`: the existing stable namespace for provider/subject bindings; never rename an established provider ID.
+
+The client ID, dedicated secret, and exact callback must match Auth's `FOLIO_SSO_*` registration. All six unset disables SSO and leaves local login available; partial or unsafe configuration fails fast. Configuration supplies the trusted provider and authenticated exchange authority, not browser input or an identity-response issuer. Use HTTPS outside localhost. Keep secrets server-side and uncommitted; exchange is server-to-server and needs no browser CORS access.
+
+Portal, Auth, Folio API callback, and Folio web origins are separate configuration boundaries. `CORS_ORIGIN` remains the trusted Folio web origin for success and failure redirects, not the Auth origin or API callback URI. Do not substitute request headers for this configured redirect origin.
+
+The configured exchange returns authenticated stored `email`, stable `sub`, truthful `email_verified: false`, and optional `name`. Folio requires boolean `email_verified` and accepts either value from that exchange; it does not assert mailbox verification. Invalid optional names do not reject an otherwise valid identity: nonstring, blank, raw Unicode-control-containing, or trimmed names longer than 120 UTF-16 units use the normalized email fallback.
+
+Live integration requires PDMS Auth's issue/exchange APIs and Portal's authorize page, including login recovery. Controlled Folio fixtures do not prove those counterpart features work.
 
 ### Legacy SSO account switching
 
@@ -237,7 +262,7 @@ The plugin extracts:
 - Dropdown and combo-box stored values.
 - Picture controls are deliberately omitted from scalar extraction; their embedded DOCX bytes are authoritative.
 
-The plugin applies prefill through ONLYOFFICE's command API, then restricts respondent sessions to form editing. The action flow temporarily switches the editor to view restriction while extracting and force-saving a draft or submission, then restores form editing.
+The plugin applies prefill through ONLYOFFICE's command API, then restricts respondent sessions to form editing. Save, Submit, Publish, and Correction actions temporarily use the supported `readOnly` restriction to prevent further edits. After extracting response values, the plugin requests `Api.Save()` and waits through the source/origin-pinned host bridge until ONLYOFFICE reports that changes reached its editing service. Only then does Folio start the force-save Operation; document/data persistence and Operation completion still precede successful navigation or SSO. Untouched documents do not require a dirty-to-clean transition. An editor error or unavailable synchronization fails the action without starting an Operation or clearing dirty work. The editor then restores form editing, or unrestricted editing for a Template Draft.
 
 ## Persistence and artifact storage
 
@@ -349,6 +374,11 @@ X-Editor-Capability: <signed-action-or-operation-capability>
 | `POST` | `/api/admin/users` | Provision an account and disclose its temporary password once |
 | `PATCH` | `/api/admin/users/:id` | Enable/disable or change one email/role value and revoke affected Sessions |
 | `POST` | `/api/admin/users/:id/password-reset` | Rotate the credential, revoke Sessions, and disclose a temporary password once |
+| `GET` | `/api/admin/account-links` | Cursor-page pending account links with current evidence and review-generation snapshots |
+| `POST` | `/api/admin/account-links/:id/approve` | Approve the displayed pending review revision; fresh SSO must complete the binding |
+| `POST` | `/api/admin/account-links/:id/reject` | Reject the displayed pending review revision |
+
+Each pending list entry includes `reviewedGeneration` as a decimal string or `null`. A pending request may carry an invalidation generation without claiming an Admin review. Both approve and reject require exactly one JSON field, copied from the displayed list entry: `{ "reviewedGeneration": null }` or `{ "reviewedGeneration": "123" }`. A non-null value must be a canonical positive decimal string, at most 19 digits and no greater than `9223372036854775807`; JSON numbers, leading zeros, missing fields, and extra fields are invalid. Invalid bodies return `400 invalid_request` after normal Admin authorization. A changed snapshot returns `409 account_link_changed` with `Account link request changed; reload and review it again`, without writing a decision. Reload and review current evidence before retrying either action. Successful decisions retain `{ "ok": true }`; approval itself creates no Session.
 
 ### Admin form operations
 
@@ -410,16 +440,22 @@ ONLYOFFICE is a desktop-oriented editor. The dashboard and administrative shell 
 ```text
 apps/
   onlyoffice-plugin/       ONLYOFFICE plugin manifest, UI, extraction, prefill, actions
+  prefill-mock/
+    src/mock.ts            Deterministic Prefill and Legacy SSO HTTP protocols
+    src/index.ts           Standalone mock service entrypoint
   server/
     src/app.ts             Elysia routes and asynchronous operation orchestration
+    src/ai-authoring.ts    Authoring reservations, sessions, expiry, and cleanup
+    src/document-worker.ts Python worker HTTP client
+    src/document-worker-server.ts Isolated document execution and container cleanup
     src/index.ts           Production listen entrypoint
     src/onlyoffice.ts      ONLYOFFICE URLs, HMAC tokens, force-save, PDF conversion
     src/storage.ts         Private RustFS object primitives
     Dockerfile             Production API image
   web/
     src/routes/            TanStack Router screens
-    src/components/        App shell, editor wrapper, UI primitives
-    src/lib/               API client and auth provider
+    src/components/        Form controls, editor bridge, revision history, app shell, UI
+    src/lib/               API client, auth provider, dirty/save lifecycle helpers
     Dockerfile             Production static web image
     sws.toml               Port 80, SPA fallback, no-cache, same-origin frame policy
     sws-assets.toml         Port 80, no SPA fallback, no-cache, same-origin frame policy
@@ -483,7 +519,7 @@ For the complete source suite, build the Prefill mock first and pass explicit so
 
 ```bash
 bun run --cwd apps/prefill-mock build
-bun test --timeout 120000 ./apps/server/test/http.test.ts ./apps/server/test/storage.test.ts ./apps/web/test/form-lifecycle.test.ts ./apps/onlyoffice-plugin/plugin.test.js
+bun test --timeout 120000 ./apps/server/test/http.test.ts ./apps/server/test/storage.test.ts ./apps/web/test/form-lifecycle.test.ts ./apps/onlyoffice-plugin/plugin.test.js ./apps/prefill-mock/test/mock.test.ts
 ```
 
 Provide the same isolated database and storage environment to both commands. Use a fresh disposable database for each full run; the scenarios retain records, including paginated account-link fixtures and immutable audit history. Set `DOCUMENT_WORKER_URL` to a running isolated document worker to exercise the Python-worker scenario.

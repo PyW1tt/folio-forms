@@ -28,18 +28,6 @@ export const env = createEnv({
 
     BOOTSTRAP_ADMIN_PASSWORD: z.string().min(12).max(128).optional(),
 
-    LEGACY_SSO_AUTHORIZE_URL: z.url().optional(),
-
-    LEGACY_SSO_CALLBACK_URL: z.url().optional(),
-
-    LEGACY_SSO_CLIENT_ID: z.string().trim().min(1).optional(),
-
-    LEGACY_SSO_CLIENT_SECRET: z.string().min(32).optional(),
-
-    LEGACY_SSO_EXCHANGE_URL: z.url().optional(),
-
-    LEGACY_SSO_PROVIDER_ID: z.string().trim().min(1).max(128).optional(),
-
     CONVERTER_MAX_RETRIES: z.coerce.number().int().nonnegative().default(3),
 
     CONVERTER_POLL_INTERVAL_MS: z.coerce
@@ -55,6 +43,18 @@ export const env = createEnv({
     DATABASE_URL: z.url().default(localDatabaseUrl),
 
     EDITOR_CAPABILITY_SECRET: z.string().min(32),
+
+    LEGACY_SSO_AUTHORIZE_URL: z.url().optional(),
+
+    LEGACY_SSO_CALLBACK_URL: z.url().optional(),
+
+    LEGACY_SSO_CLIENT_ID: z.string().trim().min(1).optional(),
+
+    LEGACY_SSO_CLIENT_SECRET: z.string().min(32).optional(),
+
+    LEGACY_SSO_EXCHANGE_URL: z.url().optional(),
+
+    LEGACY_SSO_PROVIDER_ID: z.string().trim().min(1).max(128).optional(),
 
     NODE_ENV: z
       .enum(["development", "production", "test"])
