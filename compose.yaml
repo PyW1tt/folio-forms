@@ -28,7 +28,14 @@ services:
     expose:
       - "9000"
     healthcheck:
-      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:9000/health/ready"]
+      test:
+        [
+          "CMD",
+          "curl",
+          "--fail",
+          "--silent",
+          "http://localhost:9000/health/ready",
+        ]
       interval: 5s
       timeout: 5s
       retries: 12

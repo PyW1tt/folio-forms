@@ -3,11 +3,11 @@
   "type": "module",
   "main": "src/index.ts",
   "scripts": {
-    "build": "tsdown",
+    "build": "bun ../onlyoffice-plugin/build.ts && tsdown",
     "dev": "bun --watch src/index.ts",
     "check-types": "tsc -b",
     "compile": "bun build --compile --minify --sourcemap --bytecode ./src/index.ts --outfile server",
-    "test:http": "test -n \"$DATABASE_URL\" || (echo 'DATABASE_URL must point to an isolated PostgreSQL database' >&2; exit 1); bun run --cwd ../prefill-mock build && bun test --timeout 120000 test/http.test.ts",
+    "test:http": "test -n \"$DATABASE_URL\" || (echo 'DATABASE_URL must point to an isolated PostgreSQL database' >&2; exit 1); bun run --cwd ../prefill-mock build && for suite in test/http/callback.test.ts test/http/legacy-provisioning.test.ts test/http/legacy-review.test.ts test/http/legacy-session.test.ts test/http/native-scalar.test.ts test/http/admin-user-workflow.test.ts test/http/native-picture.test.ts test/http/authoring-cleanup.test.ts test/http/authoring-docx.test.ts test/http/authoring-pdf.test.ts test/http/authoring-worker.test.ts; do bun test --timeout 120000 \"$suite\" || exit $?; done",
     "test:storage": "bun test --timeout 120000 test/storage.test.ts"
   },
   "dependencies": {

@@ -1,251 +1,27 @@
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 
-import { Button, Notice, Spinner } from "@/components/ui";
-import { ApiError, API_ORIGIN, apiDelete, apiGet, apiPost } from "@/lib/api";
-
-type EditorAction =
-  | "save-template"
-  | "publish"
-  | "save-draft"
-  | "save-correction"
-  | "submit"
-  | "configure-fields";
-type EditorOperationAction = Exclude<EditorAction, "configure-fields">;
-type FieldControlType =
-  | "text"
-  | "checkbox"
-  | "date"
-  | "dropdown"
-  | "combo"
-  | "picture"
-  | "unsupported";
-type EditorOperationStatus = "pending" | "completed" | "failed";
-export type OnlyOfficeEditorState = "loading" | "ready" | "blocked" | "error";
-
-interface EditorLease {
-  id: string;
-  expiresAt: string;
-  releaseUrl: string;
-  renewUrl: string;
-}
-
-const leaseRenewalIntervalMs = 30_000;
-
-const editorConfigPath = (configUrl: string): string =>
-  configUrl.startsWith("http") ? configUrl.replace(API_ORIGIN, "") : configUrl;
-
-interface EditorConfig {
-  apiScriptUrl?: string;
-  apiUrl?: string;
-  bridge?: {
-    capabilities?: Partial<Record<EditorAction, string>>;
-    id?: string;
-    lease?: EditorLease;
-    pluginOrigin?: string;
-  };
-  config?: Record<string, unknown>;
-  editorUrl?: string;
-  [key: string]: unknown;
-}
-
-interface DirtyStateBridgeMessage {
-  bridgeId: string;
-  dirty: boolean;
-  source: "form-bridge";
-  type: "dirty-state";
-}
-interface BridgeReadyMessage {
-  bridgeId: string;
-  source: "form-bridge";
-  type: "bridge-ready";
-}
-
-interface CapabilityRequestMessage {
-  action: EditorAction;
-  bridgeId: string;
-  requestId: string;
-  source: "form-bridge";
-  type: "capability-request";
-}
-interface FieldSelectionBridgeMessage {
-  bridgeId: string;
-  controlType: FieldControlType;
-  selectionId: string;
-  selected: boolean;
-  source: "form-bridge";
-  tag: string | null;
-  type: "field-selection";
-}
-
-const isRecord = (value: unknown): value is Record<string, unknown> =>
-  value !== null && typeof value === "object" && !Array.isArray(value);
-const recordOrEmpty = (value: unknown): Record<string, unknown> =>
-  isRecord(value) ? value : {};
-
-const isNonEmptyString = (value: unknown): value is string =>
-  typeof value === "string" && value.length > 0;
-const isEditorOperationAction = (
-  value: unknown
-): value is EditorOperationAction =>
-  value === "save-template" ||
-  value === "publish" ||
-  value === "save-draft" ||
-  value === "save-correction" ||
-  value === "submit";
-const isEditorAction = (value: unknown): value is EditorAction =>
-  value === "configure-fields" || isEditorOperationAction(value);
-const isFieldControlType = (value: unknown): value is FieldControlType =>
-  value === "text" ||
-  value === "checkbox" ||
-  value === "date" ||
-  value === "dropdown" ||
-  value === "combo" ||
-  value === "picture" ||
-  value === "unsupported";
-
-const isOperationStatus = (value: unknown): value is EditorOperationStatus =>
-  value === "pending" || value === "completed" || value === "failed";
-
-const isBridgeReadyMessage = (
-  value: unknown,
-  bridgeId: string
-): value is BridgeReadyMessage =>
-  isRecord(value) &&
-  value.bridgeId === bridgeId &&
-  value.source === "form-bridge" &&
-  value.type === "bridge-ready";
-
-const parseDirtyStateMessage = (
-  value: unknown,
-  bridgeId: string
-): DirtyStateBridgeMessage | null =>
-  isRecord(value) &&
-  value.bridgeId === bridgeId &&
-  typeof value.dirty === "boolean" &&
-  value.source === "form-bridge" &&
-  value.type === "dirty-state"
-    ? (value as unknown as DirtyStateBridgeMessage)
-    : null;
-
-const parseCapabilityRequest = (
-  value: unknown,
-  bridgeId: string
-): CapabilityRequestMessage | null => {
-  if (
-    !isRecord(value) ||
-    value.bridgeId !== bridgeId ||
-    value.source !== "form-bridge" ||
-    value.type !== "capability-request" ||
-    typeof value.action !== "string" ||
-    !isEditorAction(value.action) ||
-    typeof value.requestId !== "string" ||
-    !value.requestId
-  ) {
-    return null;
-  }
-
-  return value as unknown as CapabilityRequestMessage;
-};
-
-const parseFieldSelectionMessage = (
-  value: unknown,
-  bridgeId: string
-): FieldSelectionBridgeMessage | null => {
-  if (
-    !isRecord(value) ||
-    value.bridgeId !== bridgeId ||
-    value.source !== "form-bridge" ||
-    value.type !== "field-selection" ||
-    !isNonEmptyString(value.selectionId) ||
-    typeof value.selected !== "boolean" ||
-    (value.tag !== null && typeof value.tag !== "string") ||
-    !isFieldControlType(value.controlType)
-  ) {
-    return null;
-  }
-
-  return value as unknown as FieldSelectionBridgeMessage;
-};
-
-const parseOperationMessage = (
-  value: unknown,
-  bridgeId: string
-): EditorOperationBridgeMessage | null => {
-  if (
-    !isRecord(value) ||
-    value.bridgeId !== bridgeId ||
-    value.source !== "form-bridge" ||
-    value.type !== "operation" ||
-    typeof value.action !== "string" ||
-    !isEditorOperationAction(value.action) ||
-    !isOperationStatus(value.status) ||
-    (value.operationId !== undefined && !isNonEmptyString(value.operationId)) ||
-    (value.status !== "failed" && !isNonEmptyString(value.operationId)) ||
-    (value.error !== undefined && typeof value.error !== "string")
-  ) {
-    return null;
-  }
-
-  if (value.operation !== undefined) {
-    if (!isRecord(value.operation)) {
-      return null;
-    }
-    if (value.operation.result !== undefined) {
-      if (!isRecord(value.operation.result)) {
-        return null;
-      }
-      if (
-        value.operation.result.submissionId !== undefined &&
-        typeof value.operation.result.submissionId !== "string"
-      ) {
-        return null;
-      }
-    }
-  }
-
-  return value as unknown as EditorOperationBridgeMessage;
-};
-
-interface EditorOperationBridgeMessage {
-  action: EditorOperationAction;
-  bridgeId: string;
-  error?: string;
-  operation?: {
-    result?: {
-      submissionId?: string;
-    };
-  };
-  operationId?: string;
-  source: "form-bridge";
-  status: EditorOperationStatus;
-  type: "operation";
-}
-
-export type EditorBridgeMessage =
-  | DirtyStateBridgeMessage
-  | EditorOperationBridgeMessage
-  | FieldSelectionBridgeMessage;
-
-const acknowledgeBridge = (
-  source: MessageEventSource,
-  pluginOrigin: string,
-  bridgeId: string,
-  editorSaveSupported: boolean
-) => {
-  try {
-    (source as Window).postMessage(
-      {
-        bridgeId,
-        editorSaveSupported,
-        source: "folio-parent",
-        type: "bridge-ack",
-      },
-      pluginOrigin
-    );
-  } catch {
-    // The plugin may close its frame while the handshake is in flight.
-  }
-};
+import {
+  acknowledgeBridge,
+  editorConfigPath,
+  isBridgeReadyMessage,
+  isNonEmptyString,
+  isRecord,
+  leaseRenewalIntervalMs,
+  parseCapabilityRequest,
+  parseDirtyStateMessage,
+  parseFieldSelectionMessage,
+  parseOperationMessage,
+  recordOrEmpty,
+} from "@/features/onlyoffice/editor-protocol";
+import type {
+  CapabilityRequestMessage,
+  EditorBridgeMessage,
+  EditorConfig,
+  EditorLease,
+  OnlyOfficeEditorState,
+} from "@/features/onlyoffice/editor-protocol";
+import { EditorSurface } from "@/features/onlyoffice/editor-surface";
+import { ApiError, apiDelete, apiGet, apiPost } from "@/lib/api";
 
 interface DocsApi {
   DocEditor: new (
@@ -352,81 +128,6 @@ export const OnlyOfficeEditor = ({
       feedbackRef.current?.focus();
     }
   }, [editorState]);
-  useEffect(() => {
-    const surface = surfaceRef.current;
-    if (!expanded || !surface) {
-      return;
-    }
-
-    const obscured: HTMLElement[] = [];
-    const focusableAncestors: [HTMLElement, string | null][] = [];
-    const branches = new Map<HTMLElement, HTMLElement>();
-    const hideSibling = (sibling: Element, activeBranch: HTMLElement) => {
-      if (
-        sibling instanceof HTMLElement &&
-        sibling !== activeBranch &&
-        !sibling.inert
-      ) {
-        sibling.inert = true;
-        obscured.push(sibling);
-      }
-    };
-    let branch: HTMLElement = surface;
-    while (branch.parentElement) {
-      const parent = branch.parentElement;
-      branches.set(parent, branch);
-      for (const sibling of parent.children) {
-        hideSibling(sibling, branch);
-      }
-      branch = parent;
-      if (parent.tabIndex >= 0) {
-        focusableAncestors.push([parent, parent.getAttribute("tabindex")]);
-        parent.tabIndex = -1;
-      }
-    }
-    const observer = new MutationObserver((records) => {
-      for (const record of records) {
-        const activeBranch =
-          record.target instanceof HTMLElement
-            ? branches.get(record.target)
-            : undefined;
-        if (!activeBranch) {
-          continue;
-        }
-        for (const sibling of record.addedNodes) {
-          if (sibling instanceof Element) {
-            hideSibling(sibling, activeBranch);
-          }
-        }
-      }
-    });
-    for (const parent of branches.keys()) {
-      observer.observe(parent, { childList: true });
-    }
-
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        event.preventDefault();
-        restore();
-      }
-    };
-
-    window.addEventListener("keydown", handleKeyDown);
-    return () => {
-      window.removeEventListener("keydown", handleKeyDown);
-      observer.disconnect();
-      for (const sibling of obscured) {
-        sibling.inert = false;
-      }
-      for (const [ancestor, tabIndex] of focusableAncestors) {
-        if (tabIndex === null) {
-          ancestor.removeAttribute("tabindex");
-        } else {
-          ancestor.setAttribute("tabindex", tabIndex);
-        }
-      }
-    };
-  }, [expanded, restore]);
 
   useEffect(() => {
     const lease =
@@ -910,118 +611,21 @@ export const OnlyOfficeEditor = ({
     setRetryToken((value) => value + 1);
   };
 
-  const renderEditorContent = () => {
-    const blocked = editorState === "blocked";
-    if (blocked || editorState === "error" || error) {
-      return (
-        <div
-          ref={feedbackRef}
-          className={`grid ${
-            expanded ? "h-full min-h-0" : "min-h-[520px]"
-          } place-items-center p-8`}
-          tabIndex={-1}
-        >
-          <Notice tone="danger">
-            <div className="space-y-3">
-              {blocked ? (
-                <>
-                  <p className="font-semibold">เอกสารนี้กำลังถูกแก้ไขโดยผู้ใช้รายอื่น</p>
-                  <p>ยังไม่เปิดตัวแก้ไขจนกว่าจะเชื่อมต่อใหม่ได้</p>
-                </>
-              ) : (
-                <p>{error ?? "ไม่สามารถเปิดตัวแก้ไขเอกสารได้"}</p>
-              )}
-              <Button type="button" variant="secondary" onClick={retry}>
-                {blocked ? "ลองเชื่อมต่อใหม่" : "ลองใหม่"}
-              </Button>
-            </div>
-          </Notice>
-        </div>
-      );
-    }
-
-    if (!config) {
-      return (
-        <div
-          className={`grid ${
-            expanded ? "h-full min-h-0" : "min-h-[520px]"
-          } place-items-center gap-3 p-8 text-center`}
-          aria-busy="true"
-          role="status"
-        >
-          <Spinner />
-          <p className="text-sm text-[var(--ink-soft)]">
-            กำลังเตรียมตัวแก้ไขเอกสาร…
-          </p>
-        </div>
-      );
-    }
-
-    if (config.editorUrl) {
-      return (
-        <iframe
-          title={title}
-          src={config.editorUrl}
-          className={
-            expanded
-              ? "h-full min-h-0 w-full border-0"
-              : "h-[min(72vh,760px)] min-h-[520px] w-full border-0"
-          }
-        />
-      );
-    }
-
-    return (
-      <div
-        className={
-          expanded
-            ? "h-full min-h-0 w-full"
-            : "h-[min(72vh,760px)] min-h-[520px] w-full"
-        }
-      >
-        <div ref={hostRef} className="h-full w-full" aria-label={title} />
-      </div>
-    );
-  };
-
   return (
-    <div
-      aria-label={expanded ? title : undefined}
-      aria-describedby={expanded ? keyboardHelpId : undefined}
-      aria-modal={expanded ? true : undefined}
-      ref={surfaceRef}
-      role={expanded ? "dialog" : undefined}
-      className={
-        expanded
-          ? "fixed inset-0 z-[100] flex min-h-0 flex-col overflow-hidden overscroll-none bg-[var(--canvas)] p-3 sm:p-4"
-          : "relative"
-      }
-    >
-      <div className="flex shrink-0 flex-wrap items-center justify-end gap-2 pb-2">
-        {expanded && (
-          <p
-            className="mr-auto text-sm text-[var(--ink-soft)]"
-            id={keyboardHelpId}
-          >
-            คืนขนาดจากในเอกสารด้วยแป้นพิมพ์: กด Alt/Option แล้ว F และเลือก
-            “คืนค่าขนาดปกติ” ตามคำใบ้ของ ONLYOFFICE
-          </p>
-        )}
-        <Button
-          aria-controls={surfaceId}
-          aria-expanded={expanded}
-          className="focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--ink)]"
-          onClick={() => setExpanded((value) => !value)}
-          size="sm"
-          type="button"
-          variant="secondary"
-        >
-          {expanded ? "คืนค่าขนาดปกติ" : "ขยายพื้นที่เอกสาร"}
-        </Button>
-      </div>
-      <div className={expanded ? "min-h-0 flex-1" : undefined} id={surfaceId}>
-        {renderEditorContent()}
-      </div>
-    </div>
+    <EditorSurface
+      config={config}
+      editorState={editorState}
+      error={error}
+      title={title}
+      expanded={expanded}
+      hostRef={hostRef}
+      surfaceRef={surfaceRef}
+      feedbackRef={feedbackRef}
+      surfaceId={surfaceId}
+      keyboardHelpId={keyboardHelpId}
+      onRetry={retry}
+      onToggleExpanded={() => setExpanded((value) => !value)}
+      onRestore={restore}
+    />
   );
 };

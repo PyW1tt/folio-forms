@@ -33,6 +33,7 @@ An Admin-selected Form setting that routes all current and new Responses through
 An Admin's temporary workspace for creating or editing a Form from a PDF or chat description. It contains an iterative conversation and a generated DOCX that the Admin can preview and download.
 
 ## OmniRoute
+
 The external model gateway used by AI Authoring Sessions. Folio calls it server-side; the upstream provider and model are configured in OmniRoute.
 
 ## Template Draft
@@ -44,8 +45,8 @@ The editable document an Admin is currently preparing. Saving it does not change
 The current document used to start new Responses. Publishing replaces the previous Published Template and invalidates every unsubmitted Draft for that Form. Published Templates have no user-visible history.
 
 ## Field
-A tagged content control in a Form. Its Title/Alias is the user-facing label; its Tag is the stable identity in prefill and extracted data; its Placeholder guides entry.
-If the Title/Alias is blank, use the Tag as the label. Field tags must be present and unique within a Form.
+
+A tagged content control in a Form. Its Title/Alias is the user-facing label; its Tag is the stable identity in prefill and extracted data; its Placeholder guides entry. If the Title/Alias is blank, use the Tag as the label. Field tags must be present and unique within a Form.
 
 ## Response
 
@@ -60,8 +61,8 @@ A manually saved, resumable Response state containing both the current document 
 The immutable completed result of a Response. A Submission consists of extracted field data, a filled DOCX, and a PDF. It exists only when all three artifacts were persisted successfully.
 
 ## Correction
-An Admin-authored revision to a submitted Response. It records changed Field values, a reason, and a revised document while preserving the original Submission.
 
+An Admin-authored revision to a submitted Response. It records changed Field values, a reason, and a revised document while preserving the original Submission.
 
 ## Operation
 

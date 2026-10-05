@@ -19,19 +19,13 @@ import {
 import type { FormEvent } from "react";
 import { useEffect, useRef, useState } from "react";
 
+import { OnlyOfficeEditor } from "@/components/onlyoffice-editor";
+import { Badge, Button, Notice, Spinner } from "@/components/ui";
+import { FormMetadataPanel } from "@/features/admin-forms/form-metadata-panel";
 import type {
   EditorBridgeMessage,
   OnlyOfficeEditorState,
-} from "@/components/onlyoffice-editor";
-import { OnlyOfficeEditor } from "@/components/onlyoffice-editor";
-import {
-  Badge,
-  Button,
-  Input,
-  Notice,
-  Spinner,
-  Textarea,
-} from "@/components/ui";
+} from "@/features/onlyoffice/editor-protocol";
 import {
   ApiError,
   apiGet,
@@ -717,116 +711,20 @@ const FormEditorRoute = () => {
             : "แบบฟอร์มนี้เผยแพร่แล้ว สัญญาเอกสารและการตั้งค่า Field ไม่สามารถแก้ไขในที่เดิมได้ หากต้องการเปลี่ยนโครงสร้างให้สร้าง Form ใหม่"}
         </Notice>
       )}
-      <section
-        className="mb-4 rounded-[var(--radius)] border border-[var(--line)] bg-[var(--paper)] p-5"
-        aria-labelledby="metadata-title"
-      >
-        <div className="max-w-2xl">
-          <h2 id="metadata-title" className="text-lg font-semibold">
-            ข้อมูลแบบฟอร์ม
-          </h2>
-          <p className="mt-1 text-sm text-[var(--ink-soft)]">
-            แก้ไขชื่อและคำอธิบายได้ทั้งแบบร่างและแบบฟอร์มที่เผยแพร่แล้ว
-          </p>
-          <form
-            className="mt-4 space-y-4"
-            onSubmit={updateMetadata}
-            aria-busy={metadataBusy === "save"}
-          >
-            <div className="space-y-2">
-              <label className="text-sm font-semibold" htmlFor="form-title">
-                ชื่อแบบฟอร์ม
-              </label>
-              <Input
-                id="form-title"
-                name="title"
-                value={title}
-                onChange={(event) => setTitle(event.target.value)}
-                maxLength={200}
-                required
-                aria-describedby="form-title-help"
-                disabled={!metadataCanAct}
-              />
-              <p
-                id="form-title-help"
-                className="text-xs text-[var(--ink-soft)]"
-              >
-                ต้องระบุชื่อ ความยาวไม่เกิน 200 ตัวอักษร
-              </p>
-            </div>
-            <div className="space-y-2">
-              <label
-                className="text-sm font-semibold"
-                htmlFor="form-description"
-              >
-                คำอธิบาย
-              </label>
-              <Textarea
-                id="form-description"
-                name="description"
-                value={description}
-                onChange={(event) => setDescription(event.target.value)}
-                maxLength={2000}
-                rows={4}
-                aria-describedby="form-description-help"
-                disabled={!metadataCanAct}
-              />
-              <p
-                id="form-description-help"
-                className="text-xs text-[var(--ink-soft)]"
-              >
-                ใส่คำอธิบายเพิ่มเติมได้ไม่เกิน 2,000 ตัวอักษร
-              </p>
-            </div>
-            <div className="flex justify-end">
-              <Button type="submit" disabled={!metadataCanAct}>
-                {metadataBusy === "save" ? <Spinner /> : <Save size={15} />}
-                {metadataBusy === "save" ? "กำลังบันทึกข้อมูล…" : "บันทึกข้อมูลแบบฟอร์ม"}
-              </Button>
-            </div>
-          </form>
-          <div
-            className="mt-5 space-y-2"
-            aria-busy={metadataBusy === "fill-method"}
-          >
-            <label className="text-sm font-semibold" htmlFor="form-fill-method">
-              Fill Method
-            </label>
-            <select
-              className="min-h-11 w-full rounded-[10px] border border-[var(--line-strong)] bg-[var(--paper)] px-3 text-[var(--ink)] shadow-sm focus:border-[var(--ink)] focus:outline-none"
-              disabled={!metadataCanAct || loadedForm.status === "draft"}
-              id="form-fill-method"
-              onChange={(event) => {
-                const { value } = event.target;
-                if (value === "native" || value === "onlyoffice") {
-                  void updateFillMethod(value);
-                }
-              }}
-              value={loadedForm.fillMethod}
-            >
-              <option value="onlyoffice">ONLYOFFICE</option>
-              <option disabled={!loadedForm.nativeFillAvailable} value="native">
-                Native form
-              </option>
-            </select>
-            <p
-              className="text-xs text-[var(--ink-soft)]"
-              id="form-fill-method-help"
-            >
-              {fillMethodHelp}
-            </p>
-            {metadataBusy === "fill-method" ? (
-              <p
-                className="inline-flex items-center gap-2 text-xs"
-                role="status"
-              >
-                <Spinner />
-                Updating Fill Method…
-              </p>
-            ) : null}
-          </div>
-        </div>
-      </section>
+      <FormMetadataPanel
+        title={title}
+        description={description}
+        metadataBusy={metadataBusy}
+        metadataCanAct={metadataCanAct}
+        fillMethod={loadedForm.fillMethod}
+        status={loadedForm.status}
+        nativeFillAvailable={loadedForm.nativeFillAvailable === true}
+        fillMethodHelp={fillMethodHelp}
+        setTitle={setTitle}
+        setDescription={setDescription}
+        updateMetadata={updateMetadata}
+        updateFillMethod={updateFillMethod}
+      />
       <div className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-[var(--radius)] border border-[var(--line)] bg-[var(--paper)] p-4">
         <div className="flex min-w-0 items-center gap-3">
           <Globe2 className="shrink-0 text-[var(--success)]" size={18} />

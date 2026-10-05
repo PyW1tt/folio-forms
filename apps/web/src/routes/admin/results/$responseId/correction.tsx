@@ -9,8 +9,8 @@ import { useEffect, useRef, useState } from "react";
 
 import { PageHeader } from "@/components/app-shell";
 import { OnlyOfficeEditor } from "@/components/onlyoffice-editor";
-import type { EditorBridgeMessage } from "@/components/onlyoffice-editor";
 import { Button, Card, Input, Notice } from "@/components/ui";
+import type { EditorBridgeMessage } from "@/features/onlyoffice/editor-protocol";
 
 const AdminCorrectionRoute = () => {
   const navigate = useNavigate();

@@ -12,11 +12,10 @@ dcup-build:
 dcdown:
   docker compose --env-file .env -f compose.yaml down
 
-
 dev:
   docker compose --env-file .env -p folio-forms-dev -f compose.yaml -f compose.dev.yaml up -d --wait postgres rustfs onlyoffice dev-gateway
   docker compose --env-file .env -p folio-forms-dev -f compose.yaml -f compose.dev.yaml up --no-recreate rustfs-init
-  bun --env-file apps/server/.env run --cwd packages/db db:migrate
+  bun run --cwd packages/db --env-file ../../apps/server/.env db:migrate
   bun run dev
 
 dev-down:
