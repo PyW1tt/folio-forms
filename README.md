@@ -439,21 +439,31 @@ ONLYOFFICE is a desktop-oriented editor. The dashboard and administrative shell 
 
 ```text
 apps/
-  onlyoffice-plugin/       ONLYOFFICE plugin manifest, UI, extraction, prefill, actions
+  onlyoffice-plugin/
+    src/                   Plugin factories, bridge, fields, prefill, standalone Office commands
+    build.ts               Build the classic IIFE with the shared server bundler helper
+    dist/plugin.js         Generated deployment script
   prefill-mock/
     src/mock.ts            Deterministic Prefill and Legacy SSO HTTP protocols
     src/index.ts           Standalone mock service entrypoint
   server/
-    src/app.ts             Elysia routes and asynchronous operation orchestration
+    src/app.ts             Per-app configuration, hooks, and ordered route composition
+    src/routes/            HTTP registrars with scoped per-app dependencies
     src/ai-authoring.ts    Authoring reservations, sessions, expiry, and cleanup
+    src/ai-authoring/      Document generation, agent orchestration, shared types
+    src/documents/         DOCX package, field, picture, and native-rendering algorithms
     src/document-worker.ts Python worker HTTP client
     src/document-worker-server.ts Isolated document execution and container cleanup
     src/index.ts           Production listen entrypoint
     src/onlyoffice.ts      ONLYOFFICE URLs, HMAC tokens, force-save, PDF conversion
     src/storage.ts         Private RustFS object primitives
     Dockerfile             Production API image
+    test/http/             Eleven serial HTTP suites
+    test/fixtures/         Explicit app dependencies and caller-owned mock cleanup
+    test/scenarios/        Typed steps within the original Admin and native journeys
   web/
     src/routes/            TanStack Router screens
+    src/features/          Editor protocol/surface and feature-specific UI/helpers
     src/components/        Form controls, editor bridge, revision history, app shell, UI
     src/lib/               API client, auth provider, dirty/save lifecycle helpers
     Dockerfile             Production static web image
@@ -482,7 +492,7 @@ bun install
 Database:
 
 ```bash
-bun run --cwd apps/server db:migrate
+bun run --cwd packages/db --env-file ../../apps/server/.env db:migrate
 bun run --cwd packages/db db:generate
 ```
 
@@ -494,14 +504,18 @@ bun run --cwd apps/server dev
 bun run --cwd apps/web dev
 ```
 
+For local development, `just dev` starts the dependencies and applies migrations before starting the API. Direct `bun run dev` assumes the database is already migrated. The migration command above uses `apps/server/.env` to target the same local database as the API, not the Docker-only database URL in the root `.env`.
+
 Quality:
 
 ```bash
-bun x ultracite fix
-bun x ultracite check
+bun run fix
+bun run check
 bun run check-types
 bun run build
 ```
+
+ONLYOFFICE source lives in `apps/onlyoffice-plugin/src/`. The server build runs `bun ../onlyoffice-plugin/build.ts` before `tsdown` and writes `apps/onlyoffice-plugin/dist/plugin.js`. Development requests to `/onlyoffice-plugin/plugin.js` build the IIFE in memory; production serves the generated artifact at the same URL. The iframe loads the SDK first, then the synchronous classic script. `server#build` bypasses Turbo caching so every root build regenerates the sibling plugin artifact; other tasks retain their existing caching.
 
 Docker:
 
@@ -515,11 +529,12 @@ docker compose --env-file .env.production -f compose.yaml down
 
 Run `bun run --cwd apps/server test:http` and `bun run --cwd apps/server test:storage` against an isolated PostgreSQL database and disposable private RustFS bucket.
 
-For the complete source suite, build the Prefill mock first and pass explicit source paths so generated `dist` tests are not included:
+For the complete source suite, use the HTTP script to build the Prefill mock once and run all eleven HTTP suites serially. Keep the remaining source paths explicit so generated `dist` tests are not included:
 
 ```bash
-bun run --cwd apps/prefill-mock build
-bun test --timeout 120000 ./apps/server/test/http.test.ts ./apps/server/test/storage.test.ts ./apps/web/test/form-lifecycle.test.ts ./apps/onlyoffice-plugin/plugin.test.js ./apps/prefill-mock/test/mock.test.ts
+bun run --cwd apps/server test:http
+bun run --cwd apps/server test:storage
+bun test --timeout 120000 ./apps/web/test/form-lifecycle.test.ts ./apps/onlyoffice-plugin/test/save-lifecycle.test.js ./apps/onlyoffice-plugin/test/prefill-values.test.js ./apps/onlyoffice-plugin/test/bridge-capabilities.test.js ./apps/onlyoffice-plugin/test/field-config.test.js ./apps/onlyoffice-plugin/test/control-mapping.test.js ./apps/prefill-mock/test/mock.test.ts
 ```
 
 Provide the same isolated database and storage environment to both commands. Use a fresh disposable database for each full run; the scenarios retain records, including paginated account-link fixtures and immutable audit history. Set `DOCUMENT_WORKER_URL` to a running isolated document worker to exercise the Python-worker scenario.

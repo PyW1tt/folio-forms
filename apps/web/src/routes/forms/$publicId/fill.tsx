@@ -12,19 +12,26 @@ import { useEffect, useRef, useState } from "react";
 
 import { LegacySsoSwitchButton } from "@/components/legacy-sso-switch-button";
 import { NativeForm } from "@/components/native-form";
-import type { NativeFormField } from "@/components/native-form";
 import { OnlyOfficeEditor } from "@/components/onlyoffice-editor";
-import type { EditorBridgeMessage } from "@/components/onlyoffice-editor";
 import { Button, Notice, Spinner } from "@/components/ui";
+import {
+  downloadDraftArtifact,
+  draftSaveSuccessMessage,
+  nativeSaveErrorMessage,
+  nativeValuesFromConfig,
+  submitNativeResponse,
+} from "@/features/forms/native-response";
+import type {
+  ExportFormat,
+  NativeEditorConfig,
+} from "@/features/forms/native-response";
+import type { EditorBridgeMessage } from "@/features/onlyoffice/editor-protocol";
 import {
   ApiError,
   apiDelete,
   apiGet,
   apiPost,
-  apiPostFormData,
-  downloadArtifact,
   safeReturnPath,
-  waitForOperation,
 } from "@/lib/api";
 import type { FillMethod, Operation } from "@/lib/api";
 import { roleFor, useAuth } from "@/lib/auth";
@@ -76,7 +83,6 @@ interface ReauthenticationRequest {
   handled: boolean;
   resolve: (allowed: boolean) => void;
 }
-type ExportFormat = "docx" | "pdf";
 class DraftSaveError extends Error {
   constructor() {
     super("Draft save failed");
@@ -90,82 +96,6 @@ interface PublicForm {
   fillMethod: FillMethod;
 }
 
-interface NativeEditorConfig {
-  capabilities: Record<"save-draft" | "submit", string>;
-  data: Record<string, unknown>;
-  documentKey: string;
-  fields: NativeFormField[];
-  fillMethod: "native";
-  lockedFields: Record<string, boolean>;
-  pictures: Record<string, boolean>;
-  responseId: string;
-}
-
-const nativeValuesFromConfig = (
-  config: NativeEditorConfig
-): Record<string, unknown> => {
-  const values: Record<string, unknown> = {};
-  for (const field of config.fields) {
-    const value = config.data[field.tag];
-    switch (field.type) {
-      case "checkbox": {
-        values[field.tag] = value === true;
-        break;
-      }
-      case "combo":
-      case "dropdown": {
-        values[field.tag] = typeof value === "string" ? value : null;
-        break;
-      }
-      case "picture": {
-        values[field.tag] = "";
-        break;
-      }
-      default: {
-        values[field.tag] = typeof value === "string" ? value : "";
-      }
-    }
-  }
-  return values;
-};
-
-const draftSaveSuccessMessage = (
-  exportFormat: ExportFormat | null | undefined
-): string => {
-  if (exportFormat === "docx") {
-    return "บันทึกและดาวน์โหลด DOCX แล้ว";
-  }
-  if (exportFormat === "pdf") {
-    return "บันทึกและดาวน์โหลด PDF แล้ว";
-  }
-  return "บันทึกฉบับร่างคำตอบแล้ว";
-};
-
-const nativeSaveErrorMessage = (
-  action: "save-draft" | "submit",
-  saved: boolean,
-  exportFormat: ExportFormat | null | undefined
-): string => {
-  if (action === "submit") {
-    return "ส่งแบบฟอร์มไม่สำเร็จ กรุณาลองใหม่";
-  }
-  if (!saved) {
-    return "บันทึกฉบับร่างไม่สำเร็จ กรุณาลองใหม่";
-  }
-  if (exportFormat) {
-    return "บันทึกแล้ว แต่ดาวน์โหลดไฟล์ไม่สำเร็จ กรุณาลองใหม่";
-  }
-  return "บันทึกแล้ว แต่โหลดคำตอบล่าสุดไม่สำเร็จ กรุณาโหลดแบบฟอร์มใหม่";
-};
-
-const downloadDraftArtifact = (
-  responseId: string,
-  format: ExportFormat
-): Promise<void> =>
-  downloadArtifact(
-    `/api/responses/${responseId}/draft/${format}`,
-    `response-${responseId}.${format}`
-  );
 // oxlint-disable-next-line complexity -- Coordinates the public form editor, draft lifecycle, and exit confirmation.
 const FillRoute = () => {
   const { publicId } = useParams({ from: "/forms/$publicId/fill" });
@@ -510,43 +440,6 @@ const FillRoute = () => {
     return latestConfig;
   };
 
-  const submitNativeResponse = async (
-    action: "save-draft" | "submit",
-    config: NativeEditorConfig
-  ): Promise<Operation> => {
-    const payload = {
-      data: Object.fromEntries(
-        config.fields
-          .filter((field) => field.type !== "picture")
-          .map((field): [string, unknown] => {
-            const value = nativeValues[field.tag];
-            return [
-              field.tag,
-              field.type === "date" && value === "" ? null : value,
-            ];
-          })
-      ),
-      documentKey: config.documentKey,
-      fillMethod: "native",
-      responseId: config.responseId,
-    };
-    const formData = new FormData();
-    formData.set("payload", JSON.stringify(payload));
-    for (const [tag, file] of Object.entries(nativePictureFiles)) {
-      formData.set(`picture:${tag}`, file);
-    }
-    const endpoint = action === "save-draft" ? "draft" : "submit";
-    const { operationId } = await apiPostFormData<{ operationId: string }>(
-      `/api/forms/${publicId}/${endpoint}`,
-      formData,
-      config.capabilities[action]
-    );
-    setOperation({ id: operationId, status: "pending" });
-    const completed = await waitForOperation(operationId, setOperation);
-    setOperation(completed);
-    return completed;
-  };
-
   const refreshNativeResponse = async (configUrl: string): Promise<void> => {
     const refreshedConfig = await apiGet<
       NativeEditorConfig | { fillMethod: "onlyoffice" }
@@ -643,7 +536,14 @@ const FillRoute = () => {
         nativeConfig,
         editorConfigUrl
       );
-      const completed = await submitNativeResponse(action, latestConfig);
+      const completed = await submitNativeResponse({
+        action,
+        config: latestConfig,
+        onOperation: setOperation,
+        pictureFiles: nativePictureFiles,
+        publicId,
+        values: nativeValues,
+      });
       saved = true;
       if (action === "submit") {
         setNativePictureFiles({});

@@ -123,7 +123,7 @@ This is one of four repository-owned specifications. The exact required checkout
 
 Source evidence inspected for this specification:
 
-- `AGENTS.md:136–146`, `docs/agents/domain.md`, `docs/agents/issue-tracker.md`, and `docs/agents/triage-labels.md` establish domain terminology and local Markdown publication with `ready-for-agent`.
+- `.omp/AGENTS.md`, `docs/agents/domain.md`, `docs/agents/issue-tracker.md`, and `docs/agents/triage-labels.md` establish domain terminology and local Markdown publication with `ready-for-agent`.
 - `CONTEXT.md:7–21,50–72` defines User, Legacy Identity, SSO Bridge, Pending Account Link, Response, Draft, Operation, and separate Prefill. The legacy SSO ADR's verified-email requirements conflict with the accepted PDMS trust policy; `docs/adr/0002-legacy-one-time-code-sso.md:11–33` supplies the retained guarantees and canonical Basic/form/`sub` contract.
 - `apps/server/src/app.ts:1384–1539,1652–2019,2061–2382` shows endpoint configuration/return validation, the current true-only email gate, Basic form exchange and timeout, review-before-mapping email rejection, true-valued first provisioning with email as name, transaction generation, five-minute transaction, and 60-second Session transfer. `apps/server/src/app.ts:2969–2972,13834–13837` shows local-password restrictions remain distinct from SSO provenance; the public route inventory also appears in `README.md:320–326`.
 - `packages/db/prisma/schema.prisma:87–190` provides existing email verification, unique provider/account mapping, reviewed generation, Session provenance, and Verification persistence. `packages/auth/src/index.ts:10–69` shows one-hour non-refreshing Sessions, disabled public signup, and server-controlled additional fields.
