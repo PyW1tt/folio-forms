@@ -609,7 +609,38 @@ function saveDocumentCommand() {
   return typeof Api.Save === "function" && Api.Save();
 }
 
+// Keep this command self-contained: ONLYOFFICE serializes it into the document.
+function applyNewDateDefaultsCommand() {
+  const knownIds = Asc.scope.formBridgeKnownControlIds;
+  const known = new Set(knownIds || []);
+  const ids = [];
+  let changed = false;
+  for (const control of Api.GetDocument().GetAllContentControls()) {
+    if (typeof control.GetInternalId !== "function") {
+      continue;
+    }
+    const id = String(control.GetInternalId());
+    ids.push(id);
+    if (
+      knownIds !== null &&
+      !known.has(id) &&
+      typeof control.IsDatePicker === "function" &&
+      control.IsDatePicker()
+    ) {
+      if (
+        typeof control.SetDateFormat !== "function" ||
+        control.SetDateFormat("dd/MM/yyyy") === false
+      ) {
+        throw new Error("Could not set the new date field format");
+      }
+      changed = true;
+    }
+  }
+  return JSON.stringify({ ids, changed });
+}
+
 export {
+  applyNewDateDefaultsCommand,
   extractFormDataCommand,
   applyPrefillCommand,
   getCurrentContentControlCommand,

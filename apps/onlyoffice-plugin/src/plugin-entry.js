@@ -2,6 +2,7 @@
 import { createApi } from "./api.js";
 import { createBridge } from "./bridge.js";
 import { ACTIONS, BUTTON_IDS } from "./constants.js";
+import { createDateDefaults } from "./date-defaults.js";
 import { createFieldPanel } from "./field-panel.js";
 import { createFields } from "./fields.js";
 import { createOffice } from "./office.js";
@@ -25,6 +26,7 @@ let bridge;
 let panel;
 let fields;
 let operations;
+let dateDefaults;
 
 function getStatusElement() {
   const existing = document.querySelector("#form-bridge-status");
@@ -186,6 +188,7 @@ function startInitializationTasks() {
     return;
   }
   initializationStarted = true;
+  void dateDefaults?.start();
   const tasks = [];
   if (prefill.shouldApplyRuntimePrefill()) {
     window.setTimeout(() => {
@@ -263,9 +266,11 @@ function startInitializationWhenReady() {
     });
     plugin.attachEditorEvent("onDocumentContentChanged", () => {
       bridge.setDirtyState(true);
+      void dateDefaults?.refresh();
     });
     plugin.attachEditorEvent("onChangeContentControl", () => {
       bridge.setDirtyState(true);
+      void dateDefaults?.refresh();
     });
   }
 
@@ -282,6 +287,11 @@ function exposeFormBridge() {
     submitForm: operations.submitForm,
   });
   if (runtimeOptions.action === ACTIONS.TEMPLATE_EDIT) {
+    dateDefaults = createDateDefaults(
+      office,
+      () => bridge.setDirtyState(true),
+      (error) => setStatus(`ตั้งรูปแบบวันที่ไม่สำเร็จ: ${errorMessage(error)}`, "error")
+    );
     Object.assign(formBridge, {
       applySchemaPointer: fields.applySchemaPointer,
       copySchemaPointer: fields.copySchemaPointer,
@@ -371,6 +381,7 @@ function initializePlugin() {
 window.Asc = window.Asc || {};
 window.Asc.plugin = window.Asc.plugin || {};
 window.Asc.plugin.event_onChangeContentControl = () => {
+  void dateDefaults?.refresh();
   if (bridge) {
     bridge.setDirtyState(true);
   } else {
